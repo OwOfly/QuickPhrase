@@ -7,7 +7,9 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{capture, foreground, hotkey, logging, panel, platform, single_instance, tray, uia};
+use crate::{
+    capture, foreground, hotkey, logging, panel, platform, single_instance, storage, tray, uia,
+};
 
 const ID_OPEN: u32 = 1001;
 const ID_MANAGE: u32 = 1002;
@@ -159,6 +161,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         logging::warn("uia warmup failed; captures will be copy-only");
     }
 
+    storage::init();
     panel::precreate();
 
     logging::info(&format!(
@@ -385,7 +388,16 @@ fn activate_panel() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
-            let micros = panel::show(report, monitor, main);
+            let items: Vec<panel::Item> = storage::panel_items()
+                .into_iter()
+                .map(|(id, title, content, category)| panel::Item {
+                    id,
+                    title,
+                    content,
+                    category,
+                })
+                .collect();
+            let micros = panel::show(report, monitor, main, items);
 
             if micros == 0 {
                 logging::warn("panel show failed (creation or foreground)");

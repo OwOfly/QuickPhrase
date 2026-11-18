@@ -55,29 +55,12 @@ const EM_LIMITTEXT: u32 = 0x00C5;
 const LBN_SELCHANGE_CODE: u32 = 1;
 const LBN_SETFOCUS_CODE: u32 = 4;
 
-struct Item {
-    title: &'static str,
-    content: &'static str,
-    category: &'static str,
+pub struct Item {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub category: String,
 }
-
-const ITEMS: &[Item] = &[
-    Item {
-        title: "项目进度回复",
-        content: "您好，目前该功能已完成开发，正在进行测试验证，预计测试通过后安排发布。",
-        category: "工作沟通",
-    },
-    Item {
-        title: "收到回复",
-        content: "好的，已收到，我会尽快处理。",
-        category: "工作沟通",
-    },
-    Item {
-        title: "接口开发说明",
-        content: "接口采用 RESTful 风格，基于 HTTP 协议，返回格式为 JSON，具体参数如下：",
-        category: "开发相关",
-    },
-];
 
 struct Fonts {
     title: HFONT,
@@ -98,6 +81,7 @@ struct Panel {
     list: HWND,
     footer: HWND,
     filtered: Vec<usize>,
+    items: Vec<Item>,
     report: Option<Report>,
     notify: HWND,
     fonts: Fonts,
@@ -218,18 +202,24 @@ pub fn is_visible() -> bool {
     })
 }
 
-pub fn show(report: Report, monitor: Option<crate::foreground::Monitor>, notify: HWND) -> u128 {
-    present(Some(report), monitor, notify, true, false)
+pub fn show(
+    report: Report,
+    monitor: Option<crate::foreground::Monitor>,
+    notify: HWND,
+    items: Vec<Item>,
+) -> u128 {
+    present(Some(report), monitor, notify, items, true, false)
 }
 
 pub fn show_test() -> u128 {
-    present(None, None, HWND::default(), true, true)
+    present(None, None, HWND::default(), Vec::new(), true, true)
 }
 
 fn present(
     report: Option<Report>,
     monitor: Option<crate::foreground::Monitor>,
     notify: HWND,
+    items: Vec<Item>,
     activate: bool,
     quit_on_hide: bool,
 ) -> u128 {
@@ -251,6 +241,7 @@ fn present(
         panel.report = report;
         panel.monitor = monitor;
         panel.notify = notify;
+        panel.items = items;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
         ENTER_ARMED.store(false, Ordering::Relaxed);
@@ -574,6 +565,7 @@ fn create() -> Option<Panel> {
         list,
         footer,
         filtered: Vec::new(),
+        items: Vec::new(),
         report: None,
         notify: HWND::default(),
         fonts,
@@ -608,14 +600,16 @@ fn commit() {
         let panel = guard.as_ref()?;
         let index = panel.selected_index()?;
         let item_index = *panel.filtered.get(index)?;
+        let item = panel.items.get(item_index)?;
         Some((
             item_index,
-            ITEMS[item_index].category,
-            ITEMS[item_index].content,
+            item.id.clone(),
+            item.category.clone(),
+            item.content.clone(),
         ))
     });
 
-    let Some((item_index, category, content)) = info else {
+    let Some((item_index, item_id, category, content)) = info else {
         logging::info("panel commit ignored: no matching item");
         return;
     };
@@ -670,9 +664,10 @@ fn commit() {
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
         .spawn(move || {
-            let outcome = inject::run(&report, content, monitor_ok);
+            let outcome = inject::run(&report, &content, monitor_ok);
             let message = outcome.describe();
             logging::info(&format!("inject outcome: {message}"));
+            crate::storage::record_use(&item_id, outcome.status());
             if let Ok(mut slot) = INJECT_RESULT.lock() {
                 *slot = Some(message);
             }
@@ -960,9 +955,9 @@ fn apply_rounding(hwnd: HWND) {
     }
 }
 
-fn filter_items(query: &str) -> Vec<usize> {
+fn filter_items(items: &[Item], query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
-    ITEMS
+    items
         .iter()
         .enumerate()
         .filter(|(_, item)| {
@@ -975,22 +970,28 @@ fn filter_items(query: &str) -> Vec<usize> {
 }
 
 fn populate(query: &str) {
-    let filtered = filter_items(query);
-    let titles: Vec<Vec<u16>> = filtered
-        .iter()
-        .map(|index| platform::wide(ITEMS[*index].title))
-        .collect();
-
-    let list = PANEL.with(|slot| {
-        let mut guard = slot.borrow_mut();
-        let panel = guard.as_mut()?;
-        panel.filtered = filtered;
-        Some(panel.list)
+    let (list, filtered, titles) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        let Some(panel) = guard.as_ref() else {
+            return (HWND::default(), Vec::new(), Vec::new());
+        };
+        let filtered = filter_items(&panel.items, query);
+        let titles: Vec<Vec<u16>> = filtered
+            .iter()
+            .map(|index| platform::wide(&panel.items[*index].title))
+            .collect();
+        (panel.list, filtered, titles)
     });
 
-    let Some(list) = list else {
+    if list.0.is_null() {
         return;
-    };
+    }
+
+    PANEL.with(|slot| {
+        if let Some(panel) = slot.borrow_mut().as_mut() {
+            panel.filtered = filtered;
+        }
+    });
 
     unsafe {
         let _ = send(list, LB_RESETCONTENT, 0, 0);
@@ -1299,10 +1300,13 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     if draw.itemID == u32::MAX {
         return;
     }
-    let Some(item_index) = panel.filtered.get(draw.itemID as usize) else {
+    let Some(item) = panel
+        .filtered
+        .get(draw.itemID as usize)
+        .and_then(|index| panel.items.get(*index))
+    else {
         return;
     };
-    let item = &ITEMS[*item_index];
     let hdc = draw.hDC;
     let rect = draw.rcItem;
 
@@ -1318,7 +1322,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 
     let pad = scaled(12, panel.dpi);
 
-    let mut title = platform::wide(item.title);
+    let mut title = platform::wide(&item.title);
     let mut title_rect = RECT {
         left: rect.left + pad,
         top: rect.top + scaled(8, panel.dpi),
@@ -1337,7 +1341,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
         let _ = SelectObject(hdc, previous);
     }
 
-    let mut preview = platform::wide(item.content);
+    let mut preview = platform::wide(&item.content);
     let mut preview_rect = RECT {
         left: rect.left + pad,
         top: rect.top + scaled(30, panel.dpi),
@@ -1356,7 +1360,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
         let _ = SelectObject(hdc, previous);
     }
 
-    let mut tag = platform::wide(item.category);
+    let mut tag = platform::wide(&item.category);
     let mut tag_rect = RECT {
         left: rect.right - scaled(84, panel.dpi),
         top: rect.top + scaled(10, panel.dpi),
@@ -1382,7 +1386,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
-        let elapsed = present(None, None, HWND::default(), false, false);
+        let elapsed = present(None, None, HWND::default(), Vec::new(), false, false);
         samples.push(elapsed);
         hide_and_restore();
     }
@@ -1415,18 +1419,41 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_items, scaled};
+    use super::{filter_items, scaled, Item};
+
+    fn items() -> Vec<Item> {
+        vec![
+            Item {
+                id: "1".to_string(),
+                title: "项目进度回复".to_string(),
+                content: "您好，目前该功能已完成开发。".to_string(),
+                category: "工作沟通".to_string(),
+            },
+            Item {
+                id: "2".to_string(),
+                title: "收到回复".to_string(),
+                content: "好的，已收到。".to_string(),
+                category: "工作沟通".to_string(),
+            },
+            Item {
+                id: "3".to_string(),
+                title: "接口开发说明".to_string(),
+                content: "返回格式为 JSON。".to_string(),
+                category: "开发相关".to_string(),
+            },
+        ]
+    }
 
     #[test]
     fn empty_query_returns_every_item() {
-        assert_eq!(filter_items(""), vec![0, 1, 2]);
+        assert_eq!(filter_items(&items(), ""), vec![0, 1, 2]);
     }
 
     #[test]
     fn query_matches_title_and_content() {
-        assert_eq!(filter_items("项目"), vec![0]);
-        assert_eq!(filter_items("JSON"), vec![2]);
-        assert!(filter_items("does-not-exist").is_empty());
+        assert_eq!(filter_items(&items(), "项目"), vec![0]);
+        assert_eq!(filter_items(&items(), "JSON"), vec![2]);
+        assert!(filter_items(&items(), "does-not-exist").is_empty());
     }
 
     #[test]

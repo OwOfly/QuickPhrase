@@ -34,6 +34,14 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    pub fn status(&self) -> &'static str {
+        match self {
+            Outcome::Accepted => "accepted",
+            Outcome::Partial { .. } => "partial",
+            Outcome::Rejected { .. } => "rejected",
+        }
+    }
+
     pub fn describe(&self) -> String {
         match self {
             Outcome::Rejected {

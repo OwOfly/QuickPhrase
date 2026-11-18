@@ -1,0 +1,849 @@
+//! Persistent store: `data.json`, `settings.json`, `rules-user.json`.
+//!
+//! Write path (final-plan §6.1): temp file -> flush -> re-read/verify ->
+//! rotate a backup -> `MoveFileExW` (first write) or `ReplaceFileW`
+//! (existing file), with a `MoveFileExW` fallback. Any failure keeps the
+//! original file and removes the temp file.
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::{
+    MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    REPLACEFILE_IGNORE_MERGE_ERRORS, REPLACEFILE_WRITE_THROUGH,
+};
+
+use crate::{logging, platform};
+
+pub const SCHEMA_VERSION: u32 = 1;
+pub const BACKUP_KEEP: usize = 5;
+
+const DATA_FILE: &str = "data.json";
+const SETTINGS_FILE: &str = "settings.json";
+const RULES_FILE: &str = "rules-user.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Category {
+    pub id: String,
+    pub name: String,
+    pub sort_order: i32,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Snippet {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub category_id: Option<String>,
+    pub pinned: bool,
+    pub sort_order: i32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub use_count: u64,
+    pub last_used_at: Option<String>,
+    pub last_insert_status: Option<String>,
+    pub deleted_at: Option<String>,
+    pub search_blob: String,
+}
+
+impl Snippet {
+    /// Lowercased title + newline + lowercased body, per §6.2.
+    pub fn rebuild_blob(&mut self) {
+        self.search_blob = format!(
+            "{}\n{}",
+            self.title.to_lowercase(),
+            self.content.to_lowercase()
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataFile {
+    pub schema_version: u32,
+    pub revision: u64,
+    pub categories: Vec<Category>,
+    pub snippets: Vec<Snippet>,
+}
+
+impl Default for DataFile {
+    fn default() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            revision: 0,
+            categories: Vec::new(),
+            snippets: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Settings {
+    pub schema_version: u32,
+    pub hotkey: String,
+    pub insertion_mode: String,
+    pub tab_policy: String,
+    pub theme: String,
+    pub startup: bool,
+    pub paused: bool,
+    pub data_dir: Option<String>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            hotkey: "Ctrl+Alt+Q".to_string(),
+            insertion_mode: "unicode".to_string(),
+            tab_policy: "spaces4".to_string(),
+            theme: "system".to_string(),
+            startup: false,
+            paused: false,
+            data_dir: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRule {
+    pub exe: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RulesFile {
+    pub version: u32,
+    pub rules: Vec<UserRule>,
+}
+
+impl Default for RulesFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            rules: Vec::new(),
+        }
+    }
+}
+
+pub struct Store {
+    dir: PathBuf,
+    data: DataFile,
+    settings: Settings,
+    rules: RulesFile,
+    read_only: bool,
+    notice: Option<String>,
+}
+
+static STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
+
+/// Load the store once at startup and log its state.
+pub fn init() {
+    let store = Store::load();
+    logging::info(&format!(
+        "storage: dir={} revision={} snippets={} read_only={} notice={:?}",
+        store.dir().display(),
+        store.data().revision,
+        store.snippets().len(),
+        store.is_read_only(),
+        store.notice()
+    ));
+    let _ = STORE.set(std::sync::Mutex::new(store));
+}
+
+pub fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
+    let store = STORE.get()?;
+    let mut guard = store.lock().ok()?;
+    Some(f(&mut guard))
+}
+
+/// Snapshot for the panel: id, title, content, category name.
+pub fn panel_items() -> Vec<(String, String, String, String)> {
+    with_store(|store| {
+        store
+            .snippets()
+            .into_iter()
+            .map(|snippet| {
+                (
+                    snippet.id.clone(),
+                    snippet.title.clone(),
+                    snippet.content.clone(),
+                    store.category_name(snippet.category_id.as_deref()),
+                )
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+pub fn record_use(id: &str, status: &str) {
+    match with_store(|store| store.record_use(id, status)) {
+        Some(Ok(())) => {}
+        Some(Err(err)) => logging::warn(&format!("storage: record_use failed: {err}")),
+        None => logging::warn("storage: record_use before init"),
+    }
+}
+
+impl Store {
+    pub fn load() -> Self {
+        Self::load_from(&platform::data_dir())
+    }
+
+    pub fn load_from(dir: &Path) -> Self {
+        if let Err(err) = fs::create_dir_all(dir) {
+            logging::error(&format!("storage: cannot create data dir: {err}"));
+            return Self {
+                dir: dir.to_path_buf(),
+                data: DataFile::default(),
+                settings: Settings::default(),
+                rules: RulesFile::default(),
+                read_only: true,
+                notice: Some("data_dir_unavailable".to_string()),
+            };
+        }
+
+        let mut notice = None;
+        let mut read_only = false;
+
+        let (mut data, recovered) = match read_with_recovery::<DataFile>(dir, DATA_FILE) {
+            Ok((Some(data), source)) => (data, source),
+            Ok((None, _)) => (seed(), None),
+            Err(err) => {
+                logging::error(&format!("storage: data.json unusable: {err}"));
+                notice = Some("data_recovery_failed".to_string());
+                read_only = true;
+                (DataFile::default(), None)
+            }
+        };
+
+        if data.schema_version > SCHEMA_VERSION {
+            logging::warn(&format!(
+                "storage: schema {} is newer than {SCHEMA_VERSION}; read-only",
+                data.schema_version
+            ));
+            notice = Some("schema_newer".to_string());
+            read_only = true;
+        } else if data.schema_version < SCHEMA_VERSION {
+            logging::warn(&format!(
+                "storage: schema {} predates {SCHEMA_VERSION}; read-only until migrated",
+                data.schema_version
+            ));
+            notice = Some("schema_older".to_string());
+            read_only = true;
+        }
+
+        let settings = match read_with_recovery::<Settings>(dir, SETTINGS_FILE) {
+            Ok((Some(settings), _)) => settings,
+            Ok((None, _)) => Settings::default(),
+            Err(err) => {
+                logging::warn(&format!("storage: settings.json unusable: {err}"));
+                Settings::default()
+            }
+        };
+
+        let rules = match read_with_recovery::<RulesFile>(dir, RULES_FILE) {
+            Ok((Some(rules), _)) => rules,
+            Ok((None, _)) => RulesFile::default(),
+            Err(err) => {
+                logging::warn(&format!("storage: rules-user.json unusable: {err}"));
+                RulesFile::default()
+            }
+        };
+
+        for snippet in &mut data.snippets {
+            snippet.rebuild_blob();
+        }
+
+        let mut store = Self {
+            dir: dir.to_path_buf(),
+            data,
+            settings,
+            rules,
+            read_only,
+            notice,
+        };
+
+        // Persist a fresh seed, a recovered backup, or default settings so the
+        // next start is stable.
+        if !read_only && (recovered.is_some() || !store.path(DATA_FILE).exists()) {
+            if let Err(err) = store.save_data() {
+                logging::error(&format!("storage: initial save failed: {err}"));
+            }
+        }
+        if !read_only && !store.path(SETTINGS_FILE).exists() {
+            let settings = store.settings.clone();
+            let _ = store.write_typed(SETTINGS_FILE, &settings);
+        }
+        if !read_only && !store.path(RULES_FILE).exists() {
+            let rules = store.rules.clone();
+            let _ = store.write_typed(RULES_FILE, &rules);
+        }
+
+        store
+    }
+
+    pub fn data(&self) -> &DataFile {
+        &self.data
+    }
+
+    #[allow(dead_code)] // consumed by M1-5 settings UI
+    pub fn settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    #[allow(dead_code)] // consumed by M1-7 rule evaluation
+    pub fn rules(&self) -> &RulesFile {
+        &self.rules
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Active snippets in panel order: pinned first, then sort order, then
+    /// most recently updated.
+    pub fn snippets(&self) -> Vec<&Snippet> {
+        let mut items: Vec<&Snippet> = self
+            .data
+            .snippets
+            .iter()
+            .filter(|snippet| snippet.deleted_at.is_none())
+            .collect();
+        items.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then(a.sort_order.cmp(&b.sort_order))
+                .then(b.updated_at.cmp(&a.updated_at))
+        });
+        items
+    }
+
+    pub fn category_name(&self, id: Option<&str>) -> String {
+        let Some(id) = id else {
+            return String::new();
+        };
+        self.data
+            .categories
+            .iter()
+            .find(|category| category.id == id)
+            .map(|category| category.name.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn save_data(&mut self) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        for snippet in &mut self.data.snippets {
+            snippet.rebuild_blob();
+        }
+        let next_revision = self.data.revision + 1;
+        self.data.revision = next_revision;
+        match self.write_typed(DATA_FILE, &self.data) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.revision = next_revision - 1;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn record_use(&mut self, id: &str, status: &str) -> Result<(), String> {
+        let now = now_iso();
+        let Some(snippet) = self.data.snippets.iter_mut().find(|item| item.id == id) else {
+            return Err("snippet_missing".to_string());
+        };
+        snippet.use_count += 1;
+        snippet.last_used_at = Some(now.clone());
+        snippet.last_insert_status = Some(status.to_string());
+        snippet.updated_at = now;
+        self.save_data()
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.dir.join(name)
+    }
+
+    fn write_typed<T: Serialize>(&self, name: &str, value: &T) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
+        write_atomic(&self.dir, name, &bytes)
+    }
+}
+
+fn seed() -> DataFile {
+    let now = now_iso();
+    let category = Category {
+        id: new_id(),
+        name: "工作沟通".to_string(),
+        sort_order: 0,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let development = Category {
+        id: new_id(),
+        name: "开发相关".to_string(),
+        sort_order: 1,
+        created_at: now.clone(),
+        updated_at: now.clone(),
+    };
+    let mut snippets = vec![
+        snippet(
+            "项目进度回复",
+            "您好，目前该功能已完成开发，正在进行测试验证，预计测试通过后安排发布。",
+            Some(category.id.clone()),
+            0,
+            &now,
+        ),
+        snippet(
+            "收到回复",
+            "好的，已收到，我会尽快处理。",
+            Some(category.id.clone()),
+            1,
+            &now,
+        ),
+        snippet(
+            "接口开发说明",
+            "接口采用 RESTful 风格，基于 HTTP 协议，返回格式为 JSON，具体参数如下：",
+            Some(development.id.clone()),
+            2,
+            &now,
+        ),
+    ];
+    for item in &mut snippets {
+        item.rebuild_blob();
+    }
+    DataFile {
+        schema_version: SCHEMA_VERSION,
+        revision: 0,
+        categories: vec![category, development],
+        snippets,
+    }
+}
+
+fn snippet(
+    title: &str,
+    content: &str,
+    category_id: Option<String>,
+    sort_order: i32,
+    now: &str,
+) -> Snippet {
+    Snippet {
+        id: new_id(),
+        title: title.to_string(),
+        content: content.to_string(),
+        category_id,
+        pinned: false,
+        sort_order,
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        use_count: 0,
+        last_used_at: None,
+        last_insert_status: None,
+        deleted_at: None,
+        search_blob: String::new(),
+    }
+}
+
+/// Read `name`, falling back to backups newest-first. Returns the value and the
+/// backup path when recovery was needed. `Ok((None, _))` means the file does not
+/// exist.
+fn read_with_recovery<T: DeserializeOwned>(
+    dir: &Path,
+    name: &str,
+) -> Result<(Option<T>, Option<PathBuf>), String> {
+    let path = dir.join(name);
+    if !path.exists() {
+        return Ok((None, None));
+    }
+
+    match read_json::<T>(&path) {
+        Ok(value) => return Ok((Some(value), None)),
+        Err(err) => logging::warn(&format!(
+            "storage: {name} unreadable ({err}); trying backups"
+        )),
+    }
+
+    for backup in backups(dir, name) {
+        match read_json::<T>(&backup) {
+            Ok(value) => {
+                logging::warn(&format!(
+                    "storage: recovered {name} from {}",
+                    backup.display()
+                ));
+                return Ok((Some(value), Some(backup)));
+            }
+            Err(err) => logging::warn(&format!(
+                "storage: backup {} unusable ({err})",
+                backup.display()
+            )),
+        }
+    }
+
+    Err("all_backups_failed".to_string())
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
+    let bytes = fs::read(path).map_err(|err| err.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+}
+
+fn backups(dir: &Path, name: &str) -> Vec<PathBuf> {
+    let stem = name.trim_end_matches(".json");
+    let directory = dir.join("backups");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(|value| value.starts_with(&format!("{stem}-")) && value.ends_with(".json"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+    paths.reverse();
+    paths
+}
+
+fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
+    let source = dir.join(name);
+    if !source.exists() {
+        return Ok(());
+    }
+    let directory = dir.join("backups");
+    fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
+    let stem = name.trim_end_matches(".json");
+    let target = directory.join(format!("{stem}-{}.json", now_stamp()));
+    fs::copy(&source, &target).map_err(|err| err.to_string())?;
+
+    while backups(dir, name).len() > BACKUP_KEEP {
+        let oldest = backups(dir, name).pop();
+        if let Some(oldest) = oldest {
+            let _ = fs::remove_file(oldest);
+        }
+    }
+    Ok(())
+}
+
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+    let target = dir.join(name);
+    let temp = dir.join(format!("{name}.tmp"));
+
+    let result = (|| -> Result<(), String> {
+        let mut file = fs::File::create(&temp).map_err(|err| err.to_string())?;
+        file.write_all(bytes).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())?;
+        drop(file);
+
+        let written = fs::read(&temp).map_err(|err| err.to_string())?;
+        if written != bytes {
+            return Err("temp_verify_failed".to_string());
+        }
+
+        if target.exists() {
+            backup_file(dir, name)?;
+            if replace_file(&target, &temp).is_err() {
+                move_file(&temp, &target, true)?;
+            }
+        } else {
+            move_file(&temp, &target, false)?;
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn replace_file(target: &Path, replacement: &Path) -> Result<(), String> {
+    let target = platform::wide(&target.to_string_lossy());
+    let replacement = platform::wide(&replacement.to_string_lossy());
+    unsafe {
+        ReplaceFileW(
+            PCWSTR(target.as_ptr()),
+            PCWSTR(replacement.as_ptr()),
+            PCWSTR::null(),
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+        .map_err(|err| err.to_string())
+    }
+}
+
+fn move_file(source: &Path, target: &Path, replace: bool) -> Result<(), String> {
+    let source = platform::wide(&source.to_string_lossy());
+    let target = platform::wide(&target.to_string_lossy());
+    let flags = if replace {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_WRITE_THROUGH
+    };
+    unsafe {
+        MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr()), flags)
+            .map_err(|err| err.to_string())
+    }
+}
+
+fn now_iso() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+fn now_stamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs() as i64;
+    let millis = now.subsec_millis();
+    let days = seconds.div_euclid(86_400);
+    let rest = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}{month:02}{day:02}T{:02}{:02}{:02}{millis:03}Z",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    ((year + i64::from(month <= 2)) as i32, month, day)
+}
+
+fn new_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = u64::from(std::process::id());
+    let mut state = nanos ^ (counter << 32) ^ (pid << 16) ^ 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        state ^= state >> 30;
+        state = state.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        state ^= state >> 27;
+        state = state.wrapping_mul(0x94D0_49BB_1331_11EB);
+        state ^= state >> 31;
+        chunk.copy_from_slice(&state.to_le_bytes());
+    }
+    // RFC 4122 version 4 layout.
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qp-store-{tag}-{}", new_id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn first_load_seeds_and_persists() {
+        let dir = temp_dir("seed");
+        let store = Store::load_from(&dir);
+        assert!(!store.is_read_only());
+        assert_eq!(store.snippets().len(), 3);
+        assert!(dir.join(DATA_FILE).exists());
+        assert!(dir.join(SETTINGS_FILE).exists());
+        assert!(dir.join(RULES_FILE).exists());
+
+        let reloaded = Store::load_from(&dir);
+        assert_eq!(reloaded.snippets().len(), 3);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_increments_revision_and_persists() {
+        let dir = temp_dir("save");
+        let mut store = Store::load_from(&dir);
+        let before = store.data().revision;
+        store.data.snippets[0].title = "改名".to_string();
+        store.save_data().unwrap();
+        assert_eq!(store.data().revision, before + 1);
+
+        let reloaded = Store::load_from(&dir);
+        assert!(reloaded.snippets().iter().any(|item| item.title == "改名"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_use_updates_count_and_status() {
+        let dir = temp_dir("use");
+        let mut store = Store::load_from(&dir);
+        let id = store.snippets()[0].id.clone();
+        store.record_use(&id, "accepted").unwrap();
+        let reloaded = Store::load_from(&dir);
+        let snippet = reloaded
+            .data()
+            .snippets
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        assert_eq!(snippet.use_count, 1);
+        assert_eq!(snippet.last_insert_status.as_deref(), Some("accepted"));
+        assert!(snippet.last_used_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backups_are_pruned_to_five() {
+        let dir = temp_dir("prune");
+        let mut store = Store::load_from(&dir);
+        for index in 0..8 {
+            store.data.snippets[0].use_count = index;
+            store.save_data().unwrap();
+        }
+        let count = backups(&dir, DATA_FILE).len();
+        assert!(count <= BACKUP_KEEP, "backups={count}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_main_recovers_from_newest_backup() {
+        let dir = temp_dir("recover");
+        let mut store = Store::load_from(&dir);
+        store.data.snippets[0].title = "第一版".to_string();
+        store.save_data().unwrap();
+        store.data.snippets[0].title = "第二版".to_string();
+        store.save_data().unwrap();
+
+        fs::write(dir.join(DATA_FILE), b"{ not json").unwrap();
+        let recovered = Store::load_from(&dir);
+        assert!(!recovered.is_read_only());
+        assert!(recovered
+            .data()
+            .snippets
+            .iter()
+            .any(|item| item.title == "第一版" || item.title == "第二版"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn all_copies_corrupt_enters_read_only() {
+        let dir = temp_dir("readonly");
+        let mut store = Store::load_from(&dir);
+        store.save_data().unwrap();
+        fs::write(dir.join(DATA_FILE), b"broken").unwrap();
+        for backup in backups(&dir, DATA_FILE) {
+            fs::write(backup, b"broken").unwrap();
+        }
+        let broken = Store::load_from(&dir);
+        assert!(broken.is_read_only());
+        assert_eq!(broken.notice(), Some("data_recovery_failed"));
+        assert!(broken.snippets().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_schema_is_read_only() {
+        let dir = temp_dir("schema");
+        let store = Store::load_from(&dir);
+        let mut data = store.data().clone();
+        data.schema_version = SCHEMA_VERSION + 1;
+        fs::write(
+            dir.join(DATA_FILE),
+            serde_json::to_vec_pretty(&data).unwrap(),
+        )
+        .unwrap();
+        let newer = Store::load_from(&dir);
+        assert!(newer.is_read_only());
+        assert_eq!(newer.notice(), Some("schema_newer"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_file() {
+        let dir = temp_dir("temp");
+        let mut store = Store::load_from(&dir);
+        store.save_data().unwrap();
+        assert!(!dir.join(format!("{DATA_FILE}.tmp")).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn simulated_fault_injection_never_loses_all_copies() {
+        // 100 rounds: write a new value, then corrupt the main file. A valid
+        // store or a recovery from backup must still be possible.
+        let dir = temp_dir("faults");
+        let mut store = Store::load_from(&dir);
+        for round in 0..100u32 {
+            store.data.snippets[0].use_count = u64::from(round);
+            store.save_data().unwrap();
+            if round % 3 == 0 {
+                let bytes = fs::read(dir.join(DATA_FILE)).unwrap();
+                let cut = bytes.len() / 2;
+                fs::write(dir.join(DATA_FILE), &bytes[..cut]).unwrap();
+            }
+            let loaded = Store::load_from(&dir);
+            assert!(
+                !loaded.is_read_only() || round < 2,
+                "round {round} lost every copy"
+            );
+            if let Some(snippet) = loaded.snippets().first() {
+                assert!(snippet.use_count <= u64::from(round));
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

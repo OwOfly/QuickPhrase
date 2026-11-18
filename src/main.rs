@@ -11,6 +11,7 @@ mod logging;
 mod panel;
 mod platform;
 mod single_instance;
+mod storage;
 mod tray;
 mod uia;
 

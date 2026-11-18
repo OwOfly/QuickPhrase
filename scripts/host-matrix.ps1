@@ -121,7 +121,13 @@ if (-not (Test-Path $hwndFile)) { throw "host probe did not publish its HWND" }
 $hostWindow = [IntPtr][int64](Get-Content $hwndFile -Raw).Trim()
 Check "host window created" ($hostWindow -ne [IntPtr]::Zero) ("hwnd=" + $hostWindow)
 
-Check "host focused" (Focus-Window $hostWindow) ("fg=" + [QPHost]::GetForegroundWindow())
+$focused = Focus-Window $hostWindow
+Check "host focused" $focused ("fg=" + [QPHost]::GetForegroundWindow())
+if (-not $focused) {
+    try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
+    "FAIL: cannot bring the host probe to the foreground (locked desktop or foreground lock)"
+    exit 2
+}
 Start-Sleep -Milliseconds 500
 
 # Clipboard sentinel: an accepted injection must not touch the clipboard.
