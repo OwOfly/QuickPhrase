@@ -45,6 +45,14 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             single_instance::signal_existing();
             return 0;
         }
+        single_instance::Acquire::Failed(code) => {
+            logging::error(&format!("CreateMutexW failed: {code}"));
+            platform::error_box(
+                "QuickPhrase 启动失败",
+                &format!("无法创建单实例互斥量（错误码 {code}）。"),
+            );
+            return 2;
+        }
     };
 
     let module = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
@@ -119,8 +127,10 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         platform::error_box("QuickPhrase", "无法添加托盘图标。");
     }
 
+    let mut hotkey_registered = false;
     match hotkey::register(hwnd) {
         Ok(()) => {
+            hotkey_registered = true;
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 state.hotkey_ok = true;
@@ -186,6 +196,11 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     }
     logging::info("message loop ended");
 
+    if (selftest || bench) && !hotkey_registered {
+        logging::error("startup selftest failed: hotkey was not registered");
+        return 3;
+    }
+
     0
 }
 
@@ -210,8 +225,12 @@ unsafe extern "system" fn window_proc(
 
     if taskbar_message != 0 && message == taskbar_message {
         logging::info("TaskbarCreated received; re-adding tray icon");
-        let icon = STATE.with(|state| state.borrow().icon);
-        let ok = tray::add(hwnd, icon, TIP_NORMAL);
+        let (icon, paused) = STATE.with(|state| {
+            let state = state.borrow();
+            (state.icon, state.paused)
+        });
+        let tip = if paused { TIP_PAUSED } else { TIP_NORMAL };
+        let ok = tray::add(hwnd, icon, tip);
         STATE.with(|state| state.borrow_mut().tray_ok = ok);
         return LRESULT(0);
     }
@@ -273,6 +292,11 @@ unsafe extern "system" fn window_proc(
             if hotkey_ok {
                 hotkey::unregister(hwnd);
             }
+            STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.tray_ok = false;
+                state.hotkey_ok = false;
+            });
             PostQuitMessage(0);
             LRESULT(0)
         }

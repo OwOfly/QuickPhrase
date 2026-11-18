@@ -8,8 +8,7 @@ fn find_rc() -> Option<PathBuf> {
         .join("bin");
 
     let mut best: Option<(Vec<u32>, PathBuf)> = None;
-    for entry in std::fs::read_dir(root).ok()? {
-        let entry = entry.ok()?;
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
         let candidate = entry.path().join("x64").join("rc.exe");
         if !candidate.exists() {
             continue;

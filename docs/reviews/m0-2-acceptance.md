@@ -11,12 +11,14 @@
 | --- | --- |
 | 原生快照 | 前台 HWND、PID、线程、进程创建时间、exe、窗口类/标题、`hwndFocus`、caret、完整性级别 |
 | UIA 捕获 | 常驻 MTA 线程 + `CUIAutomation`；`GetFocusedElement`；60 ms 预算；启动预热 |
-| 零 HWND | `NativeWindowHandle==0` 时用 `RawViewWalker` 最多上溯 20 层，命中顶层窗口后校验归属 |
+| 零 HWND | `NativeWindowHandle==0` 时用 `RawViewWalker` 最多上溯 64 层（实测 Chromium 需要 24 层），命中顶层窗口后校验归属 |
 | 身份 | `CompareElements` 为唯一权威；RuntimeId 未使用 |
 | 只读 | 原生 `ES_READONLY`；`ValuePattern.CurrentIsReadOnly`；TextRange `UIA_IsReadOnlyAttributeId` |
 | 插入点 | `TextPattern2.GetCaretRange().isActive`；`TextPattern.GetSelection().Length` |
 | 区域 | 终端（`ConsoleWindowClass` / 终端 exe / UIA class 含 xterm）；编辑器（`Edit`/`RichEdit`/`_WwG`）；其余 UNKNOWN |
-| 超时 | 请求 ID 语义、60 ms 超时、连续 2 次后本会话 `UIA_UNAVAILABLE`，注入降级只复制 |
+| 超时 | 请求 ID + deadline；过期请求不执行、结果不回写 `last`；连续 2 次超时后本会话 `UIA_UNAVAILABLE`，注入降级只复制 |
+| 决策 | 身份与能力分离；UIA 超时/否定证据不回退原生；只读未知、Document、无插入点、禁用、密码、提权、完整性未知一律只复制 |
+| 隐私 | 不采集 UIA `CurrentName`（可能包含控件正文），报告只保留类名、控件类型、属性标志 |
 | 前台监听 | 面板生命周期内 `EVENT_SYSTEM_FOREGROUND` + 独立消息循环，记录 seq/hwnd/pid |
 
 ## 实测证据
@@ -48,6 +50,8 @@
 ```
 
 **深度发现**：上溯上限原设 20 层时，同一元素 `ancestor_verified=false`、身份降级为 UNKNOWN；改成 64 层后在**第 24 层**命中窗口，身份恢复 VERIFIED。Chromium/Electron 的零 HWND 元素可以超过 20 层，20 不够。
+
+**复核修复**：三家代码复核后，能力判定改为“未知即拒绝”；UIA 超时/否定不再回退原生；只读需两源都明确为 false；Document、无插入点、禁用、提权、完整性未知均只复制；`CurrentName` 已从报告移除。
 
 ### 2. 零 HWND 的非编辑元素
 

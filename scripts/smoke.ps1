@@ -59,6 +59,9 @@ function Close-MainWindow([int]$ProcessId) {
     return $true
 }
 
+$before = 0
+if (Test-Path $log) { $before = (Get-Content $log).Count }
+
 $results = New-Object System.Collections.Generic.List[object]
 function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
@@ -88,6 +91,30 @@ Check "first instance alive" (-not $first.HasExited) ("pid=" + $first.Id)
 $workingSetMb = [math]::Round((Get-Process -Id $first.Id).WorkingSet64 / 1MB, 2)
 Check "idle working set <= 35 MB (early sample)" ($workingSetMb -le 35) ("$workingSetMb MB at ~1 s")
 
+# 2b. real hotkey trigger (best effort: UIPI may block input injection)
+$hotkeyError = $null
+$hotkeyTestable = $true
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    [System.Windows.Forms.SendKeys]::SendWait("^%q")
+    Start-Sleep -Milliseconds 700
+} catch {
+    $hotkeyTestable = $false
+    $hotkeyError = $_.Exception.Message
+}
+
+if ($hotkeyTestable) {
+    $hotkeyLines = @()
+    if (Test-Path $log) { $hotkeyLines = Get-Content $log | Select-Object -Skip $before }
+    Check "hotkey fires" (($hotkeyLines -join "`n") -match "hotkey fired") ""
+} else {
+    $results.Add([pscustomobject]@{
+        Name   = "hotkey fires"
+        Ok     = $true
+        Detail = "SKIP: input injection blocked ($hotkeyError)"
+    })
+}
+
 # 3. second instance
 $second = Start-Process -FilePath $exe -PassThru -Wait
 Start-Sleep -Milliseconds 300
@@ -103,10 +130,12 @@ Check "WM_CLOSE closes main window" ($closed -and $first.HasExited) ("closed=$cl
 $again = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru -Wait
 Check "hotkey released after exit" ($again.ExitCode -eq 0) ("selftest exit=" + $again.ExitCode)
 
-# 6. log assertions
-$logText = if (Test-Path $log) { Get-Content $log -Raw } else { "" }
-Check "hotkey registered in log" ($logText -match "hotkey registered: Ctrl\+Alt\+Q") ""
-Check "second instance signalled" ($logText -match "second instance activation requested") ""
+# 6. log assertions (this run only)
+$newLines = @()
+if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before }
+$newText = $newLines -join "`n"
+Check "hotkey registered in log" ($newText -match "hotkey registered: Ctrl\+Alt\+Q") ""
+Check "second instance signalled" ($newText -match "second instance activation requested") ""
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize

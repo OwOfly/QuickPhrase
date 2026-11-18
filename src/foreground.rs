@@ -43,7 +43,6 @@ pub fn start() -> Option<Monitor> {
             }
 
             let thread_id = unsafe { GetCurrentThreadId() };
-            let _ = tx.send(thread_id);
 
             let hook = unsafe {
                 SetWinEventHook(
@@ -56,6 +55,13 @@ pub fn start() -> Option<Monitor> {
                     WINEVENT_OUTOFCONTEXT,
                 )
             };
+
+            if hook == HWINEVENTHOOK::default() {
+                crate::logging::error("SetWinEventHook failed");
+                let _ = tx.send(None);
+                return;
+            }
+            let _ = tx.send(Some(thread_id));
 
             loop {
                 let result = unsafe { GetMessageW(&mut message, None, 0, 0) };
@@ -76,7 +82,7 @@ pub fn start() -> Option<Monitor> {
         })
         .ok()?;
 
-    let thread_id = rx.recv().ok()?;
+    let thread_id = rx.recv().ok()??;
     Some(Monitor {
         thread: Some(handle),
         thread_id,

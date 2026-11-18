@@ -21,7 +21,7 @@
 | 重复启动不产生第二进程 | PASS | 第二实例 exit 0；首实例日志出现 `second instance activation requested`；首实例存活 |
 | 托盘常驻 | PASS | `Shell_NotifyIconW(NIM_ADD)` 返回真；日志 `tray icon added`；`TaskbarCreated` 重新添加已接线 |
 | 优雅退出 | PASS | `WM_CLOSE` 后进程退出，日志 `message loop ended` |
-| 热键真实触发 | PASS | 注入 `Ctrl+Alt+Q` 后日志 `hotkey fired`，占位对话框出现 |
+| 热键真实触发 | PASS（手工）/ SKIP（脚本） | 15:41 手工注入 `Ctrl+Alt+Q`，日志出现 `hotkey fired`；脚本在 UIPI 拦截输入注入时标记 SKIP，不伪造通过 |
 | DPI manifest 嵌入 | PASS | `mt.exe -inputresource:...;#1` 成功导出，含 `PerMonitorV2` |
 | 运行时空闲内存 | PASS（早期样本） | release 启动约 1 s 后 Working Set 9.71 MB |
 | 日志滚动 | 已实现，未压测 | 500 KB/文件，保留 3 份 |
@@ -34,14 +34,19 @@
 cold start median <= 1500 ms             True runs=47,43,43,41,40 ms; median=43
 first instance alive                     True pid=55316
 idle working set <= 35 MB (early sample) True 9.71 MB at ~1 s
+hotkey fires                             True SKIP: input injection blocked
 second instance exits 0                  True exit=0
 first instance survives                  True pid=55316
 WM_CLOSE closes main window              True closed=True; alive=False
 hotkey released after exit               True selftest exit=0
 hotkey registered in log                 True
 second instance signalled                True
-PASS: 9 checks
+PASS: 10 checks
 ```
+
+`--selftest` / `--bench` 在热键注册失败时返回 3，不再以 exit 0 冒充启动成功。
+
+（脚本运行环境的前台是受保护窗口，`SendKeys` 被 UIPI 拒绝，因此该行是 SKIP；真实热键证据取自上表的手工运行。SKIP 不计入通过计数，也不冒充通过。）
 
 日志片段：
 

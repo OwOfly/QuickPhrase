@@ -1,23 +1,29 @@
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, RegisterWindowMessageW};
+
+use windows::Win32::Foundation::{LPARAM, WPARAM};
 
 pub enum Acquire {
     First(HANDLE),
     AlreadyRunning,
+    Failed(u32),
 }
 
 pub fn acquire() -> Acquire {
     match unsafe { CreateMutexW(None, false, w!("Local\\QuickPhrase.SingleInstance")) } {
         Ok(handle) => {
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                unsafe {
+                    let _ = CloseHandle(handle);
+                }
                 Acquire::AlreadyRunning
             } else {
                 Acquire::First(handle)
             }
         }
-        Err(_) => Acquire::First(HANDLE::default()),
+        Err(err) => Acquire::Failed(err.code().0 as u32),
     }
 }
 

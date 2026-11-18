@@ -91,11 +91,14 @@ impl WindowContext {
     }
 
     pub fn focused_is_password(&self) -> bool {
-        self.focused_style & ES_PASSWORD != 0
+        // ES_PASSWORD shares the 0x20 bit with BS_LEFTTEXT and must only be
+        // applied to edit controls.
+        self.focused_is_editable() && self.focused_style & ES_PASSWORD != 0
     }
 
     pub fn focused_is_readonly(&self) -> bool {
-        self.focused_style & ES_READONLY != 0
+        // Same for ES_READONLY vs CBS_DISABLENOSCROLL.
+        self.focused_is_editable() && self.focused_style & ES_READONLY != 0
     }
 }
 
@@ -131,8 +134,10 @@ pub fn snapshot() -> Option<WindowContext> {
 
     let mut focused = HWND::default();
     let mut caret = None;
-    let mut gui = GUITHREADINFO::default();
-    gui.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
     if unsafe { GetGUIThreadInfo(tid, &mut gui) }.is_ok() {
         focused = gui.hwndFocus;
         if !gui.hwndCaret.0.is_null() {

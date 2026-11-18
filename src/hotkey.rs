@@ -10,7 +10,7 @@ pub fn register(hwnd: HWND) -> Result<(), u32> {
     let modifiers: HOT_KEY_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
     unsafe {
         RegisterHotKey(Some(hwnd), HOTKEY_ID, modifiers, HOTKEY_VK_Q)
-            .map_err(|err| err.code().0 as u32)
+            .map_err(|err| crate::platform::win32_code(err.code().0 as u32))
     }
 }
 
