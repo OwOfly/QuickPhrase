@@ -199,30 +199,9 @@ impl Report {
         )
     }
 
+    #[allow(dead_code)] // kept for the M0-4 failure fallback
     pub fn balloon(&self) -> String {
-        if self.identity != "verified" {
-            return format!("未能确认原控件，只复制 / {} ms", self.timings_ms.total);
-        }
-
-        let message = match self.capability.as_str() {
-            "text" => match self.region.as_str() {
-                "terminal" => "可单行输入；终端多行只复制".to_string(),
-                "text_editor" => "可输入（编辑器）".to_string(),
-                _ => "可单行输入；多行只复制".to_string(),
-            },
-            "password" => "已拒绝：密码框".to_string(),
-            "elevated" => "已拒绝：目标权限更高".to_string(),
-            "integrity_unknown" => "已拒绝：完整性级别未知".to_string(),
-            "readonly" => "只复制：只读控件".to_string(),
-            "disabled" => "只复制：控件已禁用".to_string(),
-            "no_caret" => "只复制：没有插入点".to_string(),
-            "document" => "只复制：整页文档".to_string(),
-            "value_only" => "只复制：仅值模式".to_string(),
-            "uia_unavailable" => "只复制：识别超时".to_string(),
-            _ => "只复制：无法确认可输入".to_string(),
-        };
-
-        format!("{message} / {} ms", self.timings_ms.total)
+        format!("{} / {} ms", self.capability, self.timings_ms.total)
     }
 }
 

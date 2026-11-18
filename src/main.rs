@@ -6,6 +6,7 @@ mod context;
 mod foreground;
 mod hotkey;
 mod logging;
+mod panel;
 mod platform;
 mod single_instance;
 mod tray;
@@ -13,12 +14,18 @@ mod uia;
 
 use std::time::{Duration, Instant};
 
+use windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+};
+
 fn main() {
     let started = Instant::now();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let selftest = has(&args, "--selftest");
     let bench = has(&args, "--bench");
     let capture_test = has(&args, "--capture-test");
+    let panel_bench = has(&args, "--panel-bench");
+    let panel_test = has(&args, "--panel-test");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -45,6 +52,27 @@ fn main() {
     if capture_test {
         run_capture_test(delay);
         logging::info("capture-test done");
+        return;
+    }
+
+    if panel_bench {
+        let (p50, p95, max) = panel::bench(100);
+        logging::info(&format!(
+            "panel bench: n=100 p50={p50}us p95={p95}us max={max}us"
+        ));
+        return;
+    }
+
+    if panel_test {
+        panel::show_test();
+        let mut message = MSG::default();
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        logging::info("panel-test done");
         return;
     }
 

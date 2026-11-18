@@ -2,12 +2,12 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{capture, hotkey, logging, platform, single_instance, tray, uia};
+use crate::{capture, hotkey, logging, panel, platform, single_instance, tray, uia};
 
 const ID_OPEN: u32 = 1001;
 const ID_MANAGE: u32 = 1002;
@@ -239,14 +239,32 @@ unsafe extern "system" fn window_proc(
         WM_HOTKEY => {
             if wparam.0 as i32 == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
+
+                if panel::is_visible() {
+                    panel::hide_and_restore();
+                    logging::info("panel closed by hotkey");
+                    return LRESULT(0);
+                }
+
                 let started = Instant::now();
                 match capture::once() {
                     Some(report) => {
                         logging::info(&format!("capture: {}", report.summary()));
-                        tray::balloon(hwnd, "QuickPhrase", &report.balloon());
+                        let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
+                        let caret = report.target.caret.map(|rect| RECT {
+                            left: rect[0],
+                            top: rect[1],
+                            right: rect[2],
+                            bottom: rect[3],
+                        });
+                        let micros = panel::show(target, caret, &report.summary());
+                        logging::info(&format!(
+                            "panel shown in {micros} us; capture total {} ms",
+                            report.timings_ms.total
+                        ));
                     }
                     None => {
-                        logging::warn("capture returned no foreground window");
+                        logging::warn("capture returned no usable foreground window");
                         tray::balloon(hwnd, "QuickPhrase", "未捕获到前台窗口");
                     }
                 }
