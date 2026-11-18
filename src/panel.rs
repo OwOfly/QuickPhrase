@@ -627,12 +627,9 @@ fn commit() {
     }
 
     // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
-    // target. The worker reports back through WM_INJECT_DONE.
+    // target. The worker reports back through WM_INJECT_DONE with its session.
     let session = SESSION.load(Ordering::Relaxed);
     INJECTING.store(true, Ordering::Relaxed);
-
-    // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
-    // target. The worker reports back through WM_INJECT_DONE with its session.
     let notify_raw = notify.0 as isize;
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
