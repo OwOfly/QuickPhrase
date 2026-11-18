@@ -336,7 +336,11 @@ fn worker(mailbox: Arc<Mailbox>, latest: Arc<AtomicU64>) {
 }
 
 fn is_stale(id: u64, deadline: Instant, latest: &AtomicU64) -> bool {
-    id < latest.load(Ordering::Relaxed) || Instant::now() > deadline
+    is_stale_at(id, deadline, latest, Instant::now())
+}
+
+fn is_stale_at(id: u64, deadline: Instant, latest: &AtomicU64, now: Instant) -> bool {
+    id < latest.load(Ordering::Relaxed) || now > deadline
 }
 
 fn capture_element(
@@ -492,7 +496,60 @@ fn variant_bool(variant: &VARIANT) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::combine_read_only;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::{self, TryRecvError};
+    use std::time::{Duration, Instant};
+
+    use super::{combine_read_only, is_stale_at, Mailbox, Request};
+
+    #[test]
+    fn mailbox_replaces_pending_request_and_drops_old_reply() {
+        let mailbox = Mailbox::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+
+        let (first_tx, first_rx) = mpsc::channel::<()>();
+        mailbox.submit(Request::Warmup {
+            id: 1,
+            deadline,
+            reply: first_tx,
+        });
+
+        let (second_tx, second_rx) = mpsc::channel::<()>();
+        mailbox.submit(Request::Warmup {
+            id: 2,
+            deadline,
+            reply: second_tx,
+        });
+
+        assert!(matches!(
+            first_rx.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+
+        match mailbox.take() {
+            Some(Request::Warmup { id, .. }) => assert_eq!(id, 2),
+            _ => panic!("expected the newer warmup request"),
+        }
+        drop(second_rx);
+    }
+
+    #[test]
+    fn stale_predicate_rejects_newer_id_and_expired_deadline() {
+        let now = Instant::now();
+        let latest = AtomicU64::new(2);
+
+        assert!(is_stale_at(1, now + Duration::from_secs(1), &latest, now));
+        assert!(is_stale_at(2, now - Duration::from_secs(1), &latest, now));
+        assert!(!is_stale_at(2, now + Duration::from_secs(1), &latest, now));
+    }
+
+    #[test]
+    fn expired_capture_is_not_committed() {
+        let now = Instant::now();
+        let latest = AtomicU64::new(1);
+        // Same predicate used before writing `last`.
+        assert!(is_stale_at(1, now - Duration::from_millis(1), &latest, now));
+    }
 
     #[test]
     fn read_only_any_true_denies() {
