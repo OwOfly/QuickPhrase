@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use crate::context;
 pub struct UiaSnapshot {
     pub control_type: i32,
     pub class_name: String,
-    pub is_password: bool,
+    pub is_password: Option<bool>,
     pub is_enabled: bool,
     pub is_read_only: Option<bool>,
     pub has_text_pattern: bool,
@@ -42,6 +42,8 @@ pub struct UiaSnapshot {
 
 enum Request {
     Warmup {
+        id: u64,
+        deadline: Instant,
         reply: Sender<()>,
     },
     Capture {
@@ -59,8 +61,40 @@ enum Request {
     Shutdown,
 }
 
+/// Single-slot mailbox: a newer request replaces the pending one, so the
+/// worker can never accumulate an unbounded backlog. The replaced request's
+/// reply channel is dropped, which tells its caller that it was superseded.
+struct Mailbox {
+    slot: Mutex<Option<Request>>,
+    cv: Condvar,
+}
+
+impl Mailbox {
+    fn new() -> Self {
+        Self {
+            slot: Mutex::new(None),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn submit(&self, request: Request) {
+        if let Ok(mut slot) = self.slot.lock() {
+            *slot = Some(request);
+            self.cv.notify_one();
+        }
+    }
+
+    fn take(&self) -> Option<Request> {
+        let mut slot = self.slot.lock().ok()?;
+        while slot.is_none() {
+            slot = self.cv.wait(slot).ok()?;
+        }
+        slot.take()
+    }
+}
+
 pub struct UiaClient {
-    tx: Option<Sender<Request>>,
+    mailbox: Arc<Mailbox>,
     next_id: AtomicU64,
     latest: Arc<AtomicU64>,
     timeouts: AtomicU32,
@@ -69,56 +103,57 @@ pub struct UiaClient {
 
 impl UiaClient {
     fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
+        let mailbox = Arc::new(Mailbox::new());
         let latest = Arc::new(AtomicU64::new(0));
-        let worker_latest = latest.clone();
 
+        let worker_mailbox = mailbox.clone();
+        let worker_latest = latest.clone();
         let spawned = thread::Builder::new()
             .name("quickphrase-uia".into())
-            .spawn(move || worker(rx, worker_latest));
+            .spawn(move || worker(worker_mailbox, worker_latest))
+            .is_ok();
 
-        match spawned {
-            Ok(_) => Self {
-                tx: Some(tx),
-                next_id: AtomicU64::new(0),
-                latest,
-                timeouts: AtomicU32::new(0),
-                unavailable: AtomicBool::new(false),
-            },
-            Err(err) => {
-                crate::logging::error(&format!("failed to spawn UIA worker: {err}"));
-                Self {
-                    tx: None,
-                    next_id: AtomicU64::new(0),
-                    latest,
-                    timeouts: AtomicU32::new(0),
-                    unavailable: AtomicBool::new(true),
-                }
-            }
+        if !spawned {
+            crate::logging::error("failed to spawn UIA worker");
         }
+
+        Self {
+            mailbox,
+            next_id: AtomicU64::new(0),
+            latest,
+            timeouts: AtomicU32::new(0),
+            unavailable: AtomicBool::new(!spawned),
+        }
+    }
+
+    fn next_request(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        self.latest.store(id, Ordering::Relaxed);
+        id
     }
 
     pub fn warmup(&self, timeout: Duration) -> bool {
         if self.unavailable.load(Ordering::Relaxed) {
             return false;
         }
-        let Some(tx) = &self.tx else {
-            return false;
-        };
+        let id = self.next_request();
         let (reply_tx, reply_rx) = mpsc::channel();
-        if tx.send(Request::Warmup { reply: reply_tx }).is_err() {
-            self.unavailable.store(true, Ordering::Relaxed);
-            return false;
-        }
+        self.mailbox.submit(Request::Warmup {
+            id,
+            deadline: Instant::now() + timeout,
+            reply: reply_tx,
+        });
+
         match reply_rx.recv_timeout(timeout) {
             Ok(()) => {
                 self.timeouts.store(0, Ordering::Relaxed);
                 true
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => {
                 self.note_timeout();
                 false
             }
+            Err(RecvTimeoutError::Disconnected) => false,
         }
     }
 
@@ -126,36 +161,25 @@ impl UiaClient {
         if self.unavailable.load(Ordering::Relaxed) {
             return None;
         }
-        let Some(tx) = &self.tx else {
-            return None;
-        };
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.latest.store(id, Ordering::Relaxed);
-
+        let id = self.next_request();
         let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(Request::Capture {
-                id,
-                deadline: Instant::now() + timeout,
-                foreground: foreground.0 as isize,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            self.unavailable.store(true, Ordering::Relaxed);
-            return None;
-        }
+        self.mailbox.submit(Request::Capture {
+            id,
+            deadline: Instant::now() + timeout,
+            foreground: foreground.0 as isize,
+            reply: reply_tx,
+        });
 
         match reply_rx.recv_timeout(timeout) {
             Ok(result) => {
                 self.timeouts.store(0, Ordering::Relaxed);
                 result
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => {
                 self.note_timeout();
                 None
             }
+            Err(RecvTimeoutError::Disconnected) => None,
         }
     }
 
@@ -163,36 +187,25 @@ impl UiaClient {
         if self.unavailable.load(Ordering::Relaxed) {
             return None;
         }
-        let Some(tx) = &self.tx else {
-            return None;
-        };
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.latest.store(id, Ordering::Relaxed);
-
+        let id = self.next_request();
         let (reply_tx, reply_rx) = mpsc::channel();
-        if tx
-            .send(Request::CompareLast {
-                id,
-                deadline: Instant::now() + timeout,
-                foreground: foreground.0 as isize,
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            self.unavailable.store(true, Ordering::Relaxed);
-            return None;
-        }
+        self.mailbox.submit(Request::CompareLast {
+            id,
+            deadline: Instant::now() + timeout,
+            foreground: foreground.0 as isize,
+            reply: reply_tx,
+        });
 
         match reply_rx.recv_timeout(timeout) {
             Ok(result) => {
                 self.timeouts.store(0, Ordering::Relaxed);
                 result
             }
-            Err(_) => {
+            Err(RecvTimeoutError::Timeout) => {
                 self.note_timeout();
                 None
             }
+            Err(RecvTimeoutError::Disconnected) => None,
         }
     }
 
@@ -210,9 +223,7 @@ impl UiaClient {
 
 impl Drop for UiaClient {
     fn drop(&mut self) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(Request::Shutdown);
-        }
+        self.mailbox.submit(Request::Shutdown);
     }
 }
 
@@ -249,7 +260,7 @@ pub fn combine_read_only(value: Option<bool>, text: Option<bool>) -> Option<bool
     }
 }
 
-fn worker(rx: Receiver<Request>, latest: Arc<AtomicU64>) {
+fn worker(mailbox: Arc<Mailbox>, latest: Arc<AtomicU64>) {
     let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if init.is_err() {
         crate::logging::error(&format!("CoInitializeEx failed: 0x{:08X}", init.0 as u32));
@@ -268,9 +279,16 @@ fn worker(rx: Receiver<Request>, latest: Arc<AtomicU64>) {
 
     let mut last: Option<IUIAutomationElement> = None;
 
-    while let Ok(request) = rx.recv() {
+    while let Some(request) = mailbox.take() {
         match request {
-            Request::Warmup { reply } => {
+            Request::Warmup {
+                id,
+                deadline,
+                reply,
+            } => {
+                if is_stale(id, deadline, &latest) {
+                    continue;
+                }
                 let _ = reply.send(());
             }
             Request::Capture {
@@ -280,7 +298,6 @@ fn worker(rx: Receiver<Request>, latest: Arc<AtomicU64>) {
                 reply,
             } => {
                 if is_stale(id, deadline, &latest) {
-                    let _ = reply.send(None);
                     continue;
                 }
 
@@ -288,7 +305,6 @@ fn worker(rx: Receiver<Request>, latest: Arc<AtomicU64>) {
                 let (snapshot, element) = capture_element(&automation, target);
 
                 if is_stale(id, deadline, &latest) {
-                    let _ = reply.send(None);
                     continue;
                 }
                 if let Some(element) = element {
@@ -303,13 +319,11 @@ fn worker(rx: Receiver<Request>, latest: Arc<AtomicU64>) {
                 reply,
             } => {
                 if is_stale(id, deadline, &latest) {
-                    let _ = reply.send(None);
                     continue;
                 }
                 let target = HWND(foreground as *mut core::ffi::c_void);
                 let result = compare_element(&automation, target, &last);
                 if is_stale(id, deadline, &latest) {
-                    let _ = reply.send(None);
                     continue;
                 }
                 let _ = reply.send(result);
@@ -371,8 +385,8 @@ fn capture_element(
         .map(|value| value.to_string())
         .unwrap_or_default();
     let is_password = unsafe { element.CurrentIsPassword() }
-        .map(|value| value.as_bool())
-        .unwrap_or(false);
+        .ok()
+        .map(|value| value.as_bool());
     let is_enabled = unsafe { element.CurrentIsEnabled() }
         .map(|value| value.as_bool())
         .unwrap_or(false);

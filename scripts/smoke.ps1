@@ -63,6 +63,7 @@ $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 
 $results = New-Object System.Collections.Generic.List[object]
+$skipped = 0
 function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
 }
@@ -103,15 +104,22 @@ try {
     $hotkeyError = $_.Exception.Message
 }
 
+$hotkeyObserved = $false
 if ($hotkeyTestable) {
     $hotkeyLines = @()
     if (Test-Path $log) { $hotkeyLines = Get-Content $log | Select-Object -Skip $before }
-    Check "hotkey fires" (($hotkeyLines -join "`n") -match "hotkey fired") ""
+    $hotkeyObserved = ($hotkeyLines -join "`n") -match "hotkey fired"
+}
+
+if ($hotkeyObserved) {
+    Check "hotkey fires" $true ""
 } else {
+    $script:skipped += 1
+    $reason = if ($hotkeyError) { $hotkeyError } else { "no hotkey event observed; injection may be blocked" }
     $results.Add([pscustomobject]@{
         Name   = "hotkey fires"
         Ok     = $true
-        Detail = "SKIP: input injection blocked ($hotkeyError)"
+        Detail = "SKIP: $reason"
     })
 }
 
@@ -147,5 +155,6 @@ if ($failed.Count -gt 0) {
     "FAIL: $($failed.Count) check(s)"
     exit 1
 }
-"PASS: $($results.Count) checks"
+$executed = $results.Count - $skipped
+"PASS: $executed checks ($skipped skipped)"
 exit 0

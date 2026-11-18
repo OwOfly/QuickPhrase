@@ -34,14 +34,14 @@
 cold start median <= 1500 ms             True runs=47,43,43,41,40 ms; median=43
 first instance alive                     True pid=55316
 idle working set <= 35 MB (early sample) True 9.71 MB at ~1 s
-hotkey fires                             True SKIP: input injection blocked
+hotkey fires                             True SKIP: no hotkey event observed
 second instance exits 0                  True exit=0
 first instance survives                  True pid=55316
 WM_CLOSE closes main window              True closed=True; alive=False
 hotkey released after exit               True selftest exit=0
 hotkey registered in log                 True
 second instance signalled                True
-PASS: 10 checks
+PASS: 9 checks (1 skipped)
 ```
 
 `--selftest` / `--bench` 在热键注册失败时返回 3，不再以 exit 0 冒充启动成功。

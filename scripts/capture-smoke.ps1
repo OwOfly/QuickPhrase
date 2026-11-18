@@ -38,8 +38,9 @@ if (Test-Path $log) { $newLog = Get-Content $log | Select-Object -Skip $before }
 $logText = $newLog -join "`n"
 
 if ($logText -match "no foreground window") {
+    $results | Format-Table -AutoSize
     "SKIP: no foreground window in this desktop session"
-    exit 0
+    exit 3
 }
 
 Check "uia warmup ok" ($logText -match "uia warmup: true") ""
@@ -52,7 +53,11 @@ if (Test-Path $captures) {
         Where-Object { $_.LastWriteTime -ge $startedAt.AddSeconds(-2) } |
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
-    if (-not $newest) { "SKIP: no fresh capture report" ; exit 0 }
+    if (-not $newest) {
+        $results | Format-Table -AutoSize
+        "SKIP: no fresh capture report"
+        exit 3
+    }
     if ($newest) {
         $report = Get-Content $newest.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
         Check "report parsed" $true $newest.Name

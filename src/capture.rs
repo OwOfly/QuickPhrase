@@ -51,6 +51,8 @@ impl Capability {
 pub struct Gate {
     pub target_higher: bool,
     pub integrity_unknown: bool,
+    pub native_password: bool,
+    pub native_read_only: bool,
 }
 
 #[derive(Serialize)]
@@ -114,6 +116,8 @@ pub fn once() -> Option<Report> {
         target_higher: window.target_higher,
         integrity_unknown: window.integrity == Integrity::Unknown
             || window.own_integrity == Integrity::Unknown,
+        native_password: window.focused_is_password(),
+        native_read_only: window.focused_is_readonly(),
     };
     let capability = decide_capability(gate, uia_snapshot.as_ref());
     let region = classify(&window, uia_snapshot.as_ref());
@@ -248,6 +252,14 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
     if gate.integrity_unknown {
         return Capability::IntegrityUnknown;
     }
+    // Native style bits are checked before UIA: a provider that forgets to
+    // report a password or read-only control must not widen the gate.
+    if gate.native_password {
+        return Capability::Password;
+    }
+    if gate.native_read_only {
+        return Capability::ReadOnly;
+    }
 
     let Some(snapshot) = facts else {
         return Capability::UiaUnavailable;
@@ -256,8 +268,10 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
     if !snapshot.foreground_stable || !snapshot.ancestor_verified {
         return Capability::Unknown;
     }
-    if snapshot.is_password {
-        return Capability::Password;
+    match snapshot.is_password {
+        Some(true) => return Capability::Password,
+        None => return Capability::Unknown,
+        Some(false) => {}
     }
     if !snapshot.is_enabled {
         return Capability::Disabled;
@@ -290,7 +304,7 @@ fn classify(window: &WindowContext, uia_hint: Option<&UiaSnapshot>) -> &'static 
         &window.exe,
         &window.class,
         &window.focused_class,
-        uia_hint.and_then(|snapshot| Some(snapshot.class_name.as_str())),
+        uia_hint.map(|snapshot| snapshot.class_name.as_str()),
         uia_hint.and_then(|snapshot| snapshot.region_hint.as_deref()),
     )
 }
@@ -373,7 +387,7 @@ mod tests {
         UiaSnapshot {
             control_type: 50004,
             class_name: "Edit".to_string(),
-            is_password: false,
+            is_password: Some(false),
             is_enabled: true,
             is_read_only: Some(false),
             has_text_pattern: true,
@@ -394,6 +408,8 @@ mod tests {
         Gate {
             target_higher: false,
             integrity_unknown: false,
+            native_password: false,
+            native_read_only: false,
         }
     }
 
@@ -490,10 +506,37 @@ mod tests {
     }
 
     #[test]
+    fn native_password_and_read_only_deny() {
+        let mut password = gate();
+        password.native_password = true;
+        assert_eq!(
+            decide_capability(password, Some(&facts())),
+            Capability::Password
+        );
+
+        let mut read_only = gate();
+        read_only.native_read_only = true;
+        assert_eq!(
+            decide_capability(read_only, Some(&facts())),
+            Capability::ReadOnly
+        );
+    }
+
+    #[test]
+    fn unknown_uia_password_denies() {
+        let mut snapshot = facts();
+        snapshot.is_password = None;
+        assert_eq!(
+            decide_capability(gate(), Some(&snapshot)),
+            Capability::Unknown
+        );
+    }
+
+    #[test]
     fn elevated_and_unknown_integrity_deny() {
         let higher = Gate {
             target_higher: true,
-            integrity_unknown: false,
+            ..gate()
         };
         assert_eq!(
             decide_capability(higher, Some(&facts())),
@@ -501,8 +544,8 @@ mod tests {
         );
 
         let unknown = Gate {
-            target_higher: false,
             integrity_unknown: true,
+            ..gate()
         };
         assert_eq!(
             decide_capability(unknown, Some(&facts())),
