@@ -7,7 +7,7 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{capture, hotkey, logging, panel, platform, single_instance, tray, uia};
+use crate::{capture, foreground, hotkey, logging, panel, platform, single_instance, tray, uia};
 
 const ID_OPEN: u32 = 1001;
 const ID_MANAGE: u32 = 1002;
@@ -238,6 +238,13 @@ unsafe extern "system" fn window_proc(
     }
 
     match message {
+        panel::WM_INJECT_DONE => {
+            panel::finish_insert();
+            if let Some(text) = panel::take_inject_result() {
+                tray::balloon(hwnd, "QuickPhrase", &text);
+            }
+            LRESULT(0)
+        }
         WM_HOTKEY => {
             if wparam.0 as i32 == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
@@ -361,11 +368,15 @@ fn activate_panel() {
     let started = Instant::now();
     let main = STATE.with(|state| state.borrow().hwnd);
 
+    // Install the foreground monitor before capturing, so a switch between the
+    // hotkey and the panel becoming visible is still observed by G3.
+    let monitor = foreground::start();
+
     match capture::once() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
-            let micros = panel::show(report, main);
+            let micros = panel::show(report, monitor, main);
 
             if micros == 0 {
                 logging::warn("panel show failed (creation or foreground)");

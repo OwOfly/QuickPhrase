@@ -11,16 +11,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetWindowTextW, IsWindow, LoadCursorW, PeekMessageW, RegisterClassW, SetForegroundWindow,
-    ShowWindow, TranslateMessage, ES_MULTILINE, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
-    WS_VSCROLL,
+    GetWindowLongW, GetWindowTextW, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW,
+    RegisterClassW, SetForegroundWindow, ShowWindow, TranslateMessage, ES_MULTILINE, GWL_STYLE,
+    HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::capture::{Report, Target, Timings};
 use crate::{clipboard, context, foreground, logging, uia};
 
 const MAX_UNICODE_UNITS: usize = 2_000;
+const ES_READONLY: i32 = 0x0800;
 
 enum Plan {
     Insert(String),
@@ -46,15 +47,29 @@ impl Outcome {
                 reason,
                 copied: false,
             } => format!("未输入，复制失败（{reason}）"),
-            Outcome::Accepted => "已输入".to_string(),
+            Outcome::Accepted => "已发送，请确认目标已收到".to_string(),
             Outcome::Partial { reason } => {
-                format!("可能已部分输入，请检查（{reason}）")
+                format!("未确认输入（{reason}），请检查目标")
             }
         }
     }
 }
 
-pub fn run(report: &Report, raw: &str) -> Outcome {
+pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
+    let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
+    unsafe {
+        let _ = SetForegroundWindow(target);
+    }
+
+    if !monitor_ok {
+        let copied = clipboard::set_text(raw);
+        logging::warn("inject rejected: foreground monitor unavailable");
+        return Outcome::Rejected {
+            reason: "monitor_unavailable",
+            copied,
+        };
+    }
+
     let plan = plan_text(
         &report.identity,
         &report.capability,
@@ -79,8 +94,24 @@ pub fn run(report: &Report, raw: &str) -> Outcome {
         return Outcome::Rejected { reason, copied };
     }
 
+    if !final_check(report, target) {
+        let copied = clipboard::set_text(raw);
+        logging::warn("inject rejected: foreground_changed_at_send");
+        return Outcome::Rejected {
+            reason: "foreground_changed_at_send",
+            copied,
+        };
+    }
+
     let inputs = build_inputs(&text);
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+
+    if sent == 0 {
+        logging::warn("SendInput accepted 0 events (blocked)");
+        return Outcome::Partial {
+            reason: "sendinput_blocked",
+        };
+    }
 
     if sent as usize != inputs.len() {
         logging::warn(&format!(
@@ -108,6 +139,9 @@ fn plan_text(
     integrity_unknown: bool,
     raw: &str,
 ) -> Plan {
+    if raw.is_empty() {
+        return Plan::CopyOnly("empty");
+    }
     if identity != "verified" {
         return Plan::CopyOnly("identity_unknown");
     }
@@ -162,10 +196,15 @@ fn guard(report: &Report) -> Result<(), &'static str> {
         return Err("process_changed");
     }
 
+    if foreground::overflowed() {
+        return Err("foreground_overflow");
+    }
+
     for event in foreground::events() {
-        if event.pid != report.target.pid && event.pid != std::process::id() {
-            return Err("foreground_sequence");
+        if event.pid == std::process::id() || event.hwnd == report.target.hwnd {
+            continue;
         }
+        return Err("foreground_sequence");
     }
 
     unsafe {
@@ -180,10 +219,21 @@ fn guard(report: &Report) -> Result<(), &'static str> {
         return Err("focus_changed");
     }
 
+    if report.target.focused_is_editable {
+        let style = unsafe { GetWindowLongW(focused, GWL_STYLE) };
+        if style & ES_READONLY != 0 {
+            return Err("read_only_changed");
+        }
+        if report.target.selection.is_none() {
+            logging::info("position_unverified");
+        }
+    }
+
     if report.identity_source == "uia" {
         match uia::compare_last(target, Duration::from_millis(50)) {
             Some(true) => {}
-            _ => return Err("identity_changed"),
+            Some(false) => return Err("identity_changed"),
+            None => return Err("identity_unknown"),
         }
     }
 
@@ -201,6 +251,27 @@ fn guard(report: &Report) -> Result<(), &'static str> {
     }
 
     Ok(())
+}
+
+fn final_check(report: &Report, target: HWND) -> bool {
+    if unsafe { GetForegroundWindow() } != target {
+        return false;
+    }
+
+    match context::focused_window(report.target.tid) {
+        Some(focused)
+            if report.target.focused_hwnd == 0
+                || focused.0 as isize == report.target.focused_hwnd => {}
+        _ => return false,
+    }
+
+    if report.identity_source == "uia"
+        && uia::compare_last(target, Duration::from_millis(50)) != Some(true)
+    {
+        return false;
+    }
+
+    unsafe { GetForegroundWindow() == target }
 }
 
 fn wait_foreground(target: HWND, timeout: Duration) -> bool {
@@ -375,7 +446,7 @@ pub fn selftest() -> bool {
             foreground_events: Vec::new(),
         };
 
-        let outcome = run(&report, "Injected 测试\r\n第二行");
+        let outcome = run(&report, "Injected 测试\r\n第二行", true);
         pump(Duration::from_millis(400));
 
         let mut buffer = [0u16; 512];
@@ -383,7 +454,7 @@ pub fn selftest() -> bool {
         let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
         let _ = DestroyWindow(window);
 
-        let ok = text.contains("Injected 测试") && text.contains("第二行");
+        let ok = matches!(outcome, Outcome::Accepted) && text == "Injected 测试\r\n第二行";
         logging::info(&format!(
             "inject selftest: outcome={} text={text:?}",
             outcome.describe()
@@ -399,7 +470,7 @@ fn force_foreground(window: HWND) {
             return;
         }
         let foreground = GetForegroundWindow();
-        if foreground.0.is_null() {
+        if foreground.0.is_null() || IsHungAppWindow(foreground).as_bool() {
             return;
         }
         let mut pid = 0u32;
@@ -486,5 +557,75 @@ mod tests {
             Plan::CopyOnly(reason) => assert_eq!(reason, "capability"),
             _ => panic!("expected copy-only"),
         }
+    }
+
+    #[test]
+    fn exactly_two_thousand_units_is_allowed() {
+        match plan(&"a".repeat(2_000)) {
+            Plan::Insert(text) => assert_eq!(text.encode_utf16().count(), 2_000),
+            _ => panic!("expected insert"),
+        }
+    }
+
+    #[test]
+    fn emoji_counts_as_two_units() {
+        let thousand = "\u{1F600}".repeat(1_000);
+        match plan(&thousand) {
+            Plan::Insert(text) => assert_eq!(text.encode_utf16().count(), 2_000),
+            _ => panic!("expected insert"),
+        }
+        match plan(&"\u{1F600}".repeat(1_001)) {
+            Plan::CopyOnly(reason) => assert_eq!(reason, "too_long"),
+            _ => panic!("expected copy-only"),
+        }
+    }
+
+    #[test]
+    fn crlf_and_lone_cr_become_cr() {
+        for raw in ["a\r\nb", "a\rb"] {
+            match plan(raw) {
+                Plan::Insert(text) => assert_eq!(text, "a\rb"),
+                _ => panic!("expected insert"),
+            }
+        }
+    }
+
+    #[test]
+    fn c1_and_unicode_separators_are_copy_only() {
+        for raw in ["a\u{85}b", "a\u{2028}b", "a\u{2029}b"] {
+            match plan(raw) {
+                Plan::CopyOnly(reason) => assert_eq!(reason, "control_char"),
+                _ => panic!("expected copy-only"),
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_single_line_is_allowed() {
+        match plan_text("verified", "text", "terminal", false, false, "Get-Process") {
+            Plan::Insert(text) => assert_eq!(text, "Get-Process"),
+            _ => panic!("expected insert"),
+        }
+    }
+
+    #[test]
+    fn identity_elevation_and_integrity_are_copy_only() {
+        assert!(matches!(
+            plan_text("unknown", "text", "text_editor", false, false, "a"),
+            Plan::CopyOnly("identity_unknown")
+        ));
+        assert!(matches!(
+            plan_text("verified", "text", "text_editor", true, false, "a"),
+            Plan::CopyOnly("elevated")
+        ));
+        assert!(matches!(
+            plan_text("verified", "text", "text_editor", false, true, "a"),
+            Plan::CopyOnly("integrity_unknown")
+        ));
+    }
+
+    #[test]
+    fn empty_text_is_copy_only() {
+        assert!(matches!(plan(""), Plan::CopyOnly("empty")));
     }
 }

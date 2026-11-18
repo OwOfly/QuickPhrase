@@ -13,7 +13,10 @@ pub fn set_text(text: &str) -> bool {
         if OpenClipboard(None).is_err() {
             return false;
         }
-        let _ = EmptyClipboard();
+        if EmptyClipboard().is_err() {
+            let _ = CloseClipboard();
+            return false;
+        }
 
         let memory = match GlobalAlloc(GMEM_MOVEABLE, bytes) {
             Ok(memory) => memory,

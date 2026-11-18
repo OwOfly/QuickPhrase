@@ -32,7 +32,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::Report;
-use crate::{inject, logging, platform, tray};
+use crate::{inject, logging, platform};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
@@ -114,6 +114,13 @@ thread_local! {
 
 static OLD_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 static CREATE_FAILED: AtomicBool = AtomicBool::new(false);
+static INJECT_RESULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+pub const WM_INJECT_DONE: u32 = WM_APP + 0x61;
+
+pub fn take_inject_result() -> Option<String> {
+    INJECT_RESULT.lock().ok().and_then(|mut slot| slot.take())
+}
 
 fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
@@ -202,15 +209,21 @@ pub fn is_visible() -> bool {
     })
 }
 
-pub fn show(report: Report, notify: HWND) -> u128 {
-    present(Some(report), notify, true, false)
+pub fn show(report: Report, monitor: Option<crate::foreground::Monitor>, notify: HWND) -> u128 {
+    present(Some(report), monitor, notify, true, false)
 }
 
 pub fn show_test() -> u128 {
-    present(None, HWND::default(), true, true)
+    present(None, None, HWND::default(), true, true)
 }
 
-fn present(report: Option<Report>, notify: HWND, activate: bool, quit_on_hide: bool) -> u128 {
+fn present(
+    report: Option<Report>,
+    monitor: Option<crate::foreground::Monitor>,
+    notify: HWND,
+    activate: bool,
+    quit_on_hide: bool,
+) -> u128 {
     let started = Instant::now();
     let needs_create =
         PANEL.with(|slot| slot.borrow().is_none()) && !CREATE_FAILED.load(Ordering::Relaxed);
@@ -220,31 +233,21 @@ fn present(report: Option<Report>, notify: HWND, activate: bool, quit_on_hide: b
         }
     }
 
-    let (hwnd, edit, needs_monitor) = PANEL.with(|slot| {
+    let (hwnd, edit) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
-            return (HWND::default(), HWND::default(), false);
+            return (HWND::default(), HWND::default());
         };
         panel.report = report;
+        panel.monitor = monitor;
         panel.notify = notify;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
-        (panel.hwnd, panel.edit, activate && panel.monitor.is_none())
+        (panel.hwnd, panel.edit)
     });
 
     if hwnd.0.is_null() {
         return 0;
-    }
-
-    if needs_monitor {
-        let monitor = crate::foreground::start();
-        PANEL.with(|slot| {
-            if let Some(panel) = slot.borrow_mut().as_mut() {
-                if panel.monitor.is_none() {
-                    panel.monitor = monitor;
-                }
-            }
-        });
     }
 
     place();
@@ -571,6 +574,13 @@ fn commit() {
         return;
     };
 
+    let monitor_ok = PANEL.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|panel| panel.monitor.is_some())
+            .unwrap_or(false)
+    });
+
     let (report, notify, hwnd) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
@@ -596,20 +606,47 @@ fn commit() {
 
     if std::env::var_os("QUICKPHRASE_TEST_NO_INJECT").is_some() {
         logging::info("inject skipped by test flag");
+        let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
+        if unsafe { IsWindow(Some(target)) }.as_bool() {
+            unsafe {
+                let _ = SetForegroundWindow(target);
+            }
+        }
         finish_insert();
         return;
     }
 
-    let outcome = inject::run(&report, content);
-    finish_insert();
+    // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
+    // target. The worker reports back through WM_INJECT_DONE.
+    let notify_raw = notify.0 as isize;
+    let spawned = std::thread::Builder::new()
+        .name("quickphrase-inject".into())
+        .spawn(move || {
+            let outcome = inject::run(&report, content, monitor_ok);
+            let message = outcome.describe();
+            logging::info(&format!("inject outcome: {message}"));
+            if let Ok(mut slot) = INJECT_RESULT.lock() {
+                *slot = Some(message);
+            }
+            if notify_raw != 0 {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(notify_raw as *mut core::ffi::c_void)),
+                        WM_INJECT_DONE,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        });
 
-    logging::info(&format!("inject outcome: {}", outcome.describe()));
-    if !notify.0.is_null() {
-        tray::balloon(notify, "QuickPhrase", &outcome.describe());
+    if spawned.is_err() {
+        logging::error("failed to spawn injection thread");
+        finish_insert();
     }
 }
 
-fn finish_insert() {
+pub fn finish_insert() {
     let monitor = PANEL.with(|slot| {
         slot.borrow_mut()
             .as_mut()
@@ -948,14 +985,20 @@ unsafe extern "system" fn edit_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if (message == WM_KEYUP || message == WM_SYSKEYUP) && wparam.0 as u16 == VK_RETURN.0 {
+        if ime_composing(hwnd) {
+            return call_default_edit(hwnd, message, wparam, lparam);
+        }
+        commit();
+        return LRESULT(0);
+    }
+
     if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
         let key = wparam.0 as u16;
 
         if key == VK_RETURN.0 {
-            if ime_composing(hwnd) {
-                return call_default_edit(hwnd, message, wparam, lparam);
-            }
-            commit();
+            // Commit on key-up so Enter is physically released before the
+            // panel hides and focus returns to the target.
             return LRESULT(0);
         }
 
@@ -1257,7 +1300,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
-        let elapsed = present(None, HWND::default(), false, false);
+        let elapsed = present(None, None, HWND::default(), false, false);
         samples.push(elapsed);
         hide_and_restore();
     }

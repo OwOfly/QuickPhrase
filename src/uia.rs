@@ -478,9 +478,65 @@ fn compare_element(
         return Some(false);
     }
 
-    unsafe { automation.CompareElements(previous, &current) }
+    let same = unsafe { automation.CompareElements(previous, &current) }
         .map(|value| value.as_bool())
-        .ok()
+        .unwrap_or(false);
+    if !same {
+        return Some(false);
+    }
+
+    // Capability is re-checked at commit time: the control may have become
+    // read-only, disabled or a password field while the panel was open.
+    let control_type = unsafe { current.CurrentControlType() }
+        .map(|value| value.0)
+        .unwrap_or(0);
+    if control_type == 50030 {
+        return Some(false);
+    }
+
+    let enabled = unsafe { current.CurrentIsEnabled() }
+        .map(|value| value.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        return Some(false);
+    }
+
+    let password = unsafe { current.CurrentIsPassword() }
+        .map(|value| value.as_bool())
+        .unwrap_or(true);
+    if password {
+        return Some(false);
+    }
+
+    if current_read_only(&current) != Some(false) {
+        return Some(false);
+    }
+
+    Some(true)
+}
+
+fn current_read_only(element: &IUIAutomationElement) -> Option<bool> {
+    let value_read_only =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
+            .ok()
+            .and_then(|pattern| unsafe { pattern.CurrentIsReadOnly().ok() })
+            .map(|value| value.as_bool());
+
+    let text_read_only =
+        unsafe { element.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId) }
+            .ok()
+            .and_then(|pattern| unsafe { pattern.GetSelection().ok() })
+            .and_then(|array| {
+                if unsafe { array.Length() }.unwrap_or(0) > 0 {
+                    unsafe { array.GetElement(0) }.ok()
+                } else {
+                    None
+                }
+            })
+            .and_then(|range| unsafe { range.GetAttributeValue(UIA_IsReadOnlyAttributeId).ok() })
+            .and_then(|variant| variant_bool(&variant));
+
+    combine_read_only(value_read_only, text_read_only)
 }
 
 fn variant_bool(variant: &VARIANT) -> Option<bool> {

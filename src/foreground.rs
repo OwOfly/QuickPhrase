@@ -22,6 +22,7 @@ pub struct ForegroundEvent {
 
 static EVENTS: Mutex<Vec<ForegroundEvent>> = Mutex::new(Vec::new());
 static SEQ: AtomicU64 = AtomicU64::new(0);
+static OVERFLOWED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub struct Monitor {
     thread: Option<JoinHandle<()>>,
@@ -33,6 +34,7 @@ pub fn start() -> Option<Monitor> {
         events.clear();
     }
     SEQ.store(0, Ordering::Relaxed);
+    OVERFLOWED.store(false, Ordering::Relaxed);
 
     let (tx, rx) = mpsc::channel();
     let handle = thread::Builder::new()
@@ -119,7 +121,10 @@ unsafe extern "system" fn callback(
 
     if let Ok(mut events) = EVENTS.lock() {
         if events.len() >= 128 {
-            events.remove(0);
+            // Never drop evidence silently: overflow forces the injector to
+            // treat the foreground sequence as unverifiable.
+            OVERFLOWED.store(true, Ordering::Relaxed);
+            return;
         }
         events.push(ForegroundEvent {
             seq: SEQ.fetch_add(1, Ordering::Relaxed),
@@ -127,6 +132,10 @@ unsafe extern "system" fn callback(
             pid,
         });
     }
+}
+
+pub fn overflowed() -> bool {
+    OVERFLOWED.load(Ordering::Relaxed)
 }
 
 pub fn events() -> Vec<ForegroundEvent> {

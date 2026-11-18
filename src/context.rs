@@ -210,6 +210,18 @@ pub fn read_selection(hwnd: HWND) -> Option<(u32, u32)> {
         return None;
     }
 
+    // EM_GETSEL passes raw pointers. The system marshals only a small set of
+    // messages between processes, and EM_GETSEL is not one of them: sending it
+    // to another process would make that process write to addresses in its own
+    // address space. Only query selections for windows owned by this process.
+    let mut pid = 0u32;
+    unsafe {
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    if pid != std::process::id() {
+        return None;
+    }
+
     let mut start = 0u32;
     let mut end = 0u32;
     let result = unsafe {

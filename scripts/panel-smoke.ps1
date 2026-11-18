@@ -139,6 +139,7 @@ Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $rest
 $opened = Open-Panel 3
 $edit = Find-Edit $panel
 [void][QPPanelSmoke]::PostMessage($edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero)
+[void][QPPanelSmoke]::PostMessage($edit, 0x0101, [IntPtr]0x0D, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 600
 Find-Windows
 $newLines = @()
