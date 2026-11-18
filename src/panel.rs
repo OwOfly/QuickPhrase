@@ -218,7 +218,8 @@ fn present(
     quit_on_hide: bool,
 ) -> u128 {
     let started = Instant::now();
-    let needs_create = PANEL.with(|slot| slot.borrow().is_none());
+    let needs_create =
+        PANEL.with(|slot| slot.borrow().is_none()) && !CREATE_FAILED.load(Ordering::Relaxed);
     if needs_create {
         if let Some(panel) = create() {
             PANEL.with(|slot| *slot.borrow_mut() = Some(panel));
@@ -411,7 +412,7 @@ fn create() -> Option<Panel> {
         }
     };
 
-    let list = unsafe {
+    let list = match unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("LISTBOX"),
@@ -432,8 +433,19 @@ fn create() -> Option<Panel> {
             Some(instance),
             None,
         )
-    }
-    .ok()?;
+    } {
+        Ok(list) => list,
+        Err(err) => {
+            logging::error(&format!("CreateWindowExW(LISTBOX) failed: {err}"));
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
 
     let footer = match unsafe {
         CreateWindowExW(
@@ -475,6 +487,14 @@ fn create() -> Option<Panel> {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         let _ = send(edit, EM_LIMITTEXT, 200, 0);
         let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as usize as isize);
+        if old == 0 {
+            logging::error("SetWindowLongPtrW(EDIT) failed");
+            let _ = DestroyWindow(hwnd);
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
         OLD_EDIT_PROC.store(old, Ordering::Relaxed);
         let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
     }
