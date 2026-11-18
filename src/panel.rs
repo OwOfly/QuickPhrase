@@ -344,7 +344,14 @@ fn hide(restore: bool) {
 }
 
 fn create() -> Option<Panel> {
-    let module = unsafe { GetModuleHandleW(None) }.ok()?;
+    let module = match unsafe { GetModuleHandleW(None) } {
+        Ok(module) => module,
+        Err(err) => {
+            logging::error(&format!("GetModuleHandleW failed: {err}"));
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
     let instance = HINSTANCE(module.0);
 
     let class = WNDCLASSW {
@@ -502,7 +509,10 @@ fn create() -> Option<Panel> {
         let _ = send(edit, EM_LIMITTEXT, 200, 0);
         let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as usize as isize);
         if old == 0 {
-            logging::error("SetWindowLongPtrW(EDIT) failed");
+            logging::error(&format!(
+                "SetWindowLongPtrW(EDIT) failed: {:?}",
+                GetLastError()
+            ));
             let _ = DestroyWindow(hwnd);
             destroy_fonts(&fonts);
             destroy_brushes(&brushes);

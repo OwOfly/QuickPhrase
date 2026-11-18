@@ -376,7 +376,7 @@ fn activate_panel() {
             if micros == 0 {
                 logging::warn("panel show failed (creation or foreground)");
                 if !main.0.is_null() {
-                    tray::balloon(main, "QuickPhrase", "无法显示面板，请重试");
+                    tray::balloon(main, "QuickPhrase", "无法显示面板（创建或焦点失败）");
                 }
             } else {
                 logging::info(&format!(

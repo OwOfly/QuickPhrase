@@ -67,6 +67,7 @@ fn main() {
     if panel_test {
         if panel::show_test() == 0 {
             logging::error("panel-test failed to create or show the panel");
+            panel::shutdown();
             std::process::exit(3);
         }
         let mut message = MSG::default();

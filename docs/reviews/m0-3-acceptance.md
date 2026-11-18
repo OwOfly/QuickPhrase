@@ -1,7 +1,7 @@
 # M0-3 验收记录（2026-11-18，复核修复后）
 
 - 范围：快捷面板、搜索、OwnerDraw 列表、键盘导航、定位、DPI
-- 复核：M0-3 r1（glm/kimi/qwen），修复后待 r3 focused
+- 复核：r1/r2/r3 发现全部闭环；r4 focused：glm PASS、qwen PASS、kimi K11 全 CLOSED（仅哈希项受只读工具限制）
 - 复核依据：`docs/_ref/final-plan.md` v4.1 §8 M0-3
 
 ## 已实现
@@ -109,4 +109,4 @@ PASS: 10 checks
 
 ## 结论
 
-M0-3 的功能、定位、焦点契约与性能达到当前阶段目标；未覆盖项已明确归属 M0-4/M0-5。待 r3 focused 复核确认修复闭环后再开 M0-4。
+M0-3 的功能、定位、焦点契约与性能达到当前阶段目标；r4 focused 通过，未覆盖项已明确归属 M0-4/M0-5。**M0-3 过门，M0-4 可开。**
