@@ -221,7 +221,9 @@ fn guard(report: &Report) -> Result<(), &'static str> {
     if report.target.selection.is_none() {
         logging::info("position_unverified");
     }
-    if report.target.focused_is_editable && context::native_edit_read_only(focused) != Some(false) {
+    if context::is_native_edit_class(&report.target.focused_class)
+        && context::native_edit_read_only(focused) != Some(false)
+    {
         // Fail closed: a native edit whose style cannot be read must not be
         // treated as writable.
         return Err("read_only_unknown");
@@ -270,7 +272,7 @@ fn final_check(report: &Report, target: HWND) -> bool {
         _ => return false,
     }
 
-    if report.target.focused_is_editable {
+    if context::is_native_edit_class(&report.target.focused_class) {
         let focused = HWND(report.target.focused_hwnd as *mut core::ffi::c_void);
         if context::native_edit_read_only(focused) != Some(false) {
             return false;

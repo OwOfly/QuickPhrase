@@ -264,6 +264,11 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
         if !snapshot.is_enabled {
             return Capability::Disabled;
         }
+        if snapshot.control_type == 50030 {
+            // Contradictory provider: a native edit class claiming Document.
+            // Reject rather than trust either side.
+            return Capability::Document;
+        }
         if !gate.native_caret {
             // 搂5.5 row 1: a native control needs a proven insertion point
             // (rcCaret / hwndCaret or EM_GETSEL), not just a writable style.
@@ -517,6 +522,36 @@ mod tests {
         assert_eq!(
             decide_capability(native, Some(&snapshot)),
             Capability::NoCaret
+        );
+    }
+
+    #[test]
+    fn native_edit_disabled_is_rejected() {
+        let mut snapshot = facts();
+        snapshot.is_enabled = false;
+        let native = Gate {
+            native_edit: true,
+            native_caret: true,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::Disabled
+        );
+    }
+
+    #[test]
+    fn native_edit_with_document_control_type_is_rejected() {
+        let mut snapshot = facts();
+        snapshot.control_type = 50030;
+        let native = Gate {
+            native_edit: true,
+            native_caret: true,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::Document
         );
     }
 
