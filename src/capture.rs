@@ -53,6 +53,7 @@ pub struct Gate {
     pub integrity_unknown: bool,
     pub native_password: bool,
     pub native_read_only: bool,
+    pub native_edit: bool,
 }
 
 #[derive(Serialize)]
@@ -119,6 +120,7 @@ pub fn once() -> Option<Report> {
             || window.own_integrity == Integrity::Unknown,
         native_password: window.focused_is_password(),
         native_read_only: window.focused_is_readonly(),
+        native_edit: context::is_native_edit_class(&window.focused_class),
     };
     let capability = decide_capability(gate, uia_snapshot.as_ref());
     let region = classify(&window, uia_snapshot.as_ref());
@@ -240,6 +242,22 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
     }
     if gate.native_read_only {
         return Capability::ReadOnly;
+    }
+
+    // Native Edit/RichEdit: §5.5 row 1. Identity is the focused HWND, the
+    // password/read-only bits are authoritative, and the caret comes from
+    // GUITHREADINFO. UIA is only consulted to reject an explicitly reported
+    // password or disabled state.
+    if gate.native_edit {
+        if let Some(snapshot) = facts {
+            if snapshot.is_password == Some(true) {
+                return Capability::Password;
+            }
+            if !snapshot.is_enabled {
+                return Capability::Disabled;
+            }
+        }
+        return Capability::Text;
     }
 
     let Some(snapshot) = facts else {
@@ -391,6 +409,7 @@ mod tests {
             integrity_unknown: false,
             native_password: false,
             native_read_only: false,
+            native_edit: false,
         }
     }
 
@@ -406,6 +425,38 @@ mod tests {
         assert_eq!(
             decide_capability(gate(), Some(&snapshot)),
             Capability::Unknown
+        );
+    }
+
+    #[test]
+    fn native_edit_uses_style_not_uia_read_only() {
+        // A plain EDIT exposes only a ValuePattern, so the combined UIA
+        // read-only answer is None. Native style bits are authoritative.
+        let mut snapshot = facts();
+        snapshot.is_read_only = None;
+        snapshot.control_type = 50004;
+        snapshot.has_text_pattern = false;
+        snapshot.has_text_pattern2 = false;
+        snapshot.selection_count = 0;
+        snapshot.caret_active = None;
+        let native = Gate {
+            native_edit: true,
+            ..gate()
+        };
+        assert_eq!(decide_capability(native, Some(&snapshot)), Capability::Text);
+    }
+
+    #[test]
+    fn native_edit_still_denies_explicit_password() {
+        let mut snapshot = facts();
+        snapshot.is_password = Some(true);
+        let native = Gate {
+            native_edit: true,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::Password
         );
     }
 

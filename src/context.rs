@@ -37,6 +37,35 @@ const EDIT_CLASSES: &[&str] = &[
     "_WwG",
 ];
 
+/// Classes whose control is a real Win32 edit control, not a UIA document
+/// window such as Word's `_WwG`.
+const NATIVE_EDIT_CLASSES: &[&str] = &[
+    "Edit",
+    "RichEdit",
+    "RichEdit20A",
+    "RichEdit20W",
+    "RichEdit50W",
+];
+
+pub fn is_native_edit_class(name: &str) -> bool {
+    NATIVE_EDIT_CLASSES
+        .iter()
+        .any(|class| name.eq_ignore_ascii_case(class))
+}
+
+/// Native read-only state for a real edit control. `None` means the window is
+/// not a native edit control.
+pub fn native_edit_read_only(hwnd: HWND) -> Option<bool> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+    if !is_native_edit_class(&window_class(hwnd)) {
+        return None;
+    }
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+    Some(style & ES_READONLY != 0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Integrity {
     Untrusted,

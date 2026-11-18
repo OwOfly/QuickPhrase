@@ -106,6 +106,7 @@ struct Panel {
     hiding: bool,
     quit_on_hide: bool,
     monitor: Option<crate::foreground::Monitor>,
+    opening: bool,
 }
 
 thread_local! {
@@ -266,6 +267,12 @@ fn present(
     }
     populate("");
 
+    PANEL.with(|slot| {
+        if let Some(panel) = slot.borrow_mut().as_mut() {
+            panel.opening = true;
+        }
+    });
+
     unsafe {
         let _ = ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
         if activate {
@@ -275,6 +282,11 @@ fn present(
             if GetForegroundWindow() != hwnd || GetFocus() != edit {
                 logging::warn("panel could not take foreground or focus");
                 if std::env::var_os("QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL").is_none() {
+                    PANEL.with(|slot| {
+                        if let Some(panel) = slot.borrow_mut().as_mut() {
+                            panel.opening = false;
+                        }
+                    });
                     hide_only();
                     return 0;
                 }
@@ -282,6 +294,13 @@ fn present(
         }
         let _ = UpdateWindow(hwnd);
     }
+
+    PANEL.with(|slot| {
+        if let Some(panel) = slot.borrow_mut().as_mut() {
+            panel.opening = false;
+        }
+    });
+
     started.elapsed().as_micros()
 }
 
@@ -548,6 +567,7 @@ fn create() -> Option<Panel> {
         hiding: false,
         quit_on_hide: false,
         monitor: None,
+        opening: false,
     };
 
     let mut rect = RECT::default();
@@ -1204,13 +1224,22 @@ unsafe extern "system" fn window_proc(
         WM_ACTIVATE => {
             let active = (wparam.0 & 0xffff) as u32;
             if active == WA_INACTIVE {
+                // Attaching to the previous foreground thread and detaching can
+                // bounce activation right after the panel appears. Do not treat
+                // that as a user click-away while the panel is still opening.
+                let opening = PANEL.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|panel| panel.opening)
+                        .unwrap_or(true)
+                });
                 let hiding = PANEL.with(|slot| {
                     slot.borrow()
                         .as_ref()
                         .map(|panel| panel.hiding)
                         .unwrap_or(true)
                 });
-                if !hiding {
+                if !hiding && !opening {
                     hide_only();
                 }
             }

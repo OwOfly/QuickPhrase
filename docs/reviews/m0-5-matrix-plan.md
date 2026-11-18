@@ -19,7 +19,7 @@
 
 | # | 宿主 | 版本来源 | 目标控件 | 预期区域 | 预期结果 |
 | --- | --- | --- | --- | --- | --- |
-| H1 | 记事本 | Win32 `Edit` | 编辑区 | `text_editor`（原生） | 单行/多行注入 |
+| H1 | 记事本（Win11） | `Notepad` / `RichEditD2DPT` | 编辑区 | `text_editor`（UIA Document） | **只复制**（实测） |
 | H2 | Word | `OpusApp` / `_WwG` | 文档正文 | `text_editor`（UIA Document） | 仅单行注入；多行只复制 |
 | H3 | VS Code | `Code.exe` / Monaco | 编辑器 | `text_editor`（UIA Text） | 单行注入 |
 | H4 | VS Code | 集成终端 | 终端 | `terminal` | 单行注入；多行只复制 |
@@ -29,6 +29,7 @@
 | H8 | Windows Terminal | `CASCADIA_HOSTING_WINDOW_CLASS` | 终端 | `terminal` | 单行注入；多行只复制 |
 | H9 | 微信 | `WeChatMainWndForPC` | 聊天输入框 | `unknown` | 只复制（预期） |
 | H10 | 本程序自测 | `--inject-test` | 自建 EDIT | `text_editor` | 全文读回一致 |
+| H11 | 独立进程探针 | `scripts/host-probe.rs` | 裸 Win32 `Edit` | `text_editor` | 跨进程注入成功（已实测 10/10） |
 
 > 区域判定由 `capture::region_from` 用 exe/class/UIA hint 推导。**报告必须记录实际判定的 region**，不以预期替代实测。
 

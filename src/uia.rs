@@ -508,11 +508,21 @@ fn compare_element(
         return Some(false);
     }
 
-    if current_read_only(&current) != Some(false) {
+    if current_read_only_or_native(&current, handle) != Some(false) {
         return Some(false);
     }
 
     Some(true)
+}
+
+fn current_read_only_or_native(element: &IUIAutomationElement, native: HWND) -> Option<bool> {
+    // A real Win32 edit control reports its read-only state authoritatively in
+    // its style; the UIA provider may expose only a ValuePattern, which would
+    // otherwise be treated as unknown and rejected.
+    if let Some(value) = context::native_edit_read_only(native) {
+        return Some(value);
+    }
+    current_read_only(element)
 }
 
 fn current_read_only(element: &IUIAutomationElement) -> Option<bool> {

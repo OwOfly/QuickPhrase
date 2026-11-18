@@ -11,17 +11,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetWindowLongW, GetWindowTextW, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW,
-    RegisterClassW, SetForegroundWindow, ShowWindow, TranslateMessage, ES_MULTILINE, GWL_STYLE,
-    HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    GetWindowTextW, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW, RegisterClassW,
+    SetForegroundWindow, ShowWindow, TranslateMessage, ES_MULTILINE, HMENU, IDC_ARROW, MSG,
+    PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::capture::{Report, Target, Timings};
 use crate::{clipboard, context, foreground, logging, uia};
 
 const MAX_UNICODE_UNITS: usize = 2_000;
-const ES_READONLY: i32 = 0x0800;
 
 enum Plan {
     Insert(String),
@@ -222,11 +221,8 @@ fn guard(report: &Report) -> Result<(), &'static str> {
     if report.target.selection.is_none() {
         logging::info("position_unverified");
     }
-    if report.target.focused_is_editable {
-        let style = unsafe { GetWindowLongW(focused, GWL_STYLE) };
-        if style & ES_READONLY != 0 {
-            return Err("read_only_changed");
-        }
+    if report.target.focused_is_editable && context::native_edit_read_only(focused) == Some(true) {
+        return Err("read_only_changed");
     }
 
     if report.identity_source == "uia" {
@@ -274,8 +270,7 @@ fn final_check(report: &Report, target: HWND) -> bool {
 
     if report.target.focused_is_editable {
         let focused = HWND(report.target.focused_hwnd as *mut core::ffi::c_void);
-        let style = unsafe { GetWindowLongW(focused, GWL_STYLE) };
-        if style & ES_READONLY != 0 {
+        if context::native_edit_read_only(focused) == Some(true) {
             return false;
         }
     }
