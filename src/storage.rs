@@ -165,8 +165,13 @@ pub fn init() {
 
 pub fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
     let store = STORE.get()?;
-    let mut guard = store.lock().ok()?;
-    Some(f(&mut guard))
+    match store.lock() {
+        Ok(mut guard) => Some(f(&mut guard)),
+        Err(_) => {
+            logging::error("storage: store mutex poisoned");
+            None
+        }
+    }
 }
 
 /// Snapshot for the panel: id, title, content, category name.
@@ -217,6 +222,8 @@ impl Store {
         let mut notice = None;
         let mut read_only = false;
 
+        clean_stale_temp(dir);
+
         let (mut data, recovered) = match read_with_recovery::<DataFile>(dir, DATA_FILE) {
             Ok((Some(data), source)) => (data, source),
             Ok((None, _)) => (seed(), None),
@@ -244,23 +251,34 @@ impl Store {
             read_only = true;
         }
 
-        let settings = match read_with_recovery::<Settings>(dir, SETTINGS_FILE) {
-            Ok((Some(settings), _)) => settings,
-            Ok((None, _)) => Settings::default(),
-            Err(err) => {
-                logging::warn(&format!("storage: settings.json unusable: {err}"));
-                Settings::default()
-            }
-        };
+        let (settings, settings_recovered) =
+            match read_with_recovery::<Settings>(dir, SETTINGS_FILE) {
+                Ok((Some(settings), source)) => (settings, source),
+                Ok((None, _)) => (Settings::default(), None),
+                Err(err) => {
+                    logging::warn(&format!("storage: settings.json unusable: {err}"));
+                    (Settings::default(), None)
+                }
+            };
+        if settings.schema_version > SCHEMA_VERSION {
+            logging::warn("storage: settings schema is newer; read-only");
+            notice = Some("settings_schema_newer".to_string());
+            read_only = true;
+        }
 
-        let rules = match read_with_recovery::<RulesFile>(dir, RULES_FILE) {
-            Ok((Some(rules), _)) => rules,
-            Ok((None, _)) => RulesFile::default(),
+        let (rules, rules_recovered) = match read_with_recovery::<RulesFile>(dir, RULES_FILE) {
+            Ok((Some(rules), source)) => (rules, source),
+            Ok((None, _)) => (RulesFile::default(), None),
             Err(err) => {
                 logging::warn(&format!("storage: rules-user.json unusable: {err}"));
-                RulesFile::default()
+                (RulesFile::default(), None)
             }
         };
+        if rules.version > 1 {
+            logging::warn("storage: rules version is newer; read-only");
+            notice = Some("rules_version_newer".to_string());
+            read_only = true;
+        }
 
         for snippet in &mut data.snippets {
             snippet.rebuild_blob();
@@ -276,19 +294,20 @@ impl Store {
         };
 
         // Persist a fresh seed, a recovered backup, or default settings so the
-        // next start is stable.
+        // next start is stable. A recovery rewrite must not rotate the known
+        // corrupt main file into a backup slot.
         if !read_only && (recovered.is_some() || !store.path(DATA_FILE).exists()) {
-            if let Err(err) = store.save_data() {
+            if let Err(err) = store.save_data_with(false) {
                 logging::error(&format!("storage: initial save failed: {err}"));
             }
         }
-        if !read_only && !store.path(SETTINGS_FILE).exists() {
+        if !read_only && (settings_recovered.is_some() || !store.path(SETTINGS_FILE).exists()) {
             let settings = store.settings.clone();
-            let _ = store.write_typed(SETTINGS_FILE, &settings);
+            let _ = store.write_typed(SETTINGS_FILE, &settings, false);
         }
-        if !read_only && !store.path(RULES_FILE).exists() {
+        if !read_only && (rules_recovered.is_some() || !store.path(RULES_FILE).exists()) {
             let rules = store.rules.clone();
-            let _ = store.write_typed(RULES_FILE, &rules);
+            let _ = store.write_typed(RULES_FILE, &rules, false);
         }
 
         store
@@ -351,6 +370,10 @@ impl Store {
     }
 
     pub fn save_data(&mut self) -> Result<(), String> {
+        self.save_data_with(true)
+    }
+
+    fn save_data_with(&mut self, rotate_backup: bool) -> Result<(), String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
@@ -359,7 +382,7 @@ impl Store {
         }
         let next_revision = self.data.revision + 1;
         self.data.revision = next_revision;
-        match self.write_typed(DATA_FILE, &self.data) {
+        match self.write_typed(DATA_FILE, &self.data, rotate_backup) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.data.revision = next_revision - 1;
@@ -368,25 +391,44 @@ impl Store {
         }
     }
 
+    /// `useCount` counts attempts that reached `API_EVENTS_ACCEPTED` (§7).
+    /// Rejections still update `lastInsertStatus` for diagnostics.
     pub fn record_use(&mut self, id: &str, status: &str) -> Result<(), String> {
         let now = now_iso();
-        let Some(snippet) = self.data.snippets.iter_mut().find(|item| item.id == id) else {
+        let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
             return Err("snippet_missing".to_string());
         };
-        snippet.use_count += 1;
-        snippet.last_used_at = Some(now.clone());
-        snippet.last_insert_status = Some(status.to_string());
-        snippet.updated_at = now;
-        self.save_data()
+        let previous = self.data.snippets[position].clone();
+        {
+            let snippet = &mut self.data.snippets[position];
+            if status == "accepted" {
+                snippet.use_count += 1;
+                snippet.last_used_at = Some(now.clone());
+            }
+            snippet.last_insert_status = Some(status.to_string());
+            snippet.updated_at = now;
+        }
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(name)
     }
 
-    fn write_typed<T: Serialize>(&self, name: &str, value: &T) -> Result<(), String> {
+    fn write_typed<T: Serialize>(
+        &self,
+        name: &str,
+        value: &T,
+        rotate_backup: bool,
+    ) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
-        write_atomic(&self.dir, name, &bytes)
+        write_atomic(&self.dir, name, &bytes, rotate_backup)
     }
 }
 
@@ -473,6 +515,23 @@ fn read_with_recovery<T: DeserializeOwned>(
 ) -> Result<(Option<T>, Option<PathBuf>), String> {
     let path = dir.join(name);
     if !path.exists() {
+        // A missing main file with surviving backups means the user deleted or
+        // lost it; recover rather than silently seeding over the old data.
+        for backup in backups(dir, name) {
+            match read_json::<T>(&backup) {
+                Ok(value) => {
+                    logging::warn(&format!(
+                        "storage: {name} missing; recovered from {}",
+                        backup.display()
+                    ));
+                    return Ok((Some(value), Some(backup)));
+                }
+                Err(err) => logging::warn(&format!(
+                    "storage: backup {} unusable ({err})",
+                    backup.display()
+                )),
+            }
+        }
         return Ok((None, None));
     }
 
@@ -536,19 +595,56 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
     let directory = dir.join("backups");
     fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
     let stem = name.trim_end_matches(".json");
-    let target = directory.join(format!("{stem}-{}.json", now_stamp()));
-    fs::copy(&source, &target).map_err(|err| err.to_string())?;
+    let target = directory.join(format!("{stem}-{}-{:04}.json", now_stamp(), backup_seq()));
+    let temp = directory.join(format!("{stem}.tmp"));
+    fs::copy(&source, &temp).map_err(|err| err.to_string())?;
+    if let Err(err) = move_file(&temp, &target, true) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
 
-    while backups(dir, name).len() > BACKUP_KEEP {
-        let oldest = backups(dir, name).pop();
-        if let Some(oldest) = oldest {
-            let _ = fs::remove_file(oldest);
+    // Keep the newest BACKUP_KEEP files. A failed delete must not loop: the
+    // list would not change and the write path holds the store lock.
+    let mut existing = backups(dir, name);
+    while existing.len() > BACKUP_KEEP {
+        let oldest = existing.pop();
+        let Some(oldest) = oldest else {
+            break;
+        };
+        if let Err(err) = fs::remove_file(&oldest) {
+            logging::warn(&format!(
+                "storage: cannot prune backup {}: {err}",
+                oldest.display()
+            ));
+            break;
         }
     }
     Ok(())
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
+fn backup_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn clean_stale_temp(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.ends_with(".tmp"))
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Result<(), String> {
     let target = dir.join(name);
     let temp = dir.join(format!("{name}.tmp"));
 
@@ -564,7 +660,9 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
         }
 
         if target.exists() {
-            backup_file(dir, name)?;
+            if rotate_backup {
+                backup_file(dir, name)?;
+            }
             if replace_file(&target, &temp).is_err() {
                 move_file(&temp, &target, true)?;
             }
@@ -755,7 +853,104 @@ mod tests {
             store.save_data().unwrap();
         }
         let count = backups(&dir, DATA_FILE).len();
-        assert!(count <= BACKUP_KEEP, "backups={count}");
+        assert_eq!(count, BACKUP_KEEP, "backups={count}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_main_recovers_from_backup() {
+        let dir = temp_dir("missing");
+        let mut store = Store::load_from(&dir);
+        store.data.snippets[0].title = "第一次".to_string();
+        store.save_data().unwrap();
+        store.data.snippets[0].title = "第二次".to_string();
+        store.save_data().unwrap();
+        fs::remove_file(dir.join(DATA_FILE)).unwrap();
+
+        // The newest backup holds the state before the last save.
+        let recovered = Store::load_from(&dir);
+        assert!(!recovered.is_read_only());
+        assert!(recovered
+            .data()
+            .snippets
+            .iter()
+            .any(|item| item.title == "第一次"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_does_not_backup_the_corrupt_main() {
+        let dir = temp_dir("nopollute");
+        let mut store = Store::load_from(&dir);
+        for _ in 0..6 {
+            store.save_data().unwrap();
+        }
+        fs::write(dir.join(DATA_FILE), b"broken").unwrap();
+
+        let recovered = Store::load_from(&dir);
+        assert!(!recovered.is_read_only());
+        for backup in backups(&dir, DATA_FILE) {
+            let bytes = fs::read(&backup).unwrap();
+            assert!(
+                serde_json::from_slice::<DataFile>(&bytes).is_ok(),
+                "corrupt backup {}",
+                backup.display()
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejected_use_does_not_increment_count() {
+        let dir = temp_dir("rejected");
+        let mut store = Store::load_from(&dir);
+        let id = store.snippets()[0].id.clone();
+        store.record_use(&id, "rejected").unwrap();
+        let snippet = store
+            .data()
+            .snippets
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        assert_eq!(snippet.use_count, 0);
+        assert_eq!(snippet.last_insert_status.as_deref(), Some("rejected"));
+        assert!(snippet.last_used_at.is_none());
+
+        store.record_use(&id, "accepted").unwrap();
+        let snippet = store
+            .data()
+            .snippets
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        assert_eq!(snippet.use_count, 1);
+        assert!(snippet.last_used_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_rejects_save() {
+        let dir = temp_dir("readonlysave");
+        let mut store = Store::load_from(&dir);
+        store.read_only = true;
+        assert_eq!(store.save_data(), Err("read_only".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn older_schema_is_read_only() {
+        let dir = temp_dir("olderschema");
+        let store = Store::load_from(&dir);
+        let mut data = store.data().clone();
+        data.schema_version = 0;
+        fs::write(
+            dir.join(DATA_FILE),
+            serde_json::to_vec_pretty(&data).unwrap(),
+        )
+        .unwrap();
+        let older = Store::load_from(&dir);
+        assert!(older.is_read_only());
+        assert_eq!(older.notice(), Some("schema_older"));
         let _ = fs::remove_dir_all(&dir);
     }
 

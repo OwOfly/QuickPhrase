@@ -19,8 +19,8 @@
 | 只读 | 全部副本损坏、schema 高/低于程序 → `read_only`，不写入，`notice` 说明原因 |
 | 种子 | 首次启动写入 3 条短语 + 2 个分类，内容与 M0 硬编码一致 |
 | 面板接线 | 面板列表改为读取 `storage::panel_items()`，不再有硬编码 `ITEMS` |
-| 使用计数 | 注入 worker 结束后 `record_use(id, status)`，状态为 `accepted/partial/rejected` |
-| 单元测试 | 9 个：种子、revision、record_use、备份裁剪、损坏恢复、全损坏只读、schema 更新、无临时文件、100 轮模拟故障 |
+| 使用计数 | 注入 worker 结束后 `record_use(id, status)`；`useCount`/`lastUsedAt` 只在 `accepted` 时更新，`lastInsertStatus` 记录全部三态 |
+| 单元测试 | 13 个：种子、revision、record_use（含 rejected 不计数）、备份裁剪、损坏恢复、主文件缺失恢复、恢复不污染备份、全损坏只读、schema 新旧、只读拒绝写入、无临时文件、100 轮模拟故障 |
 
 ## 实测
 
@@ -32,6 +32,20 @@ storage: dir=C:\Users\Administrator\AppData\Local\QuickPhrase revision=1 snippet
 - 面板冒烟 10/10（列表已来自存储）。
 - 一次复制路径提交后 `revision=2`，首条 `useCount=1`、`lastInsertStatus=rejected`，证明计数与状态落盘。
 
+## 复核修复（r1）
+
+| 发现 | 处置 |
+| --- | --- |
+| 备份裁剪删除失败会无限自旋 | 改为有界循环，删除失败即 `break` 并记 warn；只枚举一次 |
+| 恢复回写把损坏主文件轮转进备份 | 恢复路径 `save_data_with(false)`，不轮转 |
+| 主文件缺失不查备份直接 seed | 缺失且存在备份时先恢复最新有效备份 |
+| settings/rules 版本不校验、恢复不回写 | 两者版本高于程序即只读；恢复后回写主文件 |
+| `useCount` 对 rejected 也 +1 | 仅 `accepted` 递增；三态都记 `lastInsertStatus`；保存失败回滚内存字段 |
+| 备份同毫秒同名覆盖 | 文件名追加单调序号 |
+| 备份复制崩在半途 | 先写 `.tmp` 再改名 |
+| 备份测试 `<= 5` 恒真 | 收紧为 `== 5` |
+| 陈旧 `.tmp` 残留 | 启动时清理 |
+
 ## 已知偏差 / 未覆盖
 
 - **100 次故障注入**为模拟损坏（截断主文件），非真实断电/磁盘满；真实故障注入待补。
@@ -40,7 +54,7 @@ storage: dir=C:\Users\Administrator\AppData\Local\QuickPhrase revision=1 snippet
 - 未加跨进程文件锁；依赖单实例互斥，进程内由 `Mutex<Store>` 串行化。
 - 设置与规则只落盘，未接 UI/规则求值（M1-5/M1-7）。
 - `searchBlob` 已生成并持久化，检索打分在 M1-2。
-- 面板只在启动时读取一次快照；M1-4 的 CRUD 需要重新加载。
+- 面板每次热键激活都重新读取 `storage::panel_items()`（不是只在启动时读一次）。
 
 ## 结论
 
