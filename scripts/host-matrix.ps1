@@ -12,6 +12,11 @@ $exe = Join-Path $root "target\release\quickphrase.exe"
 $log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 $outDir = Join-Path $env:TEMP "qp-host-probe"
 
+# The resident instance locks target\release\quickphrase.exe, so stop it before
+# building; the test starts a fresh process afterwards.
+Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 400
+
 if (-not $SkipBuild) {
     Push-Location $root
     try {

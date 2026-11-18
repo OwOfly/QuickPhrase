@@ -8,6 +8,10 @@ $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
 $log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
 
+# A resident instance locks the release binary, so stop it before building.
+Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Sleep -Milliseconds 400
+
 if (-not $SkipBuild) {
     Push-Location $root
     try {
