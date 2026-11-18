@@ -27,11 +27,11 @@ public class QPPanelSmoke {
   public delegate bool EnumProc(IntPtr h, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr l);
+  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll", EntryPoint="PostMessageW")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   public struct RECT { public int Left, Top, Right, Bottom; }
 }
@@ -66,6 +66,9 @@ function Find-Edit([IntPtr]$Panel) {
         return $true
     }
     [void][QPPanelSmoke]::EnumChildWindows($Panel, $callback, [IntPtr]::Zero)
+    if ($script:edit -ne [IntPtr]::Zero -and [QPPanelSmoke]::GetParent($script:edit) -ne $Panel) {
+        throw "edit parent mismatch"
+    }
     return $script:edit
 }
 
@@ -89,6 +92,8 @@ if ([QPPanelSmoke]::GetForegroundWindow() -eq [IntPtr]::Zero) {
 }
 
 # 2. show via hotkey message
+$env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
+$beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
 $app = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Milliseconds 900
 $before = 0
@@ -101,7 +106,7 @@ Start-Sleep -Milliseconds 900
 Find-Windows
 Check "panel visible after hotkey" ($panel -ne [IntPtr]::Zero -and [QPPanelSmoke]::IsWindowVisible($panel)) ""
 
-# 3. screenshot evidence
+# 3. size check
 if ($panel -ne [IntPtr]::Zero) {
     $rect = New-Object QPPanelSmoke+RECT
     [void][QPPanelSmoke]::GetWindowRect($panel, [ref]$rect)
@@ -114,6 +119,7 @@ $edit = Find-Edit $panel
 Start-Sleep -Milliseconds 600
 Find-Windows
 Check "Esc hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
+Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $beforeForeground) ""
 
 # 5. Enter commits first item and hides
 [void][QPPanelSmoke]::PostMessage($main, 0x0312, [IntPtr]1, [IntPtr]::Zero)
@@ -127,12 +133,14 @@ $newLines = @()
 if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before }
 $newText = $newLines -join "`n"
 Check "Enter hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
-Check "commit logged" ($newText -match "panel commit: title=") ""
+Check "commit logged first item" ($newText -match "panel commit: index=0 ") ""
+Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $beforeForeground) ""
 
 # 6. close app
 [void][QPPanelSmoke]::PostMessage($main, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 700
-Check "app exits" ($app.HasExited) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "n/a" }))
+Check "app exits 0" ($app.HasExited -and $app.ExitCode -eq 0) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "n/a" }))
+Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL -ErrorAction SilentlyContinue
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize

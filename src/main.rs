@@ -60,11 +60,15 @@ fn main() {
         logging::info(&format!(
             "panel bench: n=100 p50={p50}us p95={p95}us max={max}us"
         ));
+        panel::shutdown();
         return;
     }
 
     if panel_test {
-        panel::show_test();
+        if panel::show_test() == 0 {
+            logging::error("panel-test failed to create or show the panel");
+            return;
+        }
         let mut message = MSG::default();
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
             unsafe {
@@ -72,6 +76,7 @@ fn main() {
                 DispatchMessageW(&message);
             }
         }
+        panel::shutdown();
         logging::info("panel-test done");
         return;
     }

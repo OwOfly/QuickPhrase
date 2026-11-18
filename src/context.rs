@@ -1,7 +1,8 @@
 use std::sync::OnceLock;
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, POINT, RECT};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
     TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
@@ -141,7 +142,25 @@ pub fn snapshot() -> Option<WindowContext> {
     if unsafe { GetGUIThreadInfo(tid, &mut gui) }.is_ok() {
         focused = gui.hwndFocus;
         if !gui.hwndCaret.0.is_null() {
-            caret = Some(gui.rcCaret);
+            // GUITHREADINFO.rcCaret is in client coordinates relative to hwndCaret.
+            let mut top_left = POINT {
+                x: gui.rcCaret.left,
+                y: gui.rcCaret.top,
+            };
+            let mut bottom_right = POINT {
+                x: gui.rcCaret.right,
+                y: gui.rcCaret.bottom,
+            };
+            if unsafe { ClientToScreen(gui.hwndCaret, &mut top_left) }.as_bool()
+                && unsafe { ClientToScreen(gui.hwndCaret, &mut bottom_right) }.as_bool()
+            {
+                caret = Some(RECT {
+                    left: top_left.x,
+                    top: top_left.y,
+                    right: bottom_right.x,
+                    bottom: bottom_right.y,
+                });
+            }
         }
     }
 

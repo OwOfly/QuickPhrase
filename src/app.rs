@@ -159,6 +159,8 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         logging::warn("uia warmup failed; captures will be copy-only");
     }
 
+    panel::precreate();
+
     logging::info(&format!(
         "ready in {} ms (pid {})",
         started.elapsed().as_millis(),
@@ -239,39 +241,7 @@ unsafe extern "system" fn window_proc(
         WM_HOTKEY => {
             if wparam.0 as i32 == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
-
-                if panel::is_visible() {
-                    panel::hide_and_restore();
-                    logging::info("panel closed by hotkey");
-                    return LRESULT(0);
-                }
-
-                let started = Instant::now();
-                match capture::once() {
-                    Some(report) => {
-                        logging::info(&format!("capture: {}", report.summary()));
-                        let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
-                        let caret = report.target.caret.map(|rect| RECT {
-                            left: rect[0],
-                            top: rect[1],
-                            right: rect[2],
-                            bottom: rect[3],
-                        });
-                        let micros = panel::show(target, caret, &report.summary());
-                        logging::info(&format!(
-                            "panel shown in {micros} us; capture total {} ms",
-                            report.timings_ms.total
-                        ));
-                    }
-                    None => {
-                        logging::warn("capture returned no usable foreground window");
-                        tray::balloon(hwnd, "QuickPhrase", "未捕获到前台窗口");
-                    }
-                }
-                logging::info(&format!(
-                    "capture pipeline took {} ms",
-                    started.elapsed().as_millis()
-                ));
+                activate_panel();
             }
             LRESULT(0)
         }
@@ -283,7 +253,7 @@ unsafe extern "system" fn window_proc(
             let event = (lparam.0 & 0xffff) as u32;
             match event {
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                WM_LBUTTONDBLCLK => open_panel(),
+                WM_LBUTTONDBLCLK => activate_panel(),
                 _ => {}
             }
             LRESULT(0)
@@ -300,6 +270,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            panel::shutdown();
             let (tray_ok, hotkey_ok) = STATE.with(|state| {
                 let state = state.borrow();
                 (state.tray_ok, state.hotkey_ok)
@@ -365,7 +336,7 @@ unsafe fn show_menu(hwnd: HWND) {
 
 fn handle_command(id: u32) {
     match id {
-        ID_OPEN => open_panel(),
+        ID_OPEN => activate_panel(),
         ID_MANAGE => platform::info_box("QuickPhrase", "短语管理将在 M1 实现。"),
         ID_PAUSE => toggle_hotkey(),
         ID_SETTINGS => platform::info_box("QuickPhrase", "设置将在 M1 实现。"),
@@ -380,9 +351,52 @@ fn handle_command(id: u32) {
     }
 }
 
-fn open_panel() {
-    logging::info("open panel requested (placeholder)");
-    platform::info_box("QuickPhrase", "快捷面板将在 M0-3 实现。");
+fn activate_panel() {
+    if panel::is_visible() {
+        panel::hide_and_restore();
+        logging::info("panel closed");
+        return;
+    }
+
+    let started = Instant::now();
+    let main = STATE.with(|state| state.borrow().hwnd);
+
+    match capture::once() {
+        Some(report) => {
+            logging::info(&format!("capture: {}", report.summary()));
+            let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
+            let caret = report.target.caret.map(|rect| RECT {
+                left: rect[0],
+                top: rect[1],
+                right: rect[2],
+                bottom: rect[3],
+            });
+            let micros = panel::show(target, caret, &report.summary());
+
+            if micros == 0 {
+                logging::warn("panel show failed (creation or foreground)");
+                if !main.0.is_null() {
+                    tray::balloon(main, "QuickPhrase", "无法显示面板，请重试");
+                }
+            } else {
+                logging::info(&format!(
+                    "panel shown in {micros} us; capture total {} ms",
+                    report.timings_ms.total
+                ));
+            }
+        }
+        None => {
+            logging::warn("capture returned no usable foreground window");
+            if !main.0.is_null() {
+                tray::balloon(main, "QuickPhrase", "未捕获到前台窗口");
+            }
+        }
+    }
+
+    logging::info(&format!(
+        "capture pipeline took {} ms",
+        started.elapsed().as_millis()
+    ));
 }
 
 fn toggle_hotkey() {
@@ -428,7 +442,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M0-1 骨架）\n\
+             全局快捷短语输入器（M0-3 快捷面板）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()

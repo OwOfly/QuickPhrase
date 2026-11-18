@@ -1,9 +1,12 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
+    RECT, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
@@ -19,8 +22,12 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::Ime::{
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SetFocus, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_RETURN, VK_UP,
+    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_MENU,
+    VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -43,6 +50,9 @@ const LB_GETCOUNT: u32 = 0x018B;
 const LB_SETITEMHEIGHT: u32 = 0x01A0;
 const EM_SETSEL: u32 = 0x00B1;
 const EM_SETCUEBANNER: u32 = 0x1501;
+const EM_LIMITTEXT: u32 = 0x00C5;
+const LBN_SELCHANGE_CODE: u32 = 1;
+const LBN_SETFOCUS_CODE: u32 = 4;
 
 struct Item {
     title: &'static str,
@@ -95,6 +105,7 @@ struct Panel {
     dpi: u32,
     hiding: bool,
     quit_on_hide: bool,
+    monitor: Option<crate::foreground::Monitor>,
 }
 
 thread_local! {
@@ -102,13 +113,14 @@ thread_local! {
 }
 
 static OLD_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
+static CREATE_FAILED: AtomicBool = AtomicBool::new(false);
 
 fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
 }
 
 fn scaled(value: i32, dpi: u32) -> i32 {
-    value * dpi as i32 / 96
+    (value * dpi as i32 + 48) / 96
 }
 
 fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
@@ -171,6 +183,16 @@ fn destroy_brushes(brushes: &Brushes) {
     }
 }
 
+pub fn precreate() {
+    let needs_create =
+        PANEL.with(|slot| slot.borrow().is_none()) && !CREATE_FAILED.load(Ordering::Relaxed);
+    if needs_create {
+        if let Some(panel) = create() {
+            PANEL.with(|slot| *slot.borrow_mut() = Some(panel));
+        }
+    }
+}
+
 pub fn is_visible() -> bool {
     PANEL.with(|slot| {
         slot.borrow()
@@ -195,6 +217,7 @@ fn present(
     activate: bool,
     quit_on_hide: bool,
 ) -> u128 {
+    let started = Instant::now();
     let needs_create = PANEL.with(|slot| slot.borrow().is_none());
     if needs_create {
         if let Some(panel) = create() {
@@ -212,6 +235,9 @@ fn present(
         panel.summary = summary.to_string();
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
+        if activate && panel.monitor.is_none() {
+            panel.monitor = crate::foreground::start();
+        }
         (panel.hwnd, panel.edit)
     });
 
@@ -221,21 +247,23 @@ fn present(
 
     place();
     apply_rounding(hwnd);
-    PANEL.with(|slot| {
-        if let Some(panel) = slot.borrow_mut().as_mut() {
-            populate(panel, "");
-        }
-    });
+    unsafe {
+        let _ = SetWindowTextW(edit, w!(""));
+    }
+    populate("");
 
-    let started = Instant::now();
     unsafe {
         let _ = ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
         if activate {
             force_foreground(hwnd);
             let _ = SetFocus(Some(edit));
             let _ = send(edit, EM_SETSEL, 0, -1);
-            if GetForegroundWindow() != hwnd {
-                logging::warn("panel is visible but could not take foreground");
+            if GetForegroundWindow() != hwnd || GetFocus() != edit {
+                logging::warn("panel could not take foreground or focus");
+                if std::env::var_os("QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL").is_none() {
+                    hide_only();
+                    return 0;
+                }
             }
         }
         let _ = UpdateWindow(hwnd);
@@ -261,14 +289,37 @@ fn hide(restore: bool) {
         (panel.hwnd, panel.target, panel.quit_on_hide)
     });
 
-    if !hwnd.0.is_null() {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
+    if hwnd.0.is_null() {
+        return;
     }
+
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+        PANEL.with(|slot| {
+            if let Some(panel) = slot.borrow_mut().as_mut() {
+                panel.hiding = false;
+            }
+        });
+        return;
+    }
+
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+
+    let monitor = PANEL.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|panel| panel.monitor.take())
+    });
+    drop(monitor);
+
     if restore && !target.0.is_null() {
-        unsafe {
-            let _ = SetForegroundWindow(target);
+        if unsafe { IsWindow(Some(target)) }.as_bool() {
+            if !unsafe { SetForegroundWindow(target) }.as_bool() {
+                logging::warn("restore foreground failed");
+            }
+        } else {
+            logging::warn("restore target no longer exists");
         }
     }
 
@@ -299,8 +350,13 @@ fn create() -> Option<Panel> {
         lpszMenuName: PCWSTR::null(),
         lpszClassName: PANEL_CLASS,
     };
-    unsafe {
-        let _ = RegisterClassW(&class);
+    if unsafe { RegisterClassW(&class) } == 0 {
+        let error = unsafe { GetLastError() };
+        if error != ERROR_CLASS_ALREADY_EXISTS {
+            logging::error(&format!("RegisterClassW(Panel) failed: {error:?}"));
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
     }
 
     let hwnd = unsafe {
@@ -326,7 +382,7 @@ fn create() -> Option<Panel> {
     let fonts = make_fonts(dpi);
     let brushes = make_brushes();
 
-    let edit = unsafe {
+    let edit = match unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("EDIT"),
@@ -341,8 +397,19 @@ fn create() -> Option<Panel> {
             Some(instance),
             None,
         )
-    }
-    .ok()?;
+    } {
+        Ok(edit) => edit,
+        Err(err) => {
+            logging::error(&format!("CreateWindowExW(EDIT) failed: {err}"));
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
 
     let list = unsafe {
         CreateWindowExW(
@@ -368,7 +435,7 @@ fn create() -> Option<Panel> {
     }
     .ok()?;
 
-    let footer = unsafe {
+    let footer = match unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
@@ -383,8 +450,19 @@ fn create() -> Option<Panel> {
             Some(instance),
             None,
         )
-    }
-    .ok()?;
+    } {
+        Ok(footer) => footer,
+        Err(err) => {
+            logging::error(&format!("CreateWindowExW(STATIC) failed: {err}"));
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
 
     for control in [edit, list, footer] {
         unsafe {
@@ -395,12 +473,13 @@ fn create() -> Option<Panel> {
     let cue = platform::wide("搜索短语…");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
+        let _ = send(edit, EM_LIMITTEXT, 200, 0);
         let old = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as usize as isize);
         OLD_EDIT_PROC.store(old, Ordering::Relaxed);
         let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
     }
 
-    let mut panel = Panel {
+    let panel = Panel {
         hwnd,
         edit,
         list,
@@ -414,13 +493,21 @@ fn create() -> Option<Panel> {
         dpi,
         hiding: false,
         quit_on_hide: false,
+        monitor: None,
     };
 
     let mut rect = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut rect);
     }
-    panel.layout(rect.right, rect.bottom);
+    layout_controls(
+        panel.edit,
+        panel.list,
+        panel.footer,
+        panel.dpi,
+        rect.right,
+        rect.bottom,
+    );
 
     Some(panel)
 }
@@ -431,18 +518,68 @@ fn commit() {
         let panel = guard.as_ref()?;
         let index = panel.selected_index()?;
         let item_index = *panel.filtered.get(index)?;
-        let item = &ITEMS[item_index];
-        Some((item.title, item.category, panel.summary.clone()))
+        Some((
+            item_index,
+            ITEMS[item_index].category,
+            panel.summary.clone(),
+        ))
     });
 
-    if let Some((title, category, summary)) = info {
-        logging::info(&format!(
-            "panel commit: title={title} category={category} (M0-4 will insert)"
-        ));
-        logging::info(&format!("panel capture context: {summary}"));
-    }
+    let Some((item_index, category, summary)) = info else {
+        logging::info("panel commit ignored: no matching item");
+        return;
+    };
+
+    logging::info(&format!(
+        "panel commit: index={item_index} category={category} (M0-4 will insert)"
+    ));
+    logging::info(&format!("panel capture context: {summary}"));
 
     hide_and_restore();
+}
+
+fn apply_dpi(dpi: u32) {
+    if dpi == 0 {
+        return;
+    }
+
+    let changed = PANEL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(panel) = guard.as_mut() else {
+            return false;
+        };
+        if panel.dpi == dpi {
+            return false;
+        }
+        destroy_fonts(&panel.fonts);
+        panel.fonts = make_fonts(dpi);
+        panel.dpi = dpi;
+        true
+    });
+
+    if !changed {
+        return;
+    }
+
+    let (edit, list, footer, font) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        let Some(panel) = guard.as_ref() else {
+            return (
+                HWND::default(),
+                HWND::default(),
+                HWND::default(),
+                HFONT::default(),
+            );
+        };
+        (panel.edit, panel.list, panel.footer, panel.fonts.body)
+    });
+
+    unsafe {
+        for control in [edit, list, footer] {
+            let _ = send(control, WM_SETFONT, font.0 as usize, 1);
+        }
+        let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
+    }
 }
 
 fn place() {
@@ -491,32 +628,12 @@ fn place() {
         dpi = dpi_x;
     }
 
-    if dpi != old_dpi {
-        let (edit, list, footer, font) = PANEL.with(|slot| {
-            let mut guard = slot.borrow_mut();
-            let Some(panel) = guard.as_mut() else {
-                return (
-                    HWND::default(),
-                    HWND::default(),
-                    HWND::default(),
-                    HFONT::default(),
-                );
-            };
-            destroy_fonts(&panel.fonts);
-            panel.fonts = make_fonts(dpi);
-            panel.dpi = dpi;
-            (panel.edit, panel.list, panel.footer, panel.fonts.body)
-        });
-        unsafe {
-            for control in [edit, list, footer] {
-                let _ = send(control, WM_SETFONT, font.0 as usize, 1);
-            }
-            let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
-        }
-    }
+    apply_dpi(dpi);
 
-    let width = scaled(PANEL_WIDTH, dpi);
-    let height = scaled(PANEL_HEIGHT, dpi);
+    let work_width = (work.right - work.left).max(1);
+    let work_height = (work.bottom - work.top).max(1);
+    let width = scaled(PANEL_WIDTH, dpi).min((work_width - scaled(16, dpi)).max(1));
+    let height = scaled(PANEL_HEIGHT, dpi).min((work_height - scaled(16, dpi)).max(1));
     let mut x = anchor.x;
     let mut y = anchor.y + scaled(8, dpi);
 
@@ -544,46 +661,46 @@ fn place() {
     }
 }
 
-impl Panel {
-    fn layout(&mut self, width: i32, height: i32) {
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        let margin = scaled(16, self.dpi);
-        let edit_height = scaled(34, self.dpi);
-        let footer_height = scaled(22, self.dpi);
-        let gap = scaled(10, self.dpi);
-
-        unsafe {
-            let _ = MoveWindow(
-                self.edit,
-                margin,
-                scaled(14, self.dpi),
-                width - margin * 2,
-                edit_height,
-                true,
-            );
-            let list_top = scaled(14, self.dpi) + edit_height + gap;
-            let list_height = height - list_top - footer_height - scaled(12, self.dpi);
-            let _ = MoveWindow(
-                self.list,
-                scaled(10, self.dpi),
-                list_top,
-                width - scaled(20, self.dpi),
-                list_height,
-                true,
-            );
-            let _ = MoveWindow(
-                self.footer,
-                margin,
-                height - footer_height - scaled(8, self.dpi),
-                width - margin * 2,
-                footer_height,
-                true,
-            );
-        }
+fn layout_controls(edit: HWND, list: HWND, footer: HWND, dpi: u32, width: i32, height: i32) {
+    if width <= 0 || height <= 0 {
+        return;
     }
+    let margin = scaled(16, dpi);
+    let edit_height = scaled(34, dpi);
+    let footer_height = scaled(22, dpi);
+    let gap = scaled(10, dpi);
 
+    unsafe {
+        let _ = MoveWindow(
+            edit,
+            margin,
+            scaled(14, dpi),
+            width - margin * 2,
+            edit_height,
+            true,
+        );
+        let list_top = scaled(14, dpi) + edit_height + gap;
+        let list_height = (height - list_top - footer_height - scaled(12, dpi)).max(0);
+        let _ = MoveWindow(
+            list,
+            scaled(10, dpi),
+            list_top,
+            width - scaled(20, dpi),
+            list_height,
+            true,
+        );
+        let _ = MoveWindow(
+            footer,
+            margin,
+            height - footer_height - scaled(8, dpi),
+            width - margin * 2,
+            footer_height,
+            true,
+        );
+    }
+}
+
+impl Panel {
     fn selected_index(&self) -> Option<usize> {
         let index = unsafe { send(self.list, LB_GETCURSEL, 0, 0) }.0;
         if index < 0 {
@@ -592,17 +709,25 @@ impl Panel {
             Some(index as usize)
         }
     }
+}
 
-    fn move_selection(&mut self, delta: i32) {
-        let count = unsafe { send(self.list, LB_GETCOUNT, 0, 0) }.0 as i32;
-        if count <= 0 {
-            return;
-        }
-        let current = self.selected_index().unwrap_or(0) as i32;
-        let next = (current + delta).clamp(0, count - 1);
-        unsafe {
-            let _ = send(self.list, LB_SETCURSEL, next as usize, 0);
-        }
+fn move_selection(delta: i32) {
+    let (list, current, count) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        let Some(panel) = guard.as_ref() else {
+            return (HWND::default(), 0, 0);
+        };
+        let count = unsafe { send(panel.list, LB_GETCOUNT, 0, 0) }.0 as i32;
+        let current = panel.selected_index().unwrap_or(0) as i32;
+        (panel.list, current, count)
+    });
+
+    if list.0.is_null() || count <= 0 {
+        return;
+    }
+    let next = (current + delta).clamp(0, count - 1);
+    unsafe {
+        let _ = send(list, LB_SETCURSEL, next as usize, 0);
     }
 }
 
@@ -621,6 +746,10 @@ fn force_foreground(hwnd: HWND) {
         let mut pid = 0u32;
         let foreground_thread = GetWindowThreadProcessId(foreground, Some(&mut pid));
         let current_thread = GetCurrentThreadId();
+        if IsHungAppWindow(foreground).as_bool() {
+            return;
+        }
+
         if foreground_thread != 0 && foreground_thread != current_thread {
             let _ = AttachThreadInput(current_thread, foreground_thread, true);
             let _ = SetForegroundWindow(hwnd);
@@ -642,9 +771,9 @@ fn apply_rounding(hwnd: HWND) {
     }
 }
 
-fn populate(panel: &mut Panel, query: &str) {
+fn filter_items(query: &str) -> Vec<usize> {
     let query = query.trim().to_lowercase();
-    panel.filtered = ITEMS
+    ITEMS
         .iter()
         .enumerate()
         .filter(|(_, item)| {
@@ -653,22 +782,34 @@ fn populate(panel: &mut Panel, query: &str) {
                 || item.content.to_lowercase().contains(&query)
         })
         .map(|(index, _)| index)
+        .collect()
+}
+
+fn populate(query: &str) {
+    let filtered = filter_items(query);
+    let titles: Vec<Vec<u16>> = filtered
+        .iter()
+        .map(|index| platform::wide(ITEMS[*index].title))
         .collect();
 
+    let list = PANEL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let panel = guard.as_mut()?;
+        panel.filtered = filtered;
+        Some(panel.list)
+    });
+
+    let Some(list) = list else {
+        return;
+    };
+
     unsafe {
-        let _ = send(panel.list, LB_RESETCONTENT, 0, 0);
-    }
-
-    for index in &panel.filtered {
-        let title = platform::wide(ITEMS[*index].title);
-        unsafe {
-            let _ = send(panel.list, LB_ADDSTRING, 0, title.as_ptr() as isize);
+        let _ = send(list, LB_RESETCONTENT, 0, 0);
+        for title in &titles {
+            let _ = send(list, LB_ADDSTRING, 0, title.as_ptr() as isize);
         }
-    }
-
-    if !panel.filtered.is_empty() {
-        unsafe {
-            let _ = send(panel.list, LB_SETCURSEL, 0, 0);
+        if !titles.is_empty() {
+            let _ = send(list, LB_SETCURSEL, 0, 0);
         }
     }
 }
@@ -683,16 +824,39 @@ fn read_text(hwnd: HWND) -> String {
     }
 }
 
+fn modifiers_down() -> bool {
+    unsafe {
+        GetKeyState(VK_CONTROL.0 as i32) < 0
+            || GetKeyState(VK_SHIFT.0 as i32) < 0
+            || GetKeyState(VK_MENU.0 as i32) < 0
+    }
+}
+
+fn ime_composing(hwnd: HWND) -> bool {
+    unsafe {
+        let context = ImmGetContext(hwnd);
+        if context.0.is_null() {
+            return false;
+        }
+        let length = ImmGetCompositionStringW(context, GCS_COMPSTR, None, 0);
+        let _ = ImmReleaseContext(hwnd, context);
+        length > 0
+    }
+}
+
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_KEYDOWN {
+    if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
         let key = wparam.0 as u16;
 
         if key == VK_RETURN.0 {
+            if ime_composing(hwnd) {
+                return call_default_edit(hwnd, message, wparam, lparam);
+            }
             commit();
             return LRESULT(0);
         }
@@ -700,6 +864,10 @@ unsafe extern "system" fn edit_proc(
         if key == VK_ESCAPE.0 {
             hide_and_restore();
             return LRESULT(0);
+        }
+
+        if modifiers_down() {
+            return call_default_edit(hwnd, message, wparam, lparam);
         }
 
         let delta = if key == VK_UP.0 {
@@ -715,21 +883,21 @@ unsafe extern "system" fn edit_proc(
         };
 
         if let Some(delta) = delta {
-            PANEL.with(|slot| {
-                if let Some(panel) = slot.borrow_mut().as_mut() {
-                    panel.move_selection(delta);
-                }
-            });
+            move_selection(delta);
             return LRESULT(0);
         }
     }
 
+    call_default_edit(hwnd, message, wparam, lparam)
+}
+
+fn call_default_edit(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     let old = OLD_EDIT_PROC.load(Ordering::Relaxed);
     if old == 0 {
-        return DefWindowProcW(hwnd, message, wparam, lparam);
+        return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
     }
-    let previous: WNDPROC = std::mem::transmute::<isize, WNDPROC>(old);
-    CallWindowProcW(previous, hwnd, message, wparam, lparam)
+    let previous: WNDPROC = unsafe { std::mem::transmute::<isize, WNDPROC>(old) };
+    unsafe { CallWindowProcW(previous, hwnd, message, wparam, lparam) }
 }
 
 unsafe extern "system" fn window_proc(
@@ -739,19 +907,42 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_SIZE => {
+            let width = (lparam.0 & 0xffff) as i32;
+            let height = ((lparam.0 >> 16) & 0xffff) as i32;
+            let parts = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| (panel.edit, panel.list, panel.footer, panel.dpi))
+            });
+            if let Some((edit, list, footer, dpi)) = parts {
+                layout_controls(edit, list, footer, dpi, width, height);
+            }
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let control = (wparam.0 & 0xffff) as i32;
             let code = ((wparam.0 >> 16) & 0xffff) as u32;
             if control == EDIT_ID && code == EN_CHANGE {
                 let edit = HWND(lparam.0 as *mut core::ffi::c_void);
                 let text = read_text(edit);
-                PANEL.with(|slot| {
-                    if let Some(panel) = slot.borrow_mut().as_mut() {
-                        populate(panel, &text);
-                    }
-                });
+                populate(&text);
             } else if control == LIST_ID && code == LBN_DBLCLK {
                 commit();
+            } else if control == LIST_ID
+                && (code == LBN_SELCHANGE_CODE || code == LBN_SETFOCUS_CODE)
+            {
+                let edit = PANEL.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|panel| panel.edit)
+                        .unwrap_or_default()
+                });
+                if !edit.0.is_null() {
+                    unsafe {
+                        let _ = SetFocus(Some(edit));
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -763,6 +954,7 @@ unsafe extern "system" fn window_proc(
                         draw_item(panel, draw);
                     }
                 });
+                return LRESULT(1);
             }
             LRESULT(0)
         }
@@ -860,15 +1052,20 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            let mut rect = RECT::default();
+            let dpi = (wparam.0 & 0xffff) as u32;
+            apply_dpi(dpi);
+            let suggested = &*(lparam.0 as *const RECT);
             unsafe {
-                let _ = GetClientRect(hwnd, &mut rect);
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
             }
-            PANEL.with(|slot| {
-                if let Some(panel) = slot.borrow_mut().as_mut() {
-                    panel.layout(rect.right, rect.bottom);
-                }
-            });
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
@@ -957,6 +1154,9 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 }
 
 pub fn bench(iterations: u32) -> (u128, u128, u128) {
+    if iterations == 0 {
+        return (0, 0, 0);
+    }
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let elapsed = present(HWND::default(), None, "bench", false, false);
@@ -970,12 +1170,47 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     (p50, p95, max)
 }
 
-#[allow(dead_code)]
-fn shutdown() {
-    PANEL.with(|slot| {
-        if let Some(panel) = slot.borrow_mut().take() {
-            destroy_fonts(&panel.fonts);
-            destroy_brushes(&panel.brushes);
+pub fn shutdown() {
+    // Take the panel out first: DestroyWindow dispatches messages that would
+    // re-enter the window procedure and try to borrow PANEL again.
+    let panel = PANEL.with(|slot| slot.borrow_mut().take());
+    let Some(panel) = panel else {
+        return;
+    };
+
+    unsafe {
+        let old = OLD_EDIT_PROC.load(Ordering::Relaxed);
+        if old != 0 {
+            let _ = SetWindowLongPtrW(panel.edit, GWLP_WNDPROC, old);
+            OLD_EDIT_PROC.store(0, Ordering::Relaxed);
         }
-    });
+        let _ = DestroyWindow(panel.hwnd);
+    }
+    destroy_fonts(&panel.fonts);
+    destroy_brushes(&panel.brushes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filter_items, scaled};
+
+    #[test]
+    fn empty_query_returns_every_item() {
+        assert_eq!(filter_items(""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn query_matches_title_and_content() {
+        assert_eq!(filter_items("项目"), vec![0]);
+        assert_eq!(filter_items("JSON"), vec![2]);
+        assert!(filter_items("does-not-exist").is_empty());
+    }
+
+    #[test]
+    fn scaling_rounds_to_nearest_pixel() {
+        assert_eq!(scaled(520, 96), 520);
+        assert_eq!(scaled(520, 120), 650);
+        assert_eq!(scaled(420, 200), 875);
+        assert_eq!(scaled(34, 125), 44);
+    }
 }

@@ -95,7 +95,9 @@ impl Drop for Monitor {
             let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
         }
         if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+            // Detach instead of join: a hook thread stuck in a provider callback
+            // must never block panel hide or application shutdown.
+            drop(handle);
         }
     }
 }

@@ -41,7 +41,7 @@ cargo build --release
 .\target\release\quickphrase.exe
 ```
 
-- 托盘出现图标后，按 `Ctrl + Alt + Q` 触发占位提示
+- 托盘出现图标后，按 `Ctrl + Alt + Q` 打开快捷面板
 - 重复启动不会产生第二个进程，会唤起已有实例
 - 托盘菜单「暂停快捷键」可注销热键，再次点击恢复
 
@@ -115,7 +115,7 @@ scripts/panel-smoke.ps1    M0-3 面板冒烟测试
 docs/_ref/         方案、PRD、评审记录
 ```
 
-## 已知限制（M0-1 阶段）
+## 已知限制（M0-3 阶段）
 
 - 托盘使用系统默认应用图标，正式图标在 M1-9 打包阶段替换。
 - 热键目前是写死的 `Ctrl+Alt+Q`，设置界面在 M1-5。
