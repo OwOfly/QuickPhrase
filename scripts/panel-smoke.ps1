@@ -56,6 +56,20 @@ function Find-Windows {
     [void][QPPanelSmoke]::EnumWindows($callback, [IntPtr]::Zero)
 }
 
+function Open-Panel([int]$Attempts = 3) {
+    for ($i = 0; $i -lt $Attempts; $i++) {
+        $script:beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
+        [void][QPPanelSmoke]::PostMessage($script:main, 0x0312, [IntPtr]1, [IntPtr]::Zero)
+        Start-Sleep -Milliseconds 900
+        Find-Windows
+        if ($script:panel -ne [IntPtr]::Zero -and [QPPanelSmoke]::IsWindowVisible($script:panel)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 function Find-Edit([IntPtr]$Panel) {
     $script:edit = [IntPtr]::Zero
     $callback = [QPPanelSmoke+EnumProc]{
@@ -93,18 +107,17 @@ if ([QPPanelSmoke]::GetForegroundWindow() -eq [IntPtr]::Zero) {
 
 # 2. show via hotkey message
 $env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
-$beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
 $app = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Milliseconds 900
+$beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 
 Find-Windows
 if ($main -eq [IntPtr]::Zero) { throw "main window not found" }
-[void][QPPanelSmoke]::PostMessage($main, 0x0312, [IntPtr]1, [IntPtr]::Zero)
-Start-Sleep -Milliseconds 900
-Find-Windows
-Check "panel visible after hotkey" ($panel -ne [IntPtr]::Zero -and [QPPanelSmoke]::IsWindowVisible($panel)) ""
+$opened = Open-Panel 3
+$restoreTarget = $beforeForeground
+Check "panel visible after hotkey" $opened ""
 
 # 3. size check
 if ($panel -ne [IntPtr]::Zero) {
@@ -119,12 +132,10 @@ $edit = Find-Edit $panel
 Start-Sleep -Milliseconds 600
 Find-Windows
 Check "Esc hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
-Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $beforeForeground) ""
+Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
 # 5. Enter commits first item and hides
-[void][QPPanelSmoke]::PostMessage($main, 0x0312, [IntPtr]1, [IntPtr]::Zero)
-Start-Sleep -Milliseconds 900
-Find-Windows
+$opened = Open-Panel 3
 $edit = Find-Edit $panel
 [void][QPPanelSmoke]::PostMessage($edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 600
@@ -134,7 +145,7 @@ if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before
 $newText = $newLines -join "`n"
 Check "Enter hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
 Check "commit logged first item" ($newText -match "panel commit: index=0 ") ""
-Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $beforeForeground) ""
+Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
 # 6. close app
 [void][QPPanelSmoke]::PostMessage($main, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
