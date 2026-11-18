@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
@@ -115,12 +115,18 @@ thread_local! {
 static OLD_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 static CREATE_FAILED: AtomicBool = AtomicBool::new(false);
 static ENTER_ARMED: AtomicBool = AtomicBool::new(false);
+static SESSION: AtomicU64 = AtomicU64::new(0);
+static INJECTING: AtomicBool = AtomicBool::new(false);
 static INJECT_RESULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 pub const WM_INJECT_DONE: u32 = WM_APP + 0x61;
 
 pub fn take_inject_result() -> Option<String> {
     INJECT_RESULT.lock().ok().and_then(|mut slot| slot.take())
+}
+
+pub fn is_injecting() -> bool {
+    INJECTING.load(Ordering::Relaxed)
 }
 
 fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
@@ -226,6 +232,7 @@ fn present(
     quit_on_hide: bool,
 ) -> u128 {
     let started = Instant::now();
+    SESSION.fetch_add(1, Ordering::Relaxed);
     let needs_create =
         PANEL.with(|slot| slot.borrow().is_none()) && !CREATE_FAILED.load(Ordering::Relaxed);
     if needs_create {
@@ -615,12 +622,17 @@ fn commit() {
                 let _ = SetForegroundWindow(target);
             }
         }
-        finish_insert();
+        finish_insert(SESSION.load(Ordering::Relaxed));
         return;
     }
 
     // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
     // target. The worker reports back through WM_INJECT_DONE.
+    let session = SESSION.load(Ordering::Relaxed);
+    INJECTING.store(true, Ordering::Relaxed);
+
+    // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
+    // target. The worker reports back through WM_INJECT_DONE with its session.
     let notify_raw = notify.0 as isize;
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
@@ -636,7 +648,7 @@ fn commit() {
                     let _ = PostMessageW(
                         Some(HWND(notify_raw as *mut core::ffi::c_void)),
                         WM_INJECT_DONE,
-                        WPARAM(0),
+                        WPARAM(session as usize),
                         LPARAM(0),
                     );
                 }
@@ -645,17 +657,23 @@ fn commit() {
 
     if spawned.is_err() {
         logging::error("failed to spawn injection thread");
-        finish_insert();
+        INJECTING.store(false, Ordering::Relaxed);
+        finish_insert(session);
     }
 }
 
-pub fn finish_insert() {
+pub fn finish_insert(session: u64) {
+    if SESSION.load(Ordering::Relaxed) != session {
+        return;
+    }
+
     let monitor = PANEL.with(|slot| {
         slot.borrow_mut()
             .as_mut()
             .and_then(|panel| panel.monitor.take())
     });
     drop(monitor);
+    INJECTING.store(false, Ordering::Relaxed);
 
     PANEL.with(|slot| {
         if let Some(panel) = slot.borrow_mut().as_mut() {

@@ -239,7 +239,7 @@ unsafe extern "system" fn window_proc(
 
     match message {
         panel::WM_INJECT_DONE => {
-            panel::finish_insert();
+            panel::finish_insert(wparam.0 as u64);
             if let Some(text) = panel::take_inject_result() {
                 tray::balloon(hwnd, "QuickPhrase", &text);
             }
@@ -359,6 +359,15 @@ fn handle_command(id: u32) {
 }
 
 fn activate_panel() {
+    if panel::is_injecting() {
+        logging::warn("panel activation ignored: injection in flight");
+        let main = STATE.with(|state| state.borrow().hwnd);
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "正在输入，请稍候");
+        }
+        return;
+    }
+
     if panel::is_visible() {
         panel::hide_and_restore();
         logging::info("panel closed");
