@@ -226,24 +226,32 @@ fn present(
         }
     }
 
-    let (hwnd, edit) = PANEL.with(|slot| {
+    let (hwnd, edit, needs_monitor) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
-            return (HWND::default(), HWND::default());
+            return (HWND::default(), HWND::default(), false);
         };
         panel.target = target;
         panel.caret = caret;
         panel.summary = summary.to_string();
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
-        if activate && panel.monitor.is_none() {
-            panel.monitor = crate::foreground::start();
-        }
-        (panel.hwnd, panel.edit)
+        (panel.hwnd, panel.edit, activate && panel.monitor.is_none())
     });
 
     if hwnd.0.is_null() {
         return 0;
+    }
+
+    if needs_monitor {
+        let monitor = crate::foreground::start();
+        PANEL.with(|slot| {
+            if let Some(panel) = slot.borrow_mut().as_mut() {
+                if panel.monitor.is_none() {
+                    panel.monitor = monitor;
+                }
+            }
+        });
     }
 
     place();

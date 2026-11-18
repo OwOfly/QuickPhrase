@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use serde::Serialize;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -82,7 +83,7 @@ pub fn start() -> Option<Monitor> {
         })
         .ok()?;
 
-    let thread_id = rx.recv().ok()??;
+    let thread_id = rx.recv_timeout(Duration::from_millis(500)).ok()??;
     Some(Monitor {
         thread: Some(handle),
         thread_id,
