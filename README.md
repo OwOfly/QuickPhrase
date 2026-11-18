@@ -1,6 +1,6 @@
 # QuickPhrase 快语
 
-Windows 桌面全局快捷短语输入器。当前进度：**M0-1 骨架**。
+Windows 桌面全局快捷短语输入器。当前进度：**M0-2 目标捕获**。
 
 完整技术方案见 `docs/_ref/final-plan.md`（v4.1），需求见 `docs/_ref/prd-v1.1.md`。
 
@@ -10,10 +10,14 @@ Windows 桌面全局快捷短语输入器。当前进度：**M0-1 骨架**。
 - 托盘图标与右键菜单：打开面板（占位）/ 管理短语（占位）/ 暂停快捷键 / 设置（占位）/ 关于 / 退出
 - 全局热键 `Ctrl + Alt + Q`，注册失败有明确提示；暂停/恢复可用
 - 退出时释放热键与托盘图标
+- 热键触发时同步快照：前台窗口、PID、进程创建时间、焦点控件、完整性级别
+- UI Automation 捕获：常驻 MTA 线程、60 ms 预算、零 HWND 上溯、`CompareElements`、只读/密码/插入点判定
+- 区域分类：终端 / 编辑器 / 未验证；身份与“可输入能力”分开报告
+- 前台切换监听（`EVENT_SYSTEM_FOREGROUND`，面板生命周期内）
 - Per-Monitor V2 DPI manifest（已嵌入 EXE）
 - 本地滚动日志：`%LocalAppData%\QuickPhrase\logs\qp-YYYY-MM-DD.log`
 
-**尚未实现**：快捷面板、短语存储、文本注入、设置、管理窗口。热键目前只弹占位提示。
+**尚未实现**：快捷面板、短语存储、文本注入、设置、管理窗口。热键目前只做捕获并弹托盘气泡。
 
 ## 环境
 
@@ -47,6 +51,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1
 
 覆盖：冷启动、首实例存活、第二实例退出、托盘回调、优雅关闭、热键释放、日志断言。
 
+捕获链路：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\capture-smoke.ps1
+```
+
+手工诊断：先把焦点放到目标窗口，再运行
+
+```powershell
+.\target\release\quickphrase.exe --capture-test --delay 2000
+```
+
+`--delay` 毫秒后抓取当前前台，结果写入日志，并落盘到
+`%LocalAppData%\QuickPhrase\captures\capture-<ts>.json`，包含 UIA 元素属性、只读判定、插入点、耗时与前台事件序列。
+
 单独测启动耗时（不含 PowerShell 调度开销）：
 
 ```powershell
@@ -64,13 +83,18 @@ $sw.ElapsedMilliseconds
 ```
 src/
   main.rs          入口、CLI 参数
-  app.rs           隐藏主窗口、消息循环、托盘菜单、状态机占位
+  app.rs           隐藏主窗口、消息循环、托盘菜单
+  context.rs       原生窗口/进程/完整性/焦点快照
+  uia.rs           UI Automation 常驻线程、捕获、身份比对
+  capture.rs       捕获编排、能力与区域判定、JSON 报告
+  foreground.rs    前台切换监听
   hotkey.rs        RegisterHotKey 封装
   single_instance.rs  命名互斥 + 第二实例唤起
   tray.rs          Shell_NotifyIcon 封装
   logging.rs       本地滚动日志
   platform.rs      DPI、消息框、数据目录
-scripts/smoke.ps1  M0-1 冒烟测试
+scripts/smoke.ps1          M0-1 冒烟测试
+scripts/capture-smoke.ps1  M0-2 捕获冒烟测试
 docs/_ref/         方案、PRD、评审记录
 ```
 
@@ -78,4 +102,5 @@ docs/_ref/         方案、PRD、评审记录
 
 - 托盘使用系统默认应用图标，正式图标在 M1-9 打包阶段替换。
 - 热键目前是写死的 `Ctrl+Alt+Q`，设置界面在 M1-5。
-- 日志只记元数据，不记短语正文。
+- 日志只记元数据，不记短语正文；捕获 JSON 会含 UIA 元素名称，仅本机诊断使用。
+- 焦点切换类反例（A→B→A、UIA 挂起）尚未在真实交互桌面验证，M0-5 补。

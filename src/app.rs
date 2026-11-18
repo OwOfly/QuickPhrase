@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -7,7 +7,7 @@ use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{hotkey, logging, platform, single_instance, tray};
+use crate::{capture, hotkey, logging, platform, single_instance, tray, uia};
 
 const ID_OPEN: u32 = 1001;
 const ID_MANAGE: u32 = 1002;
@@ -143,6 +143,12 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         }
     }
 
+    if uia::warmup(Duration::from_millis(800)) {
+        logging::info("uia warmup ok");
+    } else {
+        logging::warn("uia warmup failed; captures will be copy-only");
+    }
+
     logging::info(&format!(
         "ready in {} ms (pid {})",
         started.elapsed().as_millis(),
@@ -214,7 +220,21 @@ unsafe extern "system" fn window_proc(
         WM_HOTKEY => {
             if wparam.0 as i32 == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
-                platform::info_box("QuickPhrase", "快捷面板将在 M0-3 实现。");
+                let started = Instant::now();
+                match capture::once() {
+                    Some(report) => {
+                        logging::info(&format!("capture: {}", report.summary()));
+                        tray::balloon(hwnd, "QuickPhrase", &report.balloon());
+                    }
+                    None => {
+                        logging::warn("capture returned no foreground window");
+                        tray::balloon(hwnd, "QuickPhrase", "未捕获到前台窗口");
+                    }
+                }
+                logging::info(&format!(
+                    "capture pipeline took {} ms",
+                    started.elapsed().as_millis()
+                ));
             }
             LRESULT(0)
         }
