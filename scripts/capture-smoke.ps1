@@ -63,7 +63,9 @@ if (Test-Path $captures) {
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if (-not $newest) {
-        if ($logText -notmatch "capture written:") {
+        if ($logText -match "capture written:") {
+            Check "capture file missing despite log" $false ""
+        } else {
             Check "capture written missing" $false ""
         }
         Exit-Skip "no fresh capture report"
