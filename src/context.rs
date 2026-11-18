@@ -2,7 +2,8 @@ use std::sync::OnceLock;
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM,
+    CloseHandle, GetLastError, SetLastError, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM, POINT,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::{
@@ -54,7 +55,7 @@ pub fn is_native_edit_class(name: &str) -> bool {
 }
 
 /// Native read-only state for a real edit control. `None` means the window is
-/// not a native edit control.
+/// not a native edit control, or its style could not be read.
 pub fn native_edit_read_only(hwnd: HWND) -> Option<bool> {
     if hwnd.0.is_null() {
         return None;
@@ -62,7 +63,14 @@ pub fn native_edit_read_only(hwnd: HWND) -> Option<bool> {
     if !is_native_edit_class(&window_class(hwnd)) {
         return None;
     }
+    unsafe {
+        SetLastError(ERROR_SUCCESS);
+    }
     let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) };
+    let error = unsafe { GetLastError() };
+    if style == 0 && error != ERROR_SUCCESS {
+        return None;
+    }
     Some(style & ES_READONLY != 0)
 }
 
@@ -405,4 +413,19 @@ fn window_text(hwnd: HWND) -> String {
         return String::new();
     }
     String::from_utf16_lossy(&buffer[..length as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_native_edit_class;
+
+    #[test]
+    fn native_edit_classes_exclude_uia_documents() {
+        assert!(is_native_edit_class("Edit"));
+        assert!(is_native_edit_class("edit"));
+        assert!(is_native_edit_class("RichEdit50W"));
+        assert!(!is_native_edit_class("_WwG"));
+        assert!(!is_native_edit_class("RichEditD2DPT"));
+        assert!(!is_native_edit_class("Chrome_RenderWidgetHostHWND"));
+    }
 }

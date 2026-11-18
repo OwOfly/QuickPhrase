@@ -249,13 +249,18 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
     // GUITHREADINFO. UIA is only consulted to reject an explicitly reported
     // password or disabled state.
     if gate.native_edit {
-        if let Some(snapshot) = facts {
-            if snapshot.is_password == Some(true) {
-                return Capability::Password;
-            }
-            if !snapshot.is_enabled {
-                return Capability::Disabled;
-            }
+        let Some(snapshot) = facts else {
+            return Capability::UiaUnavailable;
+        };
+        if snapshot.is_password == Some(true) {
+            return Capability::Password;
+        }
+        if snapshot.is_read_only == Some(true) {
+            // Cross-source conflict: any read-only claim wins (§5.5 M15).
+            return Capability::ReadOnly;
+        }
+        if !snapshot.is_enabled {
+            return Capability::Disabled;
         }
         return Capability::Text;
     }
@@ -458,6 +463,44 @@ mod tests {
             decide_capability(native, Some(&snapshot)),
             Capability::Password
         );
+    }
+
+    #[test]
+    fn native_edit_still_denies_explicit_read_only() {
+        let mut snapshot = facts();
+        snapshot.is_read_only = Some(true);
+        let native = Gate {
+            native_edit: true,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::ReadOnly
+        );
+    }
+
+    #[test]
+    fn native_password_style_wins_over_unknown_uia() {
+        let mut snapshot = facts();
+        snapshot.is_password = None;
+        let native = Gate {
+            native_edit: true,
+            native_password: true,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::Password
+        );
+    }
+
+    #[test]
+    fn native_edit_without_uia_is_unavailable() {
+        let native = Gate {
+            native_edit: true,
+            ..gate()
+        };
+        assert_eq!(decide_capability(native, None), Capability::UiaUnavailable);
     }
 
     #[test]

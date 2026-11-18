@@ -1,5 +1,5 @@
 ﻿# M0-5 cross-process injection test.
-# A separate PowerShell process owns a WinForms TextBox (native EDIT). QuickPhrase
+# A separate process (target\host-probe.exe) owns a plain Win32 EDIT. QuickPhrase
 # must capture it, show the panel, and inject the first hard-coded phrase into it.
 #
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\host-matrix.ps1 [-SkipBuild]

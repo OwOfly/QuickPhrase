@@ -221,8 +221,10 @@ fn guard(report: &Report) -> Result<(), &'static str> {
     if report.target.selection.is_none() {
         logging::info("position_unverified");
     }
-    if report.target.focused_is_editable && context::native_edit_read_only(focused) == Some(true) {
-        return Err("read_only_changed");
+    if report.target.focused_is_editable && context::native_edit_read_only(focused) != Some(false) {
+        // Fail closed: a native edit whose style cannot be read must not be
+        // treated as writable.
+        return Err("read_only_unknown");
     }
 
     if report.identity_source == "uia" {
@@ -270,7 +272,7 @@ fn final_check(report: &Report, target: HWND) -> bool {
 
     if report.target.focused_is_editable {
         let focused = HWND(report.target.focused_hwnd as *mut core::ffi::c_void);
-        if context::native_edit_read_only(focused) == Some(true) {
+        if context::native_edit_read_only(focused) != Some(false) {
             return false;
         }
     }
