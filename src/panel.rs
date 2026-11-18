@@ -107,6 +107,7 @@ struct Panel {
     quit_on_hide: bool,
     monitor: Option<crate::foreground::Monitor>,
     opening: bool,
+    deferred_inactive: bool,
 }
 
 thread_local! {
@@ -295,11 +296,25 @@ fn present(
         let _ = UpdateWindow(hwnd);
     }
 
-    PANEL.with(|slot| {
-        if let Some(panel) = slot.borrow_mut().as_mut() {
-            panel.opening = false;
+    let deferred = PANEL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        match guard.as_mut() {
+            Some(panel) => {
+                panel.opening = false;
+                std::mem::take(&mut panel.deferred_inactive)
+            }
+            None => false,
         }
     });
+
+    if deferred
+        && unsafe { GetForegroundWindow() } != hwnd
+        && std::env::var_os("QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL").is_none()
+    {
+        logging::warn("panel lost activation while opening");
+        hide_only();
+        return 0;
+    }
 
     started.elapsed().as_micros()
 }
@@ -568,6 +583,7 @@ fn create() -> Option<Panel> {
         quit_on_hide: false,
         monitor: None,
         opening: false,
+        deferred_inactive: false,
     };
 
     let mut rect = RECT::default();
@@ -1225,23 +1241,32 @@ unsafe extern "system" fn window_proc(
             let active = (wparam.0 & 0xffff) as u32;
             if active == WA_INACTIVE {
                 // Attaching to the previous foreground thread and detaching can
-                // bounce activation right after the panel appears. Do not treat
-                // that as a user click-away while the panel is still opening.
-                let opening = PANEL.with(|slot| {
+                // bounce activation right after the panel appears. Record the
+                // loss instead of dropping it, then decide once opening ends.
+                let (hiding, opening) = PANEL.with(|slot| {
                     slot.borrow()
                         .as_ref()
-                        .map(|panel| panel.opening)
-                        .unwrap_or(true)
+                        .map(|panel| (panel.hiding, panel.opening))
+                        .unwrap_or((true, false))
                 });
-                let hiding = PANEL.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .map(|panel| panel.hiding)
-                        .unwrap_or(true)
-                });
-                if !hiding && !opening {
+                if hiding {
+                    return LRESULT(0);
+                }
+                if opening {
+                    PANEL.with(|slot| {
+                        if let Some(panel) = slot.borrow_mut().as_mut() {
+                            panel.deferred_inactive = true;
+                        }
+                    });
+                } else {
                     hide_only();
                 }
+            } else {
+                PANEL.with(|slot| {
+                    if let Some(panel) = slot.borrow_mut().as_mut() {
+                        panel.deferred_inactive = false;
+                    }
+                });
             }
             LRESULT(0)
         }

@@ -516,13 +516,16 @@ fn compare_element(
 }
 
 fn current_read_only_or_native(element: &IUIAutomationElement, native: HWND) -> Option<bool> {
-    // A real Win32 edit control reports its read-only state authoritatively in
-    // its style; the UIA provider may expose only a ValuePattern, which would
-    // otherwise be treated as unknown and rejected.
-    if let Some(value) = context::native_edit_read_only(native) {
-        return Some(value);
+    // Any read-only claim wins (§5.5 M15). The native style is authoritative
+    // when it says writable, because a plain EDIT exposes only a ValuePattern
+    // and the combined UIA answer is legitimately unknown.
+    let native_state = context::native_edit_read_only(native);
+    let uia_state = current_read_only(element);
+    match (native_state, uia_state) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), _) => Some(false),
+        (None, other) => other,
     }
-    current_read_only(element)
 }
 
 fn current_read_only(element: &IUIAutomationElement) -> Option<bool> {

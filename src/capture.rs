@@ -1,4 +1,4 @@
-use std::fs;
+﻿use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,7 @@ pub struct Gate {
     pub native_password: bool,
     pub native_read_only: bool,
     pub native_edit: bool,
+    pub native_caret: bool,
 }
 
 #[derive(Serialize)]
@@ -121,6 +122,7 @@ pub fn once() -> Option<Report> {
         native_password: window.focused_is_password(),
         native_read_only: window.focused_is_readonly(),
         native_edit: context::is_native_edit_class(&window.focused_class),
+        native_caret: window.caret.is_some() || window.selection.is_some(),
     };
     let capability = decide_capability(gate, uia_snapshot.as_ref());
     let region = classify(&window, uia_snapshot.as_ref());
@@ -244,7 +246,7 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
         return Capability::ReadOnly;
     }
 
-    // Native Edit/RichEdit: §5.5 row 1. Identity is the focused HWND, the
+    // Native Edit/RichEdit: 搂5.5 row 1. Identity is the focused HWND, the
     // password/read-only bits are authoritative, and the caret comes from
     // GUITHREADINFO. UIA is only consulted to reject an explicitly reported
     // password or disabled state.
@@ -256,11 +258,16 @@ pub fn decide_capability(gate: Gate, facts: Option<&UiaSnapshot>) -> Capability 
             return Capability::Password;
         }
         if snapshot.is_read_only == Some(true) {
-            // Cross-source conflict: any read-only claim wins (§5.5 M15).
+            // Cross-source conflict: any read-only claim wins (搂5.5 M15).
             return Capability::ReadOnly;
         }
         if !snapshot.is_enabled {
             return Capability::Disabled;
+        }
+        if !gate.native_caret {
+            // 搂5.5 row 1: a native control needs a proven insertion point
+            // (rcCaret / hwndCaret or EM_GETSEL), not just a writable style.
+            return Capability::NoCaret;
         }
         return Capability::Text;
     }
@@ -415,6 +422,7 @@ mod tests {
             native_password: false,
             native_read_only: false,
             native_edit: false,
+            native_caret: false,
         }
     }
 
@@ -446,6 +454,7 @@ mod tests {
         snapshot.caret_active = None;
         let native = Gate {
             native_edit: true,
+            native_caret: true,
             ..gate()
         };
         assert_eq!(decide_capability(native, Some(&snapshot)), Capability::Text);
@@ -457,6 +466,7 @@ mod tests {
         snapshot.is_password = Some(true);
         let native = Gate {
             native_edit: true,
+            native_caret: true,
             ..gate()
         };
         assert_eq!(
@@ -471,6 +481,7 @@ mod tests {
         snapshot.is_read_only = Some(true);
         let native = Gate {
             native_edit: true,
+            native_caret: true,
             ..gate()
         };
         assert_eq!(
@@ -485,6 +496,7 @@ mod tests {
         snapshot.is_password = None;
         let native = Gate {
             native_edit: true,
+            native_caret: true,
             native_password: true,
             ..gate()
         };
@@ -495,9 +507,24 @@ mod tests {
     }
 
     #[test]
+    fn native_edit_without_caret_is_rejected() {
+        let snapshot = facts();
+        let native = Gate {
+            native_edit: true,
+            native_caret: false,
+            ..gate()
+        };
+        assert_eq!(
+            decide_capability(native, Some(&snapshot)),
+            Capability::NoCaret
+        );
+    }
+
+    #[test]
     fn native_edit_without_uia_is_unavailable() {
         let native = Gate {
             native_edit: true,
+            native_caret: true,
             ..gate()
         };
         assert_eq!(decide_capability(native, None), Capability::UiaUnavailable);
