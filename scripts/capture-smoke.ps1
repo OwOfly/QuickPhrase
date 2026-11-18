@@ -37,10 +37,19 @@ $newLog = @()
 if (Test-Path $log) { $newLog = Get-Content $log | Select-Object -Skip $before }
 $logText = $newLog -join "`n"
 
-if ($logText -match "no foreground window") {
+function Exit-Skip([string]$Reason) {
+    $failed = @($results | Where-Object { -not $_.Ok })
     $results | Format-Table -AutoSize
-    "SKIP: no foreground window in this desktop session"
+    if ($failed.Count -gt 0) {
+        "FAIL: $($failed.Count) check(s)"
+        exit 1
+    }
+    "SKIP: $Reason"
     exit 3
+}
+
+if ($logText -match "no foreground window") {
+    Exit-Skip "no foreground window in this desktop session"
 }
 
 Check "uia warmup ok" ($logText -match "uia warmup: true") ""
@@ -54,9 +63,10 @@ if (Test-Path $captures) {
         Sort-Object LastWriteTime -Descending |
         Select-Object -First 1
     if (-not $newest) {
-        $results | Format-Table -AutoSize
-        "SKIP: no fresh capture report"
-        exit 3
+        if ($logText -notmatch "capture written:") {
+            Check "capture written missing" $false ""
+        }
+        Exit-Skip "no fresh capture report"
     }
     if ($newest) {
         $report = Get-Content $newest.FullName -Raw -Encoding UTF8 | ConvertFrom-Json

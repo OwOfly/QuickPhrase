@@ -34,7 +34,7 @@
 | `cargo clippy --release` | PASS（0 error / 0 warning） |
 | `cargo test` | PASS 14/14（新增能力判定与只读组合单测） |
 | `cargo build --release` | PASS |
-| M0-1 冒烟 | PASS 10 项（热键注入项因 UIPI SKIP，不计通过） |
+| M0-1 冒烟 | PASS 9 项 + 1 SKIP（热键注入被 UIPI 拦截，SKIP 不计通过） |
 | M0-2 冒烟 | PASS 15 项 |
 
 ## 残余
