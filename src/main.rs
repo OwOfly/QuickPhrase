@@ -2,9 +2,11 @@
 
 mod app;
 mod capture;
+mod clipboard;
 mod context;
 mod foreground;
 mod hotkey;
+mod inject;
 mod logging;
 mod panel;
 mod platform;
@@ -26,6 +28,7 @@ fn main() {
     let capture_test = has(&args, "--capture-test");
     let panel_bench = has(&args, "--panel-bench");
     let panel_test = has(&args, "--panel-test");
+    let inject_test = has(&args, "--inject-test");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -53,6 +56,15 @@ fn main() {
         run_capture_test(delay);
         logging::info("capture-test done");
         return;
+    }
+
+    if inject_test {
+        let ok = inject::selftest();
+        logging::info(&format!(
+            "inject-test: {}",
+            if ok { "PASS" } else { "FAIL" }
+        ));
+        std::process::exit(if ok { 0 } else { 3 });
     }
 
     if panel_bench {

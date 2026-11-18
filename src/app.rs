@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -364,14 +364,8 @@ fn activate_panel() {
     match capture::once() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
-            let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
-            let caret = report.target.caret.map(|rect| RECT {
-                left: rect[0],
-                top: rect[1],
-                right: rect[2],
-                bottom: rect[3],
-            });
-            let micros = panel::show(target, caret, &report.summary());
+            let capture_total = report.timings_ms.total;
+            let micros = panel::show(report, main);
 
             if micros == 0 {
                 logging::warn("panel show failed (creation or foreground)");
@@ -380,8 +374,7 @@ fn activate_panel() {
                 }
             } else {
                 logging::info(&format!(
-                    "panel shown in {micros} us; capture total {} ms",
-                    report.timings_ms.total
+                    "panel shown in {micros} us; capture total {capture_total} ms"
                 ));
             }
         }
@@ -442,7 +435,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M0-3 快捷面板）\n\
+             全局快捷短语输入器（M0-4 文本注入）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()

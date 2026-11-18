@@ -31,7 +31,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::{logging, platform};
+use crate::capture::Report;
+use crate::{inject, logging, platform, tray};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
@@ -97,9 +98,8 @@ struct Panel {
     list: HWND,
     footer: HWND,
     filtered: Vec<usize>,
-    target: HWND,
-    caret: Option<RECT>,
-    summary: String,
+    report: Option<Report>,
+    notify: HWND,
     fonts: Fonts,
     brushes: Brushes,
     dpi: u32,
@@ -202,21 +202,15 @@ pub fn is_visible() -> bool {
     })
 }
 
-pub fn show(target: HWND, caret: Option<RECT>, summary: &str) -> u128 {
-    present(target, caret, summary, true, false)
+pub fn show(report: Report, notify: HWND) -> u128 {
+    present(Some(report), notify, true, false)
 }
 
 pub fn show_test() -> u128 {
-    present(HWND::default(), None, "panel test", true, true)
+    present(None, HWND::default(), true, true)
 }
 
-fn present(
-    target: HWND,
-    caret: Option<RECT>,
-    summary: &str,
-    activate: bool,
-    quit_on_hide: bool,
-) -> u128 {
+fn present(report: Option<Report>, notify: HWND, activate: bool, quit_on_hide: bool) -> u128 {
     let started = Instant::now();
     let needs_create =
         PANEL.with(|slot| slot.borrow().is_none()) && !CREATE_FAILED.load(Ordering::Relaxed);
@@ -231,9 +225,8 @@ fn present(
         let Some(panel) = guard.as_mut() else {
             return (HWND::default(), HWND::default(), false);
         };
-        panel.target = target;
-        panel.caret = caret;
-        panel.summary = summary.to_string();
+        panel.report = report;
+        panel.notify = notify;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
         (panel.hwnd, panel.edit, activate && panel.monitor.is_none())
@@ -295,7 +288,12 @@ fn hide(restore: bool) {
             return (HWND::default(), HWND::default(), false);
         };
         panel.hiding = true;
-        (panel.hwnd, panel.target, panel.quit_on_hide)
+        let target = panel
+            .report
+            .as_ref()
+            .map(|report| HWND(report.target.hwnd as *mut core::ffi::c_void))
+            .unwrap_or_default();
+        (panel.hwnd, target, panel.quit_on_hide)
     });
 
     if hwnd.0.is_null() {
@@ -529,9 +527,8 @@ fn create() -> Option<Panel> {
         list,
         footer,
         filtered: Vec::new(),
-        target: HWND::default(),
-        caret: None,
-        summary: String::new(),
+        report: None,
+        notify: HWND::default(),
         fonts,
         brushes,
         dpi,
@@ -565,21 +562,66 @@ fn commit() {
         Some((
             item_index,
             ITEMS[item_index].category,
-            panel.summary.clone(),
+            ITEMS[item_index].content,
         ))
     });
 
-    let Some((item_index, category, summary)) = info else {
+    let Some((item_index, category, content)) = info else {
         logging::info("panel commit ignored: no matching item");
         return;
     };
 
-    logging::info(&format!(
-        "panel commit: index={item_index} category={category} (M0-4 will insert)"
-    ));
-    logging::info(&format!("panel capture context: {summary}"));
+    let (report, notify, hwnd) = PANEL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(panel) = guard.as_mut() else {
+            return (None, HWND::default(), HWND::default());
+        };
+        panel.hiding = true;
+        (panel.report.take(), panel.notify, panel.hwnd)
+    });
 
-    hide_and_restore();
+    let Some(report) = report else {
+        hide_and_restore();
+        return;
+    };
+
+    logging::info(&format!(
+        "panel commit: index={item_index} category={category}"
+    ));
+    logging::info(&format!("panel capture context: {}", report.summary()));
+
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    }
+
+    if std::env::var_os("QUICKPHRASE_TEST_NO_INJECT").is_some() {
+        logging::info("inject skipped by test flag");
+        finish_insert();
+        return;
+    }
+
+    let outcome = inject::run(&report, content);
+    finish_insert();
+
+    logging::info(&format!("inject outcome: {}", outcome.describe()));
+    if !notify.0.is_null() {
+        tray::balloon(notify, "QuickPhrase", &outcome.describe());
+    }
+}
+
+fn finish_insert() {
+    let monitor = PANEL.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .and_then(|panel| panel.monitor.take())
+    });
+    drop(monitor);
+
+    PANEL.with(|slot| {
+        if let Some(panel) = slot.borrow_mut().as_mut() {
+            panel.hiding = false;
+        }
+    });
 }
 
 fn apply_dpi(dpi: u32) {
@@ -628,7 +670,19 @@ fn apply_dpi(dpi: u32) {
 
 fn place() {
     let (hwnd, caret, old_dpi) = PANEL.with(|slot| match slot.borrow().as_ref() {
-        Some(panel) => (panel.hwnd, panel.caret, panel.dpi),
+        Some(panel) => {
+            let caret = panel
+                .report
+                .as_ref()
+                .and_then(|report| report.target.caret)
+                .map(|caret| RECT {
+                    left: caret[0],
+                    top: caret[1],
+                    right: caret[2],
+                    bottom: caret[3],
+                });
+            (panel.hwnd, caret, panel.dpi)
+        }
         None => (HWND::default(), None, 96),
     });
     if hwnd.0.is_null() {
@@ -1203,7 +1257,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
-        let elapsed = present(HWND::default(), None, "bench", false, false);
+        let elapsed = present(None, HWND::default(), false, false);
         samples.push(elapsed);
         hide_and_restore();
     }

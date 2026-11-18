@@ -1,6 +1,6 @@
 # QuickPhrase 快语
 
-Windows 桌面全局快捷短语输入器。当前进度：**M0-3 快捷面板**。
+Windows 桌面全局快捷短语输入器。当前进度：**M0-4 文本注入**。
 
 完整技术方案见 `docs/_ref/final-plan.md`（v4.1），需求见 `docs/_ref/prd-v1.1.md`。
 
@@ -16,10 +16,12 @@ Windows 桌面全局快捷短语输入器。当前进度：**M0-3 快捷面板**
 - 前台切换监听（`EVENT_SYSTEM_FOREGROUND`，面板生命周期内）
 - 快捷面板：520×420、原生 `EDIT` 搜索、OwnerDraw 列表、↑↓/Home/End、Enter 提交、Esc/点击外部关闭
 - 面板按光标定位并夹紧到显示器工作区；DWM 圆角；Per-Monitor DPI 适配
+- 文本注入：恢复目标、G1–G12 守卫、`SendInput` Unicode（CR 换行）、三态结果
+- 输入策略：单行 Unicode；多行仅限已验证编辑器；终端/未知区域多行、超长、控制字符一律只复制到剪贴板
 - Per-Monitor V2 DPI manifest（已嵌入 EXE）与 Common-Controls v6 依赖
 - 本地滚动日志：`%LocalAppData%\QuickPhrase\logs\qp-YYYY-MM-DD.log`
 
-**尚未实现**：短语存储、文本注入、设置、管理窗口。Enter 目前只记录选择，不写入目标应用（M0-4）。
+**尚未实现**：短语存储、设置、管理窗口、剪贴板兼容输入模式（M1-7）。
 
 ## 环境
 
@@ -79,6 +81,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\capture-smoke.ps1
 
 # 自动化冒烟
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel-smoke.ps1
+
+# 注入自测（自建 EDIT，走完整守卫与 SendInput）
+.\target\release\quickphrase.exe --inject-test
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\inject-smoke.ps1
 ```
 
 单独测启动耗时（不含 PowerShell 调度开销）：
@@ -103,6 +109,8 @@ src/
   uia.rs           UI Automation 常驻线程、捕获、身份比对
   capture.rs       捕获编排、能力与区域判定、JSON 报告
   panel.rs         快捷面板、搜索框、OwnerDraw 列表、定位与 DPI
+  inject.rs        输入策略、守卫、SendInput、三态结果、注入自测
+  clipboard.rs     纯文本剪贴板写入（只复制路径）
   foreground.rs    前台切换监听
   hotkey.rs        RegisterHotKey 封装
   single_instance.rs  命名互斥 + 第二实例唤起
@@ -112,6 +120,7 @@ src/
 scripts/smoke.ps1          M0-1 冒烟测试
 scripts/capture-smoke.ps1  M0-2 捕获冒烟测试
 scripts/panel-smoke.ps1    M0-3 面板冒烟测试
+scripts/inject-smoke.ps1   M0-4 注入自测
 docs/_ref/         方案、PRD、评审记录
 ```
 
@@ -123,3 +132,5 @@ docs/_ref/         方案、PRD、评审记录
 - 焦点切换类反例（A→B→A、UIA 挂起）尚未在真实交互桌面验证，M0-5 补。
 - 面板列表是 3 条硬编码数据；存储与检索在 M1。
 - 本机桌面受 UIPI 限制，脚本用 `WM_HOTKEY` 消息驱动面板；真实热键已在手工测试中验证。
+- 跨应用注入矩阵尚未执行；M0-5 覆盖 Chrome、VS Code、Word、微信、终端等。
+- 剪贴板兼容输入模式与序列号保护在 M1-7。

@@ -1,7 +1,9 @@
 use std::sync::OnceLock;
 
 use windows::core::PWSTR;
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HWND, POINT, RECT};
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, HWND, LPARAM, POINT, RECT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::{
     GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
@@ -13,7 +15,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
-    GetWindowTextW, GetWindowThreadProcessId, IsChild, GA_ROOT, GUITHREADINFO, GWL_STYLE,
+    GetWindowTextW, GetWindowThreadProcessId, IsChild, SendMessageW, GA_ROOT, GUITHREADINFO,
+    GWL_STYLE,
 };
 
 const ES_PASSWORD: i32 = 0x0020;
@@ -80,6 +83,7 @@ pub struct WindowContext {
     pub focused_class: String,
     pub focused_is_child: bool,
     pub focused_style: i32,
+    pub selection: Option<(u32, u32)>,
     pub caret: Option<RECT>,
     pub integrity: Integrity,
     pub own_integrity: Integrity,
@@ -170,6 +174,13 @@ pub fn snapshot() -> Option<WindowContext> {
         focused == hwnd || unsafe { IsChild(hwnd, focused) }.as_bool()
     };
 
+    let focused_class = window_class(focused);
+    let selection = if is_edit_class(&focused_class) {
+        read_selection(focused)
+    } else {
+        None
+    };
+
     Some(WindowContext {
         hwnd,
         pid,
@@ -179,9 +190,10 @@ pub fn snapshot() -> Option<WindowContext> {
         class: window_class(hwnd),
         title: window_text(hwnd),
         focused,
-        focused_class: window_class(focused),
+        focused_class,
         focused_is_child,
         focused_style: unsafe { GetWindowLongW(focused, GWL_STYLE) },
+        selection,
         caret,
         integrity,
         own_integrity,
@@ -190,6 +202,55 @@ pub fn snapshot() -> Option<WindowContext> {
 }
 
 static OWN_INTEGRITY: OnceLock<Integrity> = OnceLock::new();
+
+const EM_GETSEL: u32 = 0x00B0;
+
+pub fn read_selection(hwnd: HWND) -> Option<(u32, u32)> {
+    if hwnd.0.is_null() {
+        return None;
+    }
+
+    let mut start = 0u32;
+    let mut end = 0u32;
+    let result = unsafe {
+        SendMessageW(
+            hwnd,
+            EM_GETSEL,
+            Some(WPARAM(&mut start as *mut u32 as usize)),
+            Some(LPARAM(&mut end as *mut u32 as isize)),
+        )
+    };
+
+    if result.0 < 0 || start > end {
+        return None;
+    }
+    Some((start, end))
+}
+
+pub fn process_created(pid: u32) -> Option<u64> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let created = process_creation(process);
+    unsafe {
+        let _ = CloseHandle(process);
+    }
+    if created == 0 {
+        None
+    } else {
+        Some(created)
+    }
+}
+
+pub fn focused_window(tid: u32) -> Option<HWND> {
+    let mut gui = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetGUIThreadInfo(tid, &mut gui) }.is_ok() && !gui.hwndFocus.0.is_null() {
+        Some(gui.hwndFocus)
+    } else {
+        None
+    }
+}
 
 pub fn belongs_to(foreground: HWND, candidate: HWND) -> bool {
     if candidate.0.is_null() {
