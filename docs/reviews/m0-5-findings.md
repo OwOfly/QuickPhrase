@@ -69,7 +69,18 @@ inject outcome: 已发送，请确认目标已收到
   只复制（fail-safe，但一次慢宿主会让本次运行剩余时间全变复制）。
   这是既定设计（M17），M0-5 只记录现象，不改阈值。
 
-## 5. 仍需真实桌面执行
+## 5. 复核
+
+这两项修复经 r1 → r2 两轮独立复核（glm / kimi / qwen）：
+
+- r1：glm PASS；kimi、qwen CHANGES_REQUIRED（原生插入点、只读冲突、样式读取 fail-open、`opening` 丢弃失活）。
+- r2：**三家全部 PASS**，R1–R7 全 CLOSED，无新 blocker/major。
+- 快照：`m0-5-native-edit-20261118-r2`，brief `12a47bd8…`，fix.diff `479a305d…`。
+
+修复后门禁：`cargo test` **44/44**、clippy 干净、inject-smoke 4/4、
+panel-smoke 10/10、host-matrix 10/10。
+
+## 6. 仍需真实桌面执行
 
 - Chrome / Edge 的 `textarea` 与 `contenteditable`
 - Word（`_WwG`，Document → 预期只复制）
