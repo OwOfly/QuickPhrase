@@ -1,7 +1,7 @@
 # M0-4 验收记录（2026-11-18，复核修复后）
 
 - 范围：恢复目标、G1–G12 守卫、`SendInput` Unicode、三态结果、输入策略、只复制路径
-- 复核：r1 三家 CHANGES_REQUIRED；修复后待 r2 focused
+- 复核：r1 三家 CHANGES_REQUIRED → r2 闭环 + 新问题 → r3 **glm PASS、kimi PASS、qwen PASS**
 - 复核依据：`docs/_ref/final-plan.md` v4.1 §7、§5.5、§8 M0-4
 
 ## 已实现
@@ -101,4 +101,8 @@ inject-test: PASS
 
 ## 结论
 
-M0-4 的注入核心、策略与守卫在代码层闭环，注入自测通过；真实跨应用行为仍由 M0-5 矩阵决定，当前不宣称 99% 成功率。待 r2 focused 复核确认。
+M0-4 的注入核心、策略与守卫在代码层闭环，注入自测通过；真实跨应用行为仍由 M0-5 矩阵决定，当前不宣称 99% 成功率。
+
+**复核闭环**：r3 focused 三家（glm / kimi / qwen）全部 PASS，S1–S5 全 CLOSED，无新 blocker/major。**M0-4 过门，M0-5 可开。**
+
+残留（不阻塞）：托盘气泡失败无降级反馈；注入 worker 路径无端到端注入测试；守卫负例无自动化；跨应用矩阵待 M0-5。
