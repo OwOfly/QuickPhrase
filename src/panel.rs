@@ -360,7 +360,7 @@ fn create() -> Option<Panel> {
         }
     }
 
-    let hwnd = unsafe {
+    let hwnd = match unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             PANEL_CLASS,
@@ -375,8 +375,14 @@ fn create() -> Option<Panel> {
             Some(instance),
             None,
         )
-    }
-    .ok()?;
+    } {
+        Ok(hwnd) => hwnd,
+        Err(err) => {
+            logging::error(&format!("CreateWindowExW(PANEL) failed: {err}"));
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
 
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
