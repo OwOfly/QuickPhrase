@@ -81,7 +81,7 @@ T1–T26 尚无逐条结论。已由代码/单测覆盖的部分：
 | 实验 | 状态 |
 | --- | --- |
 | E2 VS Code 编辑器 vs 终端 | 未执行（无 VS Code 会话） |
-| E3 捕获延迟/0-HWND 比例 | 未采集 100 次样本 |
+| E3 捕获延迟/0-HWND 比例 | 裸 Win32 EDIT：n=20，UIA 14–27 ms（p50 20 / p95 27），identity 20/20，region `text_editor` 20/20 |
 | E4 位置对比覆盖率 | 跨进程恒 `POSITION_UNVERIFIED`；原生同进程可对比 |
 
 ## 6. 结论
