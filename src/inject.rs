@@ -258,6 +258,13 @@ fn final_check(report: &Report, target: HWND) -> bool {
         return false;
     }
 
+    if report.identity_source == "uia"
+        && uia::compare_last(target, Duration::from_millis(50)) != Some(true)
+    {
+        return false;
+    }
+
+    // Re-check focus after the last blocking wait (UIA compare).
     match context::focused_window(report.target.tid) {
         Some(focused)
             if report.target.focused_hwnd == 0
@@ -265,10 +272,12 @@ fn final_check(report: &Report, target: HWND) -> bool {
         _ => return false,
     }
 
-    if report.identity_source == "uia"
-        && uia::compare_last(target, Duration::from_millis(50)) != Some(true)
-    {
-        return false;
+    if report.target.focused_is_editable {
+        let focused = HWND(report.target.focused_hwnd as *mut core::ffi::c_void);
+        let style = unsafe { GetWindowLongW(focused, GWL_STYLE) };
+        if style & ES_READONLY != 0 {
+            return false;
+        }
     }
 
     unsafe { GetForegroundWindow() == target }
