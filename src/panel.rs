@@ -524,14 +524,12 @@ fn place() {
         y = anchor.y - height - scaled(ITEM_HEIGHT, dpi);
     }
 
-    x = x.clamp(
-        work.left + scaled(8, dpi),
-        (work.right - width - scaled(8, dpi)).max(work.left),
-    );
-    y = y.clamp(
-        work.top + scaled(8, dpi),
-        (work.bottom - height - scaled(8, dpi)).max(work.top),
-    );
+    let min_x = work.left + scaled(8, dpi);
+    let max_x = (work.right - width - scaled(8, dpi)).max(min_x);
+    let min_y = work.top + scaled(8, dpi);
+    let max_y = (work.bottom - height - scaled(8, dpi)).max(min_y);
+    x = x.clamp(min_x, max_x);
+    y = y.clamp(min_y, max_y);
 
     unsafe {
         let _ = SetWindowPos(
