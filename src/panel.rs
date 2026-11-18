@@ -114,6 +114,7 @@ thread_local! {
 
 static OLD_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
 static CREATE_FAILED: AtomicBool = AtomicBool::new(false);
+static ENTER_ARMED: AtomicBool = AtomicBool::new(false);
 static INJECT_RESULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 pub const WM_INJECT_DONE: u32 = WM_APP + 0x61;
@@ -243,6 +244,7 @@ fn present(
         panel.notify = notify;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
+        ENTER_ARMED.store(false, Ordering::Relaxed);
         (panel.hwnd, panel.edit)
     });
 
@@ -291,6 +293,7 @@ fn hide(restore: bool) {
             return (HWND::default(), HWND::default(), false);
         };
         panel.hiding = true;
+        ENTER_ARMED.store(false, Ordering::Relaxed);
         let target = panel
             .report
             .as_ref()
@@ -987,9 +990,14 @@ unsafe extern "system" fn edit_proc(
 ) -> LRESULT {
     if (message == WM_KEYUP || message == WM_SYSKEYUP) && wparam.0 as u16 == VK_RETURN.0 {
         if ime_composing(hwnd) {
+            ENTER_ARMED.store(false, Ordering::Relaxed);
             return call_default_edit(hwnd, message, wparam, lparam);
         }
-        commit();
+        // Only commit when the matching key-down was observed and was not
+        // consumed by IME composition.
+        if ENTER_ARMED.swap(false, Ordering::Relaxed) {
+            commit();
+        }
         return LRESULT(0);
     }
 
@@ -997,8 +1005,13 @@ unsafe extern "system" fn edit_proc(
         let key = wparam.0 as u16;
 
         if key == VK_RETURN.0 {
+            if ime_composing(hwnd) {
+                ENTER_ARMED.store(false, Ordering::Relaxed);
+                return call_default_edit(hwnd, message, wparam, lparam);
+            }
             // Commit on key-up so Enter is physically released before the
             // panel hides and focus returns to the target.
+            ENTER_ARMED.store(true, Ordering::Relaxed);
             return LRESULT(0);
         }
 

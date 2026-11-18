@@ -219,13 +219,13 @@ fn guard(report: &Report) -> Result<(), &'static str> {
         return Err("focus_changed");
     }
 
+    if report.target.selection.is_none() {
+        logging::info("position_unverified");
+    }
     if report.target.focused_is_editable {
         let style = unsafe { GetWindowLongW(focused, GWL_STYLE) };
         if style & ES_READONLY != 0 {
             return Err("read_only_changed");
-        }
-        if report.target.selection.is_none() {
-            logging::info("position_unverified");
         }
     }
 
