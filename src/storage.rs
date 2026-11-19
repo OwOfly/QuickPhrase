@@ -182,6 +182,7 @@ pub struct PanelRow {
     pub title: String,
     pub content: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub blob: String,
     pub pinned: bool,
     pub sort_order: i32,
@@ -199,6 +200,7 @@ pub fn panel_items() -> Vec<PanelRow> {
                 title: snippet.title.clone(),
                 content: snippet.content.clone(),
                 category: store.category_name(snippet.category_id.as_deref()),
+                category_id: snippet.category_id.clone(),
                 blob: snippet.search_blob.clone(),
                 pinned: snippet.pinned,
                 sort_order: snippet.sort_order,
@@ -208,6 +210,31 @@ pub fn panel_items() -> Vec<PanelRow> {
             .collect()
     })
     .unwrap_or_default()
+}
+
+pub fn categories() -> Vec<(String, String)> {
+    with_store(|store| {
+        let mut categories: Vec<(String, String)> = store
+            .data()
+            .categories
+            .iter()
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
+        categories.sort_by(|left, right| left.1.cmp(&right.1));
+        categories
+    })
+    .unwrap_or_default()
+}
+
+pub fn read_only_notice() -> Option<String> {
+    with_store(|store| {
+        if store.is_read_only() {
+            store.notice().map(|notice| notice.to_string())
+        } else {
+            None
+        }
+    })
+    .flatten()
 }
 
 pub fn record_use(id: &str, status: &str) {

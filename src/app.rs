@@ -388,21 +388,8 @@ fn activate_panel() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
-            let items: Vec<panel::Item> = storage::panel_items()
-                .into_iter()
-                .map(|row| panel::Item {
-                    id: row.id,
-                    title: row.title,
-                    content: row.content,
-                    category: row.category,
-                    blob: row.blob,
-                    pinned: row.pinned,
-                    last_used_at: row.last_used_at,
-                    updated_at: row.updated_at,
-                    sort_order: row.sort_order,
-                })
-                .collect();
-            let micros = panel::show(report, monitor, main, items);
+            let data = panel_data();
+            let micros = panel::show(report, monitor, main, data);
 
             if micros == 0 {
                 logging::warn("panel show failed (creation or foreground)");
@@ -417,8 +404,18 @@ fn activate_panel() {
         }
         None => {
             logging::warn("capture returned no usable foreground window");
-            if !main.0.is_null() {
-                tray::balloon(main, "QuickPhrase", "未捕获到前台窗口");
+            // Per PRD 14.3 the panel still opens; Enter copies instead of typing.
+            let mut data = panel_data();
+            if data.notice.is_none() {
+                data.notice = Some("未捕获到目标窗口".to_string());
+            }
+            data.copy_only = Some("未捕获到目标窗口".to_string());
+            let micros = panel::show_copy_only(main, data);
+            if micros == 0 {
+                logging::warn("copy-only panel show failed");
+                if !main.0.is_null() {
+                    tray::balloon(main, "QuickPhrase", "无法显示面板（创建或焦点失败）");
+                }
             }
         }
     }
@@ -427,6 +424,30 @@ fn activate_panel() {
         "capture pipeline took {} ms",
         started.elapsed().as_millis()
     ));
+}
+
+fn panel_data() -> panel::PanelData {
+    let items = storage::panel_items()
+        .into_iter()
+        .map(|row| panel::Item {
+            id: row.id,
+            title: row.title,
+            content: row.content,
+            category: row.category,
+            category_id: row.category_id,
+            blob: row.blob,
+            pinned: row.pinned,
+            last_used_at: row.last_used_at,
+            updated_at: row.updated_at,
+            sort_order: row.sort_order,
+        })
+        .collect();
+    panel::PanelData {
+        items,
+        categories: storage::categories(),
+        notice: storage::read_only_notice(),
+        copy_only: None,
+    }
 }
 
 fn toggle_hotkey() {

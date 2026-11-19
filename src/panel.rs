@@ -5,18 +5,18 @@ use std::time::Instant;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    RECT, WPARAM,
+    RECT, SIZE, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FrameRect, GetMonitorInfoW, MonitorFromPoint, SelectObject, SetBkColor, SetBkMode,
-    SetTextColor, UpdateWindow, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, HBRUSH, HDC,
-    HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    TRANSPARENT,
+    FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint,
+    ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -41,6 +41,12 @@ const FOOTER_ID: i32 = 102;
 
 const PANEL_WIDTH: i32 = 520;
 const PANEL_HEIGHT: i32 = 420;
+const SEARCH_TOP: i32 = 14;
+const SEARCH_HEIGHT: i32 = 34;
+const CATEGORY_TOP: i32 = 54;
+const CATEGORY_HEIGHT: i32 = 46;
+const LIST_TOP: i32 = 104;
+const FOOTER_HEIGHT: i32 = 42;
 const ITEM_HEIGHT: i32 = 64;
 
 const LB_ADDSTRING: u32 = 0x0180;
@@ -60,11 +66,19 @@ pub struct Item {
     pub title: String,
     pub content: String,
     pub category: String,
+    pub category_id: Option<String>,
     pub blob: String,
     pub pinned: bool,
     pub last_used_at: Option<String>,
     pub updated_at: String,
     pub sort_order: i32,
+}
+
+pub struct PanelData {
+    pub items: Vec<Item>,
+    pub categories: Vec<(String, String)>,
+    pub notice: Option<String>,
+    pub copy_only: Option<String>,
 }
 
 struct Fonts {
@@ -78,6 +92,7 @@ struct Brushes {
     selected: HBRUSH,
     search: HBRUSH,
     border: HBRUSH,
+    highlight: HBRUSH,
 }
 
 struct Panel {
@@ -87,6 +102,13 @@ struct Panel {
     footer: HWND,
     filtered: Vec<usize>,
     items: Vec<Item>,
+    categories: Vec<(String, String)>,
+    active_category: Option<String>,
+    copy_only: Option<String>,
+    notice: Option<String>,
+    title_highlights: Vec<Option<(usize, usize)>>,
+    content_highlights: Vec<Option<(usize, usize)>>,
+    last_query: String,
     report: Option<Report>,
     notify: HWND,
     fonts: Fonts,
@@ -176,6 +198,7 @@ fn make_brushes() -> Brushes {
         selected: unsafe { CreateSolidBrush(rgb(240, 237, 255)) },
         search: unsafe { CreateSolidBrush(rgb(248, 248, 253)) },
         border: unsafe { CreateSolidBrush(rgb(233, 235, 243)) },
+        highlight: unsafe { CreateSolidBrush(rgb(255, 241, 184)) },
     }
 }
 
@@ -185,6 +208,7 @@ fn destroy_brushes(brushes: &Brushes) {
         let _ = DeleteObject(HGDIOBJ(brushes.selected.0));
         let _ = DeleteObject(HGDIOBJ(brushes.search.0));
         let _ = DeleteObject(HGDIOBJ(brushes.border.0));
+        let _ = DeleteObject(HGDIOBJ(brushes.highlight.0));
     }
 }
 
@@ -211,20 +235,37 @@ pub fn show(
     report: Report,
     monitor: Option<crate::foreground::Monitor>,
     notify: HWND,
-    items: Vec<Item>,
+    data: PanelData,
 ) -> u128 {
-    present(Some(report), monitor, notify, items, true, false)
+    present(Some(report), monitor, notify, data, true, false)
+}
+
+/// Capture failed: open the panel anyway, but Enter copies instead of typing.
+pub fn show_copy_only(notify: HWND, data: PanelData) -> u128 {
+    present(None, None, notify, data, true, false)
 }
 
 pub fn show_test() -> u128 {
-    present(None, None, HWND::default(), Vec::new(), true, true)
+    present(
+        None,
+        None,
+        HWND::default(),
+        PanelData {
+            items: Vec::new(),
+            categories: Vec::new(),
+            notice: None,
+            copy_only: None,
+        },
+        true,
+        true,
+    )
 }
 
 fn present(
     report: Option<Report>,
     monitor: Option<crate::foreground::Monitor>,
     notify: HWND,
-    items: Vec<Item>,
+    data: PanelData,
     activate: bool,
     quit_on_hide: bool,
 ) -> u128 {
@@ -246,10 +287,21 @@ fn present(
         panel.report = report;
         panel.monitor = monitor;
         panel.notify = notify;
-        panel.items = items;
+        panel.items = data.items;
+        panel.categories = data.categories;
+        panel.notice = data.notice;
+        panel.copy_only = data.copy_only;
+        panel.active_category = None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
         ENTER_ARMED.store(false, Ordering::Relaxed);
+        logging::info(&format!(
+            "panel data: items={} categories={} copy_only={} notice={:?}",
+            panel.items.len(),
+            panel.categories.len(),
+            panel.copy_only.is_some(),
+            panel.notice
+        ));
         (panel.hwnd, panel.edit)
     });
 
@@ -571,6 +623,13 @@ fn create() -> Option<Panel> {
         footer,
         filtered: Vec::new(),
         items: Vec::new(),
+        categories: Vec::new(),
+        active_category: None,
+        copy_only: None,
+        notice: None,
+        title_highlights: Vec::new(),
+        content_highlights: Vec::new(),
+        last_query: String::new(),
         report: None,
         notify: HWND::default(),
         fonts,
@@ -609,12 +668,12 @@ fn commit() {
         Some((
             item_index,
             item.id.clone(),
-            item.category.clone(),
+            item.category_id.clone().unwrap_or_default(),
             item.content.clone(),
         ))
     });
 
-    let Some((item_index, item_id, category, content)) = info else {
+    let Some((item_index, item_id, category_id, content)) = info else {
         logging::info("panel commit ignored: no matching item");
         return;
     };
@@ -626,22 +685,44 @@ fn commit() {
             .unwrap_or(false)
     });
 
-    let (report, notify, hwnd) = PANEL.with(|slot| {
+    let (report, notify, hwnd, copy_only) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
-            return (None, HWND::default(), HWND::default());
+            return (None, HWND::default(), HWND::default(), None);
         };
         panel.hiding = true;
-        (panel.report.take(), panel.notify, panel.hwnd)
+        let copy_only = panel.copy_only.clone();
+        (panel.report.take(), panel.notify, panel.hwnd, copy_only)
     });
 
+    if report.is_none() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        let reason = copy_only.as_deref().unwrap_or("no_target");
+        let copied = crate::clipboard::set_text(&content);
+        logging::info(&format!(
+            "panel copy-only commit: index={item_index} category={category_id} copied={copied}"
+        ));
+        if !notify.0.is_null() {
+            let message = if copied {
+                format!("已复制（{reason}）")
+            } else {
+                format!("复制失败（{reason}）")
+            };
+            crate::tray::balloon(notify, "QuickPhrase", &message);
+        }
+        finish_insert(SESSION.load(Ordering::Relaxed));
+        return;
+    }
+
     let Some(report) = report else {
-        hide_and_restore();
+        finish_insert(SESSION.load(Ordering::Relaxed));
         return;
     };
 
     logging::info(&format!(
-        "panel commit: index={item_index} category={category}"
+        "panel commit: index={item_index} category={category_id}"
     ));
     logging::info(&format!("panel capture context: {}", report.summary()));
 
@@ -855,20 +936,19 @@ fn layout_controls(edit: HWND, list: HWND, footer: HWND, dpi: u32, width: i32, h
         return;
     }
     let margin = scaled(16, dpi);
-    let edit_height = scaled(34, dpi);
-    let footer_height = scaled(22, dpi);
-    let gap = scaled(10, dpi);
+    let edit_height = scaled(SEARCH_HEIGHT, dpi);
+    let footer_height = scaled(FOOTER_HEIGHT, dpi);
 
     unsafe {
         let _ = MoveWindow(
             edit,
             margin,
-            scaled(14, dpi),
+            scaled(SEARCH_TOP, dpi),
             width - margin * 2,
             edit_height,
             true,
         );
-        let list_top = scaled(14, dpi) + edit_height + gap;
+        let list_top = scaled(LIST_TOP, dpi);
         let list_height = (height - list_top - footer_height - scaled(12, dpi)).max(0);
         let _ = MoveWindow(
             list,
@@ -960,47 +1040,326 @@ fn apply_rounding(hwnd: HWND) {
     }
 }
 
-fn filter_items(items: &[Item], query: &str) -> Vec<usize> {
-    let docs: Vec<crate::search::Doc> = items
+fn category_chips(
+    hdc: HDC,
+    panel: &Panel,
+    right_limit: i32,
+    dpi: u32,
+) -> Vec<(Option<String>, RECT)> {
+    let mut chips = Vec::new();
+    let top = scaled(CATEGORY_TOP, dpi) + scaled((CATEGORY_HEIGHT - 30) / 2, dpi);
+    let height = scaled(30, dpi);
+    let mut x = scaled(16, dpi);
+    let mut entries: Vec<(Option<String>, String)> = vec![(None, "全部".to_string())];
+    entries.extend(
+        panel
+            .categories
+            .iter()
+            .map(|(id, name)| (Some(id.clone()), name.clone())),
+    );
+
+    unsafe {
+        for (id, name) in entries {
+            let text = platform::wide(&name);
+            let mut size = SIZE::default();
+            if !GetTextExtentPoint32W(hdc, &text, &mut size).as_bool() {
+                continue;
+            }
+            let width = size.cx + scaled(22, dpi);
+            if x + width > right_limit {
+                break;
+            }
+            let chip = RECT {
+                left: x,
+                top,
+                right: x + width,
+                bottom: top + height,
+            };
+            chips.push((id, chip));
+            x += width + scaled(8, dpi);
+        }
+    }
+    chips
+}
+
+fn draw_categories(hdc: HDC, panel: &Panel, right_limit: i32, dpi: u32) {
+    let font = panel.fonts.body;
+    unsafe {
+        let previous = SelectObject(hdc, HGDIOBJ(font.0));
+        SetBkMode(hdc, TRANSPARENT);
+        for (id, mut rect) in category_chips(hdc, panel, right_limit, dpi) {
+            let selected = match (&id, &panel.active_category) {
+                (None, None) => true,
+                (Some(left), Some(right)) => left == right,
+                _ => false,
+            };
+            let mut label = platform::wide(
+                id.as_ref()
+                    .and_then(|id| {
+                        panel
+                            .categories
+                            .iter()
+                            .find(|(value, _)| value == id)
+                            .map(|(_, name)| name.as_str())
+                    })
+                    .unwrap_or("全部"),
+            );
+            let brush = if selected {
+                panel.brushes.selected
+            } else {
+                panel.brushes.search
+            };
+            FillRect(hdc, &rect, brush);
+            SetTextColor(
+                hdc,
+                if selected {
+                    rgb(0x5B, 0x3F, 0xD6)
+                } else {
+                    rgb(0x55, 0x5B, 0x70)
+                },
+            );
+            DrawTextW(
+                hdc,
+                &mut label,
+                &mut rect,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+            );
+        }
+        let _ = SelectObject(hdc, previous);
+    }
+}
+
+fn draw_empty_message(hdc: HDC, panel: &Panel, rect: &RECT, dpi: u32) {
+    let Some(message) = empty_message(panel) else {
+        return;
+    };
+    let mut message_rect = RECT {
+        left: rect.left,
+        top: scaled(LIST_TOP, dpi),
+        right: rect.right,
+        bottom: rect.bottom - scaled(FOOTER_HEIGHT + 8, dpi),
+    };
+    let mut text = platform::wide(message);
+    unsafe {
+        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.body.0));
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(0x8A, 0x90, 0xA6));
+        DrawTextW(
+            hdc,
+            &mut text,
+            &mut message_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(hdc, previous);
+    }
+}
+
+fn draw_match(
+    hdc: HDC,
+    panel: &Panel,
+    text: &str,
+    rect: &mut RECT,
+    highlight: Option<(usize, usize)>,
+    normal: COLORREF,
+) {
+    let Some((start, end)) = highlight.filter(|(start, end)| start < end && *end <= text.len())
+    else {
+        let mut wide = platform::wide(text);
+        unsafe {
+            SetTextColor(hdc, normal);
+            DrawTextW(
+                hdc,
+                &mut wide,
+                rect,
+                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+        return;
+    };
+
+    let prefix = &text[..start];
+    let matched = &text[start..end];
+    let suffix = &text[end..];
+    let mut prefix_wide = platform::wide(prefix);
+    let mut matched_wide = platform::wide(matched);
+    let mut suffix_wide = platform::wide(suffix);
+    let mut prefix_size = SIZE::default();
+    let mut matched_size = SIZE::default();
+    unsafe {
+        if !GetTextExtentPoint32W(hdc, &prefix_wide, &mut prefix_size).as_bool()
+            || !GetTextExtentPoint32W(hdc, &matched_wide, &mut matched_size).as_bool()
+        {
+            return;
+        }
+    }
+
+    let mut prefix_rect = RECT {
+        left: rect.left,
+        top: rect.top,
+        right: (rect.left + prefix_size.cx).min(rect.right),
+        bottom: rect.bottom,
+    };
+    let mut match_rect = RECT {
+        left: rect.left + prefix_size.cx,
+        top: rect.top,
+        right: (rect.left + prefix_size.cx + matched_size.cx + 2).min(rect.right),
+        bottom: rect.bottom,
+    };
+    let mut suffix_rect = RECT {
+        left: rect.left + prefix_size.cx + matched_size.cx,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+
+    unsafe {
+        SetTextColor(hdc, normal);
+        DrawTextW(
+            hdc,
+            &mut prefix_wide,
+            &mut prefix_rect,
+            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX,
+        );
+        if match_rect.right > match_rect.left {
+            FillRect(hdc, &match_rect, panel.brushes.highlight);
+            SetTextColor(hdc, rgb(0x4A, 0x2C, 0xB8));
+            DrawTextW(
+                hdc,
+                &mut matched_wide,
+                &mut match_rect,
+                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX,
+            );
+        }
+        if suffix_rect.right > suffix_rect.left {
+            SetTextColor(hdc, normal);
+            DrawTextW(
+                hdc,
+                &mut suffix_wide,
+                &mut suffix_rect,
+                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+    }
+}
+
+type Highlight = Option<(usize, usize)>;
+type FilterResult = (Vec<usize>, Vec<Highlight>, Vec<Highlight>);
+
+fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterResult {
+    let subset: Vec<usize> = items
         .iter()
-        .map(|item| crate::search::Doc {
-            id: &item.id,
-            title: &item.title,
-            content: &item.content,
-            blob: &item.blob,
-            pinned: item.pinned,
-            last_used_at: item.last_used_at.as_deref(),
-            updated_at: &item.updated_at,
-            sort_order: item.sort_order,
+        .enumerate()
+        .filter(|(_, item)| match category {
+            Some(id) => item.category_id.as_deref() == Some(id),
+            None => true,
+        })
+        .map(|(index, _)| index)
+        .collect();
+
+    let docs: Vec<crate::search::Doc> = subset
+        .iter()
+        .map(|&index| {
+            let item = &items[index];
+            crate::search::Doc {
+                id: &item.id,
+                title: &item.title,
+                content: &item.content,
+                blob: &item.blob,
+                pinned: item.pinned,
+                last_used_at: item.last_used_at.as_deref(),
+                updated_at: &item.updated_at,
+                sort_order: item.sort_order,
+            }
         })
         .collect();
-    crate::search::rank(&docs, query, crate::search::DEFAULT_LIMIT)
-        .into_iter()
-        .map(|hit| hit.index)
-        .collect()
+
+    let hits = crate::search::rank(&docs, query, crate::search::DEFAULT_LIMIT);
+    let mut filtered = Vec::with_capacity(hits.len());
+    let mut title_highlights = Vec::with_capacity(hits.len());
+    let mut content_highlights = Vec::with_capacity(hits.len());
+    for hit in hits {
+        filtered.push(subset[hit.index]);
+        title_highlights.push(hit.title_highlight);
+        content_highlights.push(hit.content_highlight);
+    }
+    (filtered, title_highlights, content_highlights)
+}
+
+fn footer_text(panel: &Panel) -> String {
+    if let Some(reason) = &panel.copy_only {
+        return format!("仅复制（{reason}） · Enter 复制 · Esc 关闭");
+    }
+    if let Some(notice) = &panel.notice {
+        return format!("存储只读（{notice}） · ↑↓ 选择 · Enter 输入 · Esc 关闭");
+    }
+    "↑↓ 选择 · Enter 输入 · Esc 关闭".to_string()
+}
+
+fn empty_message(panel: &Panel) -> Option<&'static str> {
+    if !panel.filtered.is_empty() {
+        return None;
+    }
+    if panel.items.is_empty() {
+        return Some("还没有短语");
+    }
+    if !panel.last_query.is_empty() {
+        return Some("没有匹配的短语");
+    }
+    if panel.active_category.is_some() {
+        return Some("该分类下还没有短语");
+    }
+    None
 }
 
 fn populate(query: &str) {
-    let (list, filtered, titles) = PANEL.with(|slot| {
-        let guard = slot.borrow();
-        let Some(panel) = guard.as_ref() else {
-            return (HWND::default(), Vec::new(), Vec::new());
-        };
-        let filtered = filter_items(&panel.items, query);
-        let titles: Vec<Vec<u16>> = filtered
-            .iter()
-            .map(|index| platform::wide(&panel.items[*index].title))
-            .collect();
-        (panel.list, filtered, titles)
-    });
+    let (hwnd, list, footer, filtered, title_highlights, content_highlights, footer_label) = PANEL
+        .with(|slot| {
+            let guard = slot.borrow();
+            let Some(panel) = guard.as_ref() else {
+                return (
+                    HWND::default(),
+                    HWND::default(),
+                    HWND::default(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    String::new(),
+                );
+            };
+            let (filtered, title_highlights, content_highlights) =
+                filter_items(&panel.items, panel.active_category.as_deref(), query);
+            (
+                panel.hwnd,
+                panel.list,
+                panel.footer,
+                filtered,
+                title_highlights,
+                content_highlights,
+                footer_text(panel),
+            )
+        });
 
     if list.0.is_null() {
         return;
     }
 
+    let titles: Vec<Vec<u16>> = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        let Some(panel) = guard.as_ref() else {
+            return Vec::new();
+        };
+        filtered
+            .iter()
+            .map(|index| platform::wide(&panel.items[*index].title))
+            .collect()
+    });
+
     PANEL.with(|slot| {
         if let Some(panel) = slot.borrow_mut().as_mut() {
             panel.filtered = filtered;
+            panel.title_highlights = title_highlights;
+            panel.content_highlights = content_highlights;
+            panel.last_query = query.trim().to_string();
         }
     });
 
@@ -1012,6 +1371,9 @@ fn populate(query: &str) {
         if !titles.is_empty() {
             let _ = send(list, LB_SETCURSEL, 0, 0);
         }
+        let label = platform::wide(&footer_label);
+        let _ = SetWindowTextW(footer, PCWSTR(label.as_ptr()));
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -1223,29 +1585,85 @@ unsafe extern "system" fn window_proc(
                 let hdc = BeginPaint(hwnd, &mut paint);
                 let mut rect = RECT::default();
                 let _ = GetClientRect(hwnd, &mut rect);
-                if let Some((brush, border, search, dpi)) = PANEL.with(|slot| {
-                    slot.borrow().as_ref().map(|panel| {
-                        (
-                            panel.brushes.background,
-                            panel.brushes.border,
-                            panel.brushes.search,
-                            panel.dpi,
-                        )
-                    })
-                }) {
-                    FillRect(hdc, &rect, brush);
+                PANEL.with(|slot| {
+                    let guard = slot.borrow();
+                    let Some(panel) = guard.as_ref() else {
+                        return;
+                    };
+                    let margin = scaled(16, panel.dpi);
+                    FillRect(hdc, &rect, panel.brushes.background);
 
-                    let margin = scaled(16, dpi);
                     let search_rect = RECT {
                         left: margin - 1,
-                        top: scaled(14, dpi) - 1,
+                        top: scaled(SEARCH_TOP, panel.dpi) - 1,
                         right: rect.right - margin + 1,
-                        bottom: scaled(14, dpi) + scaled(34, dpi) + 1,
+                        bottom: scaled(SEARCH_TOP + SEARCH_HEIGHT, panel.dpi) + 1,
                     };
-                    FillRect(hdc, &search_rect, search);
-                    let _ = FrameRect(hdc, &search_rect, border);
-                }
+                    FillRect(hdc, &search_rect, panel.brushes.search);
+                    let _ = FrameRect(hdc, &search_rect, panel.brushes.border);
+
+                    draw_categories(hdc, panel, rect.right - margin, panel.dpi);
+                    draw_empty_message(hdc, panel, &rect, panel.dpi);
+                });
                 let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let chosen = PANEL.with(|slot| {
+                let guard = slot.borrow();
+                let panel = guard.as_ref()?;
+                let hdc = unsafe { GetDC(Some(hwnd)) };
+                let chips = category_chips(
+                    hdc,
+                    panel,
+                    {
+                        let mut rect = RECT::default();
+                        unsafe {
+                            let _ = GetClientRect(hwnd, &mut rect);
+                        }
+                        rect.right - scaled(16, panel.dpi)
+                    },
+                    panel.dpi,
+                );
+                unsafe {
+                    let _ = ReleaseDC(Some(hwnd), hdc);
+                }
+                chips
+                    .into_iter()
+                    .find(|(_, rect)| {
+                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+                    })
+                    .map(|(id, _)| id)
+            });
+
+            if let Some(id) = chosen {
+                logging::info(&format!("panel category: {id:?}"));
+                let changed = PANEL.with(|slot| {
+                    let mut guard = slot.borrow_mut();
+                    let Some(panel) = guard.as_mut() else {
+                        return false;
+                    };
+                    if panel.active_category == id {
+                        return false;
+                    }
+                    panel.active_category = id;
+                    true
+                });
+                if changed {
+                    let edit = PANEL.with(|slot| {
+                        slot.borrow()
+                            .as_ref()
+                            .map(|panel| panel.edit)
+                            .unwrap_or_default()
+                    });
+                    if !edit.0.is_null() {
+                        let query = read_text(edit);
+                        populate(&query);
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1333,7 +1751,11 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 
     let pad = scaled(12, panel.dpi);
 
-    let mut title = platform::wide(&item.title);
+    let title_highlight = panel
+        .title_highlights
+        .get(draw.itemID as usize)
+        .copied()
+        .flatten();
     let mut title_rect = RECT {
         left: rect.left + pad,
         top: rect.top + scaled(8, panel.dpi),
@@ -1342,17 +1764,22 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     };
     unsafe {
         let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.title.0));
-        SetTextColor(hdc, rgb(0x22, 0x24, 0x3E));
-        DrawTextW(
+        draw_match(
             hdc,
-            &mut title,
+            panel,
+            &item.title,
             &mut title_rect,
-            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+            title_highlight,
+            rgb(0x22, 0x24, 0x3E),
         );
         let _ = SelectObject(hdc, previous);
     }
 
-    let mut preview = platform::wide(&item.content);
+    let content_highlight = panel
+        .content_highlights
+        .get(draw.itemID as usize)
+        .copied()
+        .flatten();
     let mut preview_rect = RECT {
         left: rect.left + pad,
         top: rect.top + scaled(30, panel.dpi),
@@ -1361,12 +1788,13 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     };
     unsafe {
         let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.body.0));
-        SetTextColor(hdc, rgb(0x77, 0x7D, 0x92));
-        DrawTextW(
+        draw_match(
             hdc,
-            &mut preview,
+            panel,
+            &item.content,
             &mut preview_rect,
-            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+            content_highlight,
+            rgb(0x77, 0x7D, 0x92),
         );
         let _ = SelectObject(hdc, previous);
     }
@@ -1397,14 +1825,26 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
-        let elapsed = present(None, None, HWND::default(), Vec::new(), false, false);
+        let elapsed = present(
+            None,
+            None,
+            HWND::default(),
+            PanelData {
+                items: Vec::new(),
+                categories: Vec::new(),
+                notice: None,
+                copy_only: None,
+            },
+            false,
+            false,
+        );
         samples.push(elapsed);
         hide_and_restore();
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
     // Nearest-rank p95: ceil(0.95 * n) -> zero-based index.
-    let p95_rank = (samples.len() * 95 + 99) / 100;
+    let p95_rank = (samples.len() * 95).div_ceil(100);
     let p95 = samples[p95_rank.saturating_sub(1).min(samples.len() - 1)];
     let max = *samples.last().unwrap_or(&0);
     (p50, p95, max)
@@ -1434,13 +1874,25 @@ pub fn shutdown() {
 mod tests {
     use super::{filter_items, scaled, Item};
 
+    fn rank_ids(items: &[Item], query: &str) -> Vec<usize> {
+        filter_items(items, None, query).0
+    }
+
     fn items() -> Vec<Item> {
-        fn item(id: &str, title: &str, content: &str, category: &str, sort_order: i32) -> Item {
+        fn item(
+            id: &str,
+            title: &str,
+            content: &str,
+            category: &str,
+            category_id: &str,
+            sort_order: i32,
+        ) -> Item {
             Item {
                 id: id.to_string(),
                 title: title.to_string(),
                 content: content.to_string(),
                 category: category.to_string(),
+                category_id: Some(category_id.to_string()),
                 blob: format!("{}\n{}", title.to_lowercase(), content.to_lowercase()),
                 pinned: false,
                 last_used_at: None,
@@ -1454,23 +1906,54 @@ mod tests {
                 "项目进度回复",
                 "您好，目前该功能已完成开发。",
                 "工作沟通",
+                "c1",
                 0,
             ),
-            item("2", "收到回复", "好的，已收到。", "工作沟通", 1),
-            item("3", "接口开发说明", "返回格式为 JSON。", "开发相关", 2),
+            item("2", "收到回复", "好的，已收到。", "工作沟通", "c1", 1),
+            item(
+                "3",
+                "接口开发说明",
+                "返回格式为 JSON。",
+                "开发相关",
+                "c2",
+                2,
+            ),
         ]
     }
 
     #[test]
     fn empty_query_returns_every_item() {
-        assert_eq!(filter_items(&items(), ""), vec![0, 1, 2]);
+        assert_eq!(rank_ids(&items(), ""), vec![0, 1, 2]);
     }
 
     #[test]
     fn query_matches_title_and_content() {
-        assert_eq!(filter_items(&items(), "项目"), vec![0]);
-        assert_eq!(filter_items(&items(), "JSON"), vec![2]);
-        assert!(filter_items(&items(), "does-not-exist").is_empty());
+        assert_eq!(rank_ids(&items(), "项目"), vec![0]);
+        assert_eq!(rank_ids(&items(), "JSON"), vec![2]);
+        assert!(rank_ids(&items(), "does-not-exist").is_empty());
+    }
+
+    #[test]
+    fn category_filter_limits_the_subset() {
+        let items = items();
+        let (filtered, _, _) = filter_items(&items, Some("c1"), "");
+        assert_eq!(filtered, vec![0, 1]);
+        let (filtered, _, _) = filter_items(&items, Some("c2"), "项目");
+        assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn highlights_follow_the_filtered_order() {
+        let items = items();
+        let (filtered, titles, contents) = filter_items(&items, None, "接口");
+        assert_eq!(filtered, vec![2]);
+        assert!(titles[0].is_some());
+        assert!(contents[0].is_none());
+
+        let (filtered, titles, contents) = filter_items(&items, None, "JSON");
+        assert_eq!(filtered, vec![2]);
+        assert!(titles[0].is_none());
+        assert!(contents[0].is_some());
     }
 
     #[test]
