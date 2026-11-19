@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
     OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -93,6 +93,7 @@ struct Manage {
     status: HWND,
     fonts: Fonts,
     brush: HBRUSH,
+    class_brush: HBRUSH,
     dpi: u32,
     view: View,
     editing: Option<String>,
@@ -228,7 +229,7 @@ fn active_rows(
             sort_order: snippet.sort_order,
         })
         .collect();
-    let hits = search::rank(&docs, query, 500);
+    let hits = search::rank(&docs, query, usize::MAX);
     hits.into_iter()
         .map(|hit| {
             let snippet = pool[hit.index];
@@ -242,8 +243,6 @@ fn active_rows(
 }
 
 fn reload_left(manage: &Manage) {
-    let was_loading = manage.loading;
-    let _ = was_loading;
     let Some(data) = data() else {
         return;
     };
@@ -274,6 +273,7 @@ fn reload_categories(manage: &Manage) {
     let Some(data) = data() else {
         return;
     };
+    let previous = unsafe { SendMessageW(manage.category, CB_GETCURSEL, 0, 0) }.0 as i32;
     unsafe {
         let _ = SendMessageW(manage.category, CB_RESETCONTENT, 0, 0);
     }
@@ -291,6 +291,14 @@ fn reload_categories(manage: &Manage) {
         unsafe {
             let _ = SendMessageW(manage.category, CB_ADDSTRING, 0, wide.as_ptr() as isize);
         }
+    }
+    let index = if previous >= 0 {
+        previous.min(data.categories.len() as i32)
+    } else {
+        0
+    };
+    unsafe {
+        let _ = SendMessageW(manage.category, CB_SETCURSEL, index as usize, 0);
     }
 }
 
@@ -343,22 +351,22 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
     let snippet = id.and_then(|id| {
         data().and_then(|data| data.snippets.into_iter().find(|snippet| snippet.id == id))
     });
+    // `?` would skip the reset at the end and leave `loading` stuck on.
+    let data = data();
     match snippet {
         Some(snippet) => {
             set_text(manage.title_edit, &snippet.title);
             set_text(manage.content_edit, &snippet.content);
-            let Some(data) = data() else {
-                return;
-            };
-            let index = snippet
-                .category_id
+            let index = data
                 .as_ref()
-                .and_then(|id| {
-                    data.categories
-                        .iter()
-                        .position(|category| &category.id == id)
+                .and_then(|data| {
+                    snippet.category_id.as_ref().and_then(|id| {
+                        data.categories
+                            .iter()
+                            .position(|category| &category.id == id)
+                            .map(|position| position + 1)
+                    })
                 })
-                .map(|position| position + 1)
                 .unwrap_or(0);
             unsafe {
                 let _ = SendMessageW(manage.category, CB_SETCURSEL, index, 0);
@@ -427,13 +435,15 @@ fn save_editor(manage: &mut Manage) {
 
     match result {
         Some(Ok(id)) => {
-            manage.editing = Some(id);
+            manage.editing = Some(id.clone());
             manage.dirty = false;
-            status_message(manage, "已保存");
             logging::info("manage: saved snippet");
             reload_left(manage);
             reload_categories(manage);
             reload_list(manage);
+            // Reload the editor so the category combo matches the saved row.
+            load_editor(manage, Some(&id));
+            status_message(manage, "已保存");
         }
         Some(Err(code)) => {
             let message = error_text(&code);
@@ -496,13 +506,24 @@ fn delete_selected(manage: &mut Manage) {
 }
 
 fn layout(manage: &Manage, width: i32, height: i32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
     let margin = scaled(MARGIN, manage.dpi);
     let row = scaled(ROW, manage.dpi);
     let left_width = scaled(LEFT_WIDTH, manage.dpi);
     let middle_width = scaled(MIDDLE_WIDTH, manage.dpi);
     let right_x = margin + left_width + margin + middle_width + margin;
     let right_width = (width - right_x - margin).max(1);
-    let content_bottom = height - margin - row - margin;
+    let actions_top = height - margin - row;
+    let meta_top = actions_top - row - margin / 2;
+    let content_bottom = meta_top - margin / 2;
+
+    // Keep the category combo and the pinned checkbox on their own row so the
+    // save/cancel buttons never overlap them at the minimum window width.
+    let pinned_width = scaled(100, manage.dpi);
+    let combo_width = (right_width - pinned_width - margin / 2)
+        .clamp(scaled(120, manage.dpi), scaled(200, manage.dpi));
 
     unsafe {
         let _ = MoveWindow(
@@ -510,14 +531,14 @@ fn layout(manage: &Manage, width: i32, height: i32) {
             margin,
             margin,
             left_width,
-            height - margin * 2 - row * 2 - margin / 2,
+            (height - margin * 2 - row * 2 - margin / 2).max(1),
             true,
         );
         let _ = MoveWindow(
             manage.cat_name,
             margin,
             height - margin - row * 2,
-            left_width - scaled(66, manage.dpi),
+            (left_width - scaled(66, manage.dpi)).max(1),
             row,
             true,
         );
@@ -546,7 +567,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
             true,
         );
         let list_top = margin + row + margin / 2;
-        let list_height = (content_bottom - list_top - row - margin).max(1);
+        let list_height = (meta_top - list_top - margin / 2).max(1);
         let _ = MoveWindow(
             manage.list,
             margin + left_width + margin,
@@ -558,7 +579,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.new_button,
             margin + left_width + margin,
-            content_bottom,
+            actions_top,
             scaled(90, manage.dpi),
             row,
             true,
@@ -566,7 +587,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.delete_button,
             margin + left_width + margin + scaled(100, manage.dpi),
-            content_bottom,
+            actions_top,
             scaled(90, manage.dpi),
             row,
             true,
@@ -574,7 +595,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.restore_button,
             margin + left_width + margin + scaled(200, manage.dpi),
-            content_bottom,
+            actions_top,
             scaled(90, manage.dpi),
             row,
             true,
@@ -582,7 +603,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
 
         let _ = MoveWindow(manage.title_edit, right_x, margin, right_width, row, true);
         let content_top = margin + row + margin;
-        let content_height = (content_bottom - content_top - row - margin).max(1);
+        let content_height = (content_bottom - content_top).max(1);
         let _ = MoveWindow(
             manage.content_edit,
             right_x,
@@ -594,23 +615,23 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.category,
             right_x,
-            content_bottom,
-            scaled(200, manage.dpi),
+            meta_top,
+            combo_width,
             scaled(200, manage.dpi),
             true,
         );
         let _ = MoveWindow(
             manage.pinned,
-            right_x + scaled(212, manage.dpi),
-            content_bottom + scaled(4, manage.dpi),
-            scaled(100, manage.dpi),
+            right_x + right_width - pinned_width,
+            meta_top + scaled(4, manage.dpi),
+            pinned_width,
             row,
             true,
         );
         let _ = MoveWindow(
             manage.save_button,
             right_x + right_width - scaled(180, manage.dpi),
-            content_bottom,
+            actions_top,
             scaled(85, manage.dpi),
             row,
             true,
@@ -618,7 +639,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.cancel_button,
             right_x + right_width - scaled(85, manage.dpi),
-            content_bottom,
+            actions_top,
             scaled(85, manage.dpi),
             row,
             true,
@@ -626,7 +647,7 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.status,
             right_x,
-            content_bottom - row - scaled(4, manage.dpi),
+            meta_top - row - scaled(2, manage.dpi),
             right_width,
             row,
             true,
@@ -671,6 +692,7 @@ fn create(owner: HWND) -> Option<Manage> {
         }
     };
     let instance = HINSTANCE(module.0);
+    let class_brush = unsafe { CreateSolidBrush(rgb(246, 247, 251)) };
     let class = WNDCLASSW {
         style: Default::default(),
         lpfnWndProc: Some(window_proc),
@@ -679,7 +701,7 @@ fn create(owner: HWND) -> Option<Manage> {
         hInstance: instance,
         hIcon: Default::default(),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-        hbrBackground: unsafe { CreateSolidBrush(rgb(246, 247, 251)) },
+        hbrBackground: class_brush,
         lpszMenuName: PCWSTR::null(),
         lpszClassName: CLASS,
     };
@@ -692,6 +714,7 @@ fn create(owner: HWND) -> Option<Manage> {
     }
 
     let hwnd = match unsafe {
+        let initial_dpi = GetDpiForSystem();
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             CLASS,
@@ -699,8 +722,8 @@ fn create(owner: HWND) -> Option<Manage> {
             WS_OVERLAPPEDWINDOW,
             80,
             80,
-            DEFAULT_WIDTH,
-            DEFAULT_HEIGHT,
+            scaled(DEFAULT_WIDTH, initial_dpi),
+            scaled(DEFAULT_HEIGHT, initial_dpi),
             Some(owner),
             None,
             Some(instance),
@@ -878,6 +901,7 @@ fn create(owner: HWND) -> Option<Manage> {
         status,
         fonts,
         brush,
+        class_brush,
         dpi,
         view: View::All,
         editing: None,
@@ -896,17 +920,22 @@ fn create(owner: HWND) -> Option<Manage> {
         new_button,
         delete_button,
         restore_button,
-        title_edit,
         content_edit,
         category,
         pinned,
         save_button,
         cancel_button,
-        status,
     ] {
         unsafe {
             let _ = SendMessageW(control, WM_SETFONT, manage.fonts.body.0 as usize, 1);
+            let style = GetWindowLongW(control, GWL_STYLE);
+            let _ = SetWindowLongW(control, GWL_STYLE, style | WS_TABSTOP.0 as i32);
         }
+    }
+    unsafe {
+        let _ = SendMessageW(title_edit, WM_SETFONT, manage.fonts.title.0 as usize, 1);
+        let style = GetWindowLongW(title_edit, GWL_STYLE);
+        let _ = SetWindowLongW(title_edit, GWL_STYLE, style | WS_TABSTOP.0 as i32);
     }
 
     let mut rect = RECT::default();
@@ -923,15 +952,26 @@ fn create(owner: HWND) -> Option<Manage> {
 }
 
 pub fn show(owner: HWND) {
-    let needs_create = MANAGE.with(|slot| slot.borrow().is_none());
+    let needs_create = MANAGE.with(|slot| match slot.try_borrow() {
+        Ok(guard) => guard.is_none(),
+        Err(_) => false,
+    });
     if needs_create {
         if let Some(manage) = create(owner) {
-            MANAGE.with(|slot| *slot.borrow_mut() = Some(manage));
+            MANAGE.with(|slot| {
+                if let Ok(mut guard) = slot.try_borrow_mut() {
+                    *guard = Some(manage);
+                }
+            });
         }
     }
 
     // ShowWindow dispatches WM_SIZE synchronously; do it outside the borrow.
-    let hwnd = MANAGE.with(|slot| slot.borrow().as_ref().map(|manage| manage.hwnd));
+    let hwnd = MANAGE.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|manage| manage.hwnd))
+    });
     let Some(hwnd) = hwnd else {
         return;
     };
@@ -943,7 +983,10 @@ pub fn show(owner: HWND) {
     MANAGE.with(|slot| {
         let mut guard = match slot.try_borrow_mut() {
             Ok(guard) => guard,
-            Err(_) => return,
+            Err(_) => {
+                logging::warn("manage: busy while opening (modal dialog?)");
+                return;
+            }
         };
         let Some(manage) = guard.as_mut() else {
             return;
@@ -957,13 +1000,38 @@ pub fn show(owner: HWND) {
     });
 }
 
-pub fn show_test(owner: HWND) {
+pub fn show_test(owner: HWND) -> bool {
     QUIT_ON_CLOSE.store(true, Ordering::Relaxed);
     show(owner);
+    MANAGE.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|manage| !manage.hwnd.0.is_null()))
+            .unwrap_or(false)
+    })
+}
+
+/// Let Tab/Enter traverse the management controls like a dialog.
+pub fn is_dialog_message(message: &MSG) -> bool {
+    let hwnd = MANAGE.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|manage| manage.hwnd))
+    });
+    match hwnd {
+        Some(hwnd) if !hwnd.0.is_null() => unsafe { IsDialogMessageW(hwnd, message).as_bool() },
+        _ => false,
+    }
 }
 
 pub fn shutdown() {
-    let manage = MANAGE.with(|slot| slot.borrow_mut().take());
+    let manage = MANAGE.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            logging::warn("manage: shutdown skipped while a dialog is open");
+            None
+        }
+    });
     let Some(manage) = manage else {
         return;
     };
@@ -972,7 +1040,19 @@ pub fn shutdown() {
         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
         let _ = DeleteObject(HGDIOBJ(manage.brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.class_brush.0));
     }
+}
+
+/// True when the user may leave (no unsaved edits, or they accepted discarding).
+pub fn confirm_exit() -> bool {
+    MANAGE.with(|slot| match slot.try_borrow() {
+        Ok(guard) => match guard.as_ref() {
+            Some(manage) if manage.dirty => confirm_discard(manage.hwnd),
+            _ => true,
+        },
+        Err(_) => true,
+    })
 }
 
 unsafe extern "system" fn window_proc(
@@ -1003,10 +1083,82 @@ unsafe extern "system" fn window_proc(
                     Ok(guard) => guard,
                     Err(_) => return,
                 };
-                let dpi = guard.as_ref().map(|manage| manage.dpi).unwrap_or(96);
+                let dpi = guard
+                    .as_ref()
+                    .map(|manage| manage.dpi)
+                    .unwrap_or_else(|| unsafe { GetDpiForSystem() });
                 info.ptMinTrackSize.x = scaled(MIN_WIDTH, dpi);
                 info.ptMinTrackSize.y = scaled(MIN_HEIGHT, dpi);
             });
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as u32;
+            let suggested = &*(lparam.0 as *const RECT);
+            let (left, top) = (suggested.left, suggested.top);
+            let (width, height) = (
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+            );
+            MANAGE.with(|slot| {
+                let mut guard = match slot.try_borrow_mut() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let Some(manage) = guard.as_mut() else {
+                    return;
+                };
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
+                    let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
+                }
+                manage.fonts = Fonts {
+                    body: make_font(14, 400, dpi),
+                    title: make_font(16, 600, dpi),
+                };
+                manage.dpi = dpi;
+                for control in [
+                    manage.left,
+                    manage.cat_name,
+                    manage.cat_add,
+                    manage.cat_delete,
+                    manage.search,
+                    manage.list,
+                    manage.new_button,
+                    manage.delete_button,
+                    manage.restore_button,
+                    manage.content_edit,
+                    manage.category,
+                    manage.pinned,
+                    manage.save_button,
+                    manage.cancel_button,
+                    manage.status,
+                ] {
+                    unsafe {
+                        let _ = SendMessageW(control, WM_SETFONT, manage.fonts.body.0 as usize, 1);
+                    }
+                }
+                unsafe {
+                    let _ = SendMessageW(
+                        manage.title_edit,
+                        WM_SETFONT,
+                        manage.fonts.title.0 as usize,
+                        1,
+                    );
+                }
+                layout(manage, width, height);
+            });
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    left,
+                    top,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -1077,6 +1229,17 @@ unsafe extern "system" fn window_proc(
                             return;
                         }
                         if manage.dirty && !confirm_discard(hwnd) {
+                            // Restore the highlighted row to the item still open.
+                            let previous = LIST_IDS.with(|slot| {
+                                slot.borrow().iter().position(|value| {
+                                    Some(value.as_str()) == manage.editing.as_deref()
+                                })
+                            });
+                            if let Some(previous) = previous {
+                                unsafe {
+                                    let _ = SendMessageW(manage.list, LB_SETCURSEL, previous, 0);
+                                }
+                            }
                             return;
                         }
                         manage.selected = Some(index as usize);
@@ -1105,6 +1268,9 @@ unsafe extern "system" fn window_proc(
                             status_message(manage, "请先在左侧选择要删除的分类");
                             return;
                         };
+                        if manage.dirty && !confirm_discard(hwnd) {
+                            return;
+                        }
                         let text = platform::wide("删除分类后，其短语会移到未分类。继续吗？");
                         let caption = platform::wide("QuickPhrase");
                         let answer = unsafe {
@@ -1134,6 +1300,10 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     ID_NEW => {
+                        if manage.view == View::Recycle {
+                            status_message(manage, "回收站内不能新建，请先恢复或切换分类");
+                            return;
+                        }
                         if manage.dirty && !confirm_discard(hwnd) {
                             return;
                         }
@@ -1149,6 +1319,9 @@ unsafe extern "system" fn window_proc(
                             status_message(manage, "请先选择要恢复的短语");
                             return;
                         };
+                        if manage.dirty && !confirm_discard(hwnd) {
+                            return;
+                        }
                         match storage::with_store(|store| store.restore(&id)) {
                             Some(Ok(())) => {
                                 status_message(manage, "已恢复");
@@ -1159,7 +1332,13 @@ unsafe extern "system" fn window_proc(
                             None => status_message(manage, "存储未初始化"),
                         }
                     }
-                    ID_SAVE => save_editor(manage),
+                    ID_SAVE => {
+                        if manage.view == View::Recycle {
+                            status_message(manage, "回收站内不能保存，请先恢复");
+                            return;
+                        }
+                        save_editor(manage);
+                    }
                     ID_CANCEL => {
                         let id = manage.editing.clone();
                         load_editor(manage, id.as_deref());
@@ -1216,18 +1395,26 @@ unsafe extern "system" fn window_proc(
             LRESULT(stock.0 as isize)
         }
         WM_CLOSE => {
-            let should_close = MANAGE.with(|slot| {
-                let guard = slot.borrow();
-                let Some(manage) = guard.as_ref() else {
-                    return true;
-                };
-                if manage.dirty {
-                    confirm_discard(manage.hwnd)
-                } else {
-                    true
-                }
+            let (should_close, had_dirty) = MANAGE.with(|slot| match slot.try_borrow() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(manage) if manage.dirty => (confirm_discard(manage.hwnd), true),
+                    Some(_) => (true, false),
+                    None => (true, false),
+                },
+                Err(_) => (true, false),
             });
             if should_close {
+                if had_dirty {
+                    // Discarding means going back to the persisted content.
+                    MANAGE.with(|slot| {
+                        if let Ok(mut guard) = slot.try_borrow_mut() {
+                            if let Some(manage) = guard.as_mut() {
+                                let id = manage.editing.clone();
+                                load_editor(manage, id.as_deref());
+                            }
+                        }
+                    });
+                }
                 if QUIT_ON_CLOSE.load(Ordering::Relaxed) {
                     unsafe {
                         let _ = DestroyWindow(hwnd);
@@ -1242,11 +1429,16 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             MANAGE.with(|slot| {
-                if let Some(manage) = slot.borrow_mut().take() {
+                let mut guard = match slot.try_borrow_mut() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                if let Some(manage) = guard.take() {
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
                         let _ = DeleteObject(HGDIOBJ(manage.brush.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.class_brush.0));
                     }
                 }
             });

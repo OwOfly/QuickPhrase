@@ -67,11 +67,28 @@ fn main() {
     }
 
     if manage_test {
+        let _guard = match single_instance::acquire() {
+            single_instance::Acquire::First(handle) => handle,
+            single_instance::Acquire::AlreadyRunning => {
+                logging::error("manage-test: another QuickPhrase instance is running");
+                std::process::exit(4);
+            }
+            single_instance::Acquire::Failed(code) => {
+                logging::error(&format!("manage-test: mutex failed ({code})"));
+                std::process::exit(4);
+            }
+        };
         storage::init();
-        manage::show_test(HWND::default());
+        if !manage::show_test(HWND::default()) {
+            logging::error("manage-test: window creation failed");
+            std::process::exit(4);
+        }
         let mut message = MSG::default();
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
             unsafe {
+                if manage::is_dialog_message(&message) {
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }

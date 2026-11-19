@@ -269,7 +269,6 @@ const CATEGORY_NAME_MAX_UNITS: usize = 40;
 
 fn validate_text(title: &str, content: &str) -> Result<(String, String), String> {
     let title = title.trim().to_string();
-    let content = content.trim_end().to_string();
     if title.is_empty() {
         return Err("title_empty".to_string());
     }
@@ -282,7 +281,8 @@ fn validate_text(title: &str, content: &str) -> Result<(String, String), String>
     if content.encode_utf16().count() > CONTENT_MAX_UNITS {
         return Err("content_too_long".to_string());
     }
-    Ok((title, content))
+    // Body keeps trailing spaces/newlines: the user's text is stored verbatim.
+    Ok((title, content.to_string()))
 }
 
 impl Store {
@@ -388,10 +388,36 @@ impl Store {
     }
 
     pub fn restore(&mut self, id: &str) -> Result<(), String> {
-        self.mutate_snippet(id, |snippet, now| {
-            snippet.deleted_at = None;
-            snippet.updated_at = now.to_string();
-        })
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
+            return Err("snippet_missing".to_string());
+        };
+        let title = self.data.snippets[position].title.to_lowercase();
+        if self
+            .data
+            .snippets
+            .iter()
+            .enumerate()
+            .any(|(index, snippet)| {
+                index != position
+                    && snippet.deleted_at.is_none()
+                    && snippet.title.to_lowercase() == title
+            })
+        {
+            return Err("duplicate_title".to_string());
+        }
+        let previous = self.data.snippets[position].clone();
+        self.data.snippets[position].deleted_at = None;
+        self.data.snippets[position].updated_at = now_iso();
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
     }
 
     pub fn purge(&mut self, id: &str) -> Result<(), String> {
@@ -415,7 +441,7 @@ impl Store {
         if self.read_only {
             return Err("read_only".to_string());
         }
-        let name = self.validate_category_name(name)?;
+        let name = self.validate_category_name(name, None)?;
         let now = now_iso();
         let id = new_id();
         let category = Category {
@@ -446,7 +472,7 @@ impl Store {
         if self.read_only {
             return Err("read_only".to_string());
         }
-        let name = self.validate_category_name(name)?;
+        let name = self.validate_category_name(name, Some(id))?;
         let Some(position) = self
             .data
             .categories
@@ -481,10 +507,11 @@ impl Store {
         };
         let previous = self.data.categories.remove(position);
         let now = now_iso();
-        let mut moved: Vec<(usize, Option<String>)> = Vec::new();
+        let mut moved: Vec<(usize, Option<String>, String)> = Vec::new();
         for (index, snippet) in self.data.snippets.iter_mut().enumerate() {
             if snippet.category_id.as_deref() == Some(id) {
-                moved.push((index, snippet.category_id.take()));
+                let old_updated = snippet.updated_at.clone();
+                moved.push((index, snippet.category_id.take(), old_updated));
                 snippet.updated_at = now.clone();
             }
         }
@@ -492,8 +519,9 @@ impl Store {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.data.categories.insert(position, previous);
-                for (index, category_id) in moved {
+                for (index, category_id, updated_at) in moved {
                     self.data.snippets[index].category_id = category_id;
+                    self.data.snippets[index].updated_at = updated_at;
                 }
                 Err(err)
             }
@@ -549,7 +577,7 @@ impl Store {
         Ok(())
     }
 
-    fn validate_category_name(&self, name: &str) -> Result<String, String> {
+    fn validate_category_name(&self, name: &str, skip: Option<&str>) -> Result<String, String> {
         let name = name.trim().to_string();
         if name.is_empty() {
             return Err("category_empty".to_string());
@@ -557,12 +585,10 @@ impl Store {
         if name.encode_utf16().count() > CATEGORY_NAME_MAX_UNITS {
             return Err("category_too_long".to_string());
         }
-        if self
-            .data
-            .categories
-            .iter()
-            .any(|category| category.name.to_lowercase() == name.to_lowercase())
-        {
+        if self.data.categories.iter().any(|category| {
+            Some(category.id.as_str()) != skip
+                && category.name.to_lowercase() == name.to_lowercase()
+        }) {
             return Err("category_duplicate".to_string());
         }
         Ok(name)
@@ -1280,6 +1306,62 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qp-store-{tag}-{}", new_id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn content_keeps_trailing_whitespace() {
+        let dir = temp_dir("trailing");
+        let mut store = Store::load_from(&dir);
+        let id = store
+            .add_snippet("标题", "正文  \n缩进\t ", None, false)
+            .expect("add");
+        assert_eq!(store.get(&id).unwrap().content, "正文  \n缩进\t ");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rejects_duplicate_active_title() {
+        let dir = temp_dir("restoredup");
+        let mut store = Store::load_from(&dir);
+        let first = store.add_snippet("Foo", "a", None, false).expect("add");
+        store.soft_delete(&first).expect("delete");
+        let _ = store.add_snippet("foo", "b", None, false).expect("add");
+        assert_eq!(store.restore(&first), Err("duplicate_title".to_string()));
+        assert!(store.get(&first).unwrap().deleted_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_category_to_same_name_is_allowed() {
+        let dir = temp_dir("renameself");
+        let mut store = Store::load_from(&dir);
+        let id = store.add_category("分类 A").expect("add");
+        assert_eq!(store.rename_category(&id, "分类 a"), Ok(()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_category_failure_rolls_back_snippets() {
+        let dir = temp_dir("catrollback");
+        let mut store = Store::load_from(&dir);
+        let category = store.add_category("待删分类").expect("add category");
+        let id = store
+            .add_snippet("标题", "正文", Some(&category), false)
+            .expect("add snippet");
+        let before = store.get(&id).unwrap().clone();
+
+        fs::create_dir_all(dir.join(format!("{DATA_FILE}.tmp"))).unwrap();
+        assert!(store.delete_category(&category).is_err());
+
+        let after = store.get(&id).unwrap();
+        assert_eq!(after.category_id, before.category_id);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert!(store
+            .data()
+            .categories
+            .iter()
+            .any(|item| item.id == category));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

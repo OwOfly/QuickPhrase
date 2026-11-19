@@ -189,6 +189,9 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             break;
         }
         unsafe {
+            if manage::is_dialog_message(&message) {
+                continue;
+            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }
@@ -360,6 +363,9 @@ fn handle_command(id: u32) {
         ID_SETTINGS => platform::info_box("QuickPhrase", "设置将在 M1 实现。"),
         ID_ABOUT => about(),
         ID_EXIT => {
+            if !manage::confirm_exit() {
+                return;
+            }
             let hwnd = STATE.with(|state| state.borrow().hwnd);
             unsafe {
                 let _ = DestroyWindow(hwnd);
@@ -517,7 +523,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M0-4 文本注入）\n\
+             全局快捷短语输入器（M1-4 管理窗口）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()
