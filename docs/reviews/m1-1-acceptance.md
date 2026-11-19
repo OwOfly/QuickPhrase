@@ -2,7 +2,7 @@
 
 - 范围：`data.json` / `settings.json` / `rules-user.json` 的 schema、原子写、备份、恢复、只读模式、revision
 - 依据：`docs/_ref/final-plan.md` §6.1、§6.2、§8 M1-1
-- 复核：r1 三家 CHANGES_REQUIRED → r2 **glm PASS、kimi PASS（R5 后续修复）、qwen PASS**
+- 复核：r1 三家 CHANGES_REQUIRED → r2 **三家 PASS** → r3 增量 **glm PASS、kimi PASS（S5 后续修复）、qwen PASS**
 
 ## 已实现
 
@@ -65,4 +65,6 @@ storage: dir=C:\Users\Administrator\AppData\Local\QuickPhrase revision=1 snippet
 
 ## 结论
 
-M1-1 的 schema、原子写、备份、恢复与只读模式具备单测与运行时证据；待独立复核后进入 M1-2。
+M1-1 的 schema、原子写、备份、恢复与只读模式具备单测与运行时证据。r3 增量复核三家无阻塞项（kimi 的 S5 只读句柄问题已由 `2dd7dea` 修复）。**M1-1 过门，M1-2 可开。**
+
+残留（不阻塞）：100 次故障注入为模拟截断；迁移链为空；无跨进程文件锁；设置/规则未接 UI 与规则求值；检索打分在 M1-2。
