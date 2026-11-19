@@ -647,8 +647,8 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         let _ = MoveWindow(
             manage.status,
             right_x,
-            meta_top - row - scaled(2, manage.dpi),
-            right_width,
+            actions_top,
+            (right_width - scaled(190, manage.dpi)).max(1),
             row,
             true,
         );
@@ -833,7 +833,10 @@ fn create(owner: HWND) -> Option<Manage> {
     let content_edit = create_control(
         w!("EDIT"),
         "",
-        WS_CHILD | WS_VISIBLE | WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL) as u32),
+        WS_CHILD
+            | WS_VISIBLE
+            | WS_VSCROLL
+            | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL) as u32),
         hwnd,
         ID_CONTENT,
         instance,
@@ -936,6 +939,7 @@ fn create(owner: HWND) -> Option<Manage> {
         let _ = SendMessageW(title_edit, WM_SETFONT, manage.fonts.title.0 as usize, 1);
         let style = GetWindowLongW(title_edit, GWL_STYLE);
         let _ = SetWindowLongW(title_edit, GWL_STYLE, style | WS_TABSTOP.0 as i32);
+        let _ = SendMessageW(status, WM_SETFONT, manage.fonts.body.0 as usize, 1);
     }
 
     let mut rect = RECT::default();
@@ -1051,7 +1055,12 @@ pub fn confirm_exit() -> bool {
             Some(manage) if manage.dirty => confirm_discard(manage.hwnd),
             _ => true,
         },
-        Err(_) => true,
+        Err(_) => {
+            // A modal dialog owns the state; refusing is safer than exiting
+            // without confirming.
+            logging::warn("manage: exit blocked while a dialog is open");
+            false
+        }
     })
 }
 
@@ -1229,16 +1238,20 @@ unsafe extern "system" fn window_proc(
                             return;
                         }
                         if manage.dirty && !confirm_discard(hwnd) {
-                            // Restore the highlighted row to the item still open.
+                            // Restore the highlighted row to the item still open;
+                            // an unsaved new snippet clears the selection.
                             let previous = LIST_IDS.with(|slot| {
                                 slot.borrow().iter().position(|value| {
                                     Some(value.as_str()) == manage.editing.as_deref()
                                 })
                             });
-                            if let Some(previous) = previous {
-                                unsafe {
-                                    let _ = SendMessageW(manage.list, LB_SETCURSEL, previous, 0);
-                                }
+                            unsafe {
+                                let _ = SendMessageW(
+                                    manage.list,
+                                    LB_SETCURSEL,
+                                    previous.unwrap_or(usize::MAX),
+                                    0,
+                                );
                             }
                             return;
                         }
