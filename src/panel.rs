@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use windows::core::{w, PCWSTR};
@@ -31,7 +31,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AnimateWindow, SystemParametersInfoW, AW_BLEND, SPI_GETCLIENTAREAANIMATION,
+    SetLayeredWindowAttributes, SystemParametersInfoW, GWL_EXSTYLE, LWA_ALPHA,
+    SPI_GETCLIENTAREAANIMATION, WS_EX_LAYERED,
 };
 
 use crate::capture::Report;
@@ -43,6 +44,7 @@ const LIST_ID: i32 = 101;
 const FOOTER_ID: i32 = 102;
 const SETTINGS_LINK_ID: i32 = 103;
 const MANAGE_LINK_ID: i32 = 104;
+const FADE_TIMER: usize = 7;
 
 const PANEL_WIDTH: i32 = 520;
 const PANEL_HEIGHT: i32 = 420;
@@ -146,6 +148,7 @@ thread_local! {
 }
 
 static OLD_EDIT_PROC: AtomicIsize = AtomicIsize::new(0);
+static FADE_STEP: AtomicU32 = AtomicU32::new(0);
 static CREATE_FAILED: AtomicBool = AtomicBool::new(false);
 static ENTER_ARMED: AtomicBool = AtomicBool::new(false);
 static SESSION: AtomicU64 = AtomicU64::new(0);
@@ -181,6 +184,23 @@ fn animations_enabled() -> bool {
     }
     .is_ok();
     ok && enabled != 0
+}
+
+fn start_fade(hwnd: HWND) {
+    if !animations_enabled() {
+        return;
+    }
+    // The window is already visible and focused; the fade runs on a timer so
+    // keystrokes reach the panel from the first frame.
+    unsafe {
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as i32);
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+    }
+    FADE_STEP.store(0, Ordering::Relaxed);
+    unsafe {
+        let _ = SetTimer(Some(hwnd), FADE_TIMER, 10, None);
+    }
 }
 
 fn create_static_link(parent: HWND, instance: HINSTANCE, id: i32, text: &str) -> Option<HWND> {
@@ -440,9 +460,7 @@ fn present(
             let _ = SetFocus(Some(edit));
             let _ = send(edit, EM_SETSEL, 0, -1);
             if animations_enabled() {
-                // Best effort; AW_BLEND on an already visible window may be a
-                // no-op, which is harmless.
-                let _ = AnimateWindow(hwnd, 100, AW_BLEND);
+                start_fade(hwnd);
             }
             if GetForegroundWindow() != hwnd || GetFocus() != edit {
                 logging::warn("panel could not take foreground or focus");
@@ -1795,6 +1813,27 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_TIMER if wparam.0 == FADE_TIMER => {
+            let step = FADE_STEP.fetch_add(1, Ordering::Relaxed) + 1;
+            unsafe {
+                let alpha = ((step.min(10) * 255) / 10) as u8;
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+            }
+            if step >= 10 {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), FADE_TIMER);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_SHOWWINDOW if wparam.0 == 0 => {
+            // Hiding during the fade must not leave the next show transparent.
+            unsafe {
+                let _ = KillTimer(Some(hwnd), FADE_TIMER);
+                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;

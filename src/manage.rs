@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, FrameRect,
-    InvalidateRect, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    ScreenToClient, SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
+    DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
@@ -1575,18 +1575,37 @@ unsafe extern "system" fn window_proc(
                                     .unwrap_or(96)
                             });
                             let thick = scaled(2, dpi);
-                            let mut frame = RECT {
-                                left: top_left.x - thick,
-                                top: top_left.y - thick,
-                                right: bottom_right.x + thick,
-                                bottom: bottom_right.y + thick,
-                            };
-                            let _ = FrameRect(hdc, &frame, error_brush);
-                            frame.left += scaled(1, dpi);
-                            frame.top += scaled(1, dpi);
-                            frame.right -= scaled(1, dpi);
-                            frame.bottom -= scaled(1, dpi);
-                            let _ = FrameRect(hdc, &frame, error_brush);
+                            // Four solid bands: FrameRect would draw 1 px
+                            // regardless of DPI.
+                            let bands = [
+                                RECT {
+                                    left: top_left.x - thick,
+                                    top: top_left.y - thick,
+                                    right: bottom_right.x + thick,
+                                    bottom: top_left.y,
+                                },
+                                RECT {
+                                    left: top_left.x - thick,
+                                    top: bottom_right.y,
+                                    right: bottom_right.x + thick,
+                                    bottom: bottom_right.y + thick,
+                                },
+                                RECT {
+                                    left: top_left.x - thick,
+                                    top: top_left.y,
+                                    right: top_left.x,
+                                    bottom: bottom_right.y,
+                                },
+                                RECT {
+                                    left: bottom_right.x,
+                                    top: top_left.y,
+                                    right: bottom_right.x + thick,
+                                    bottom: bottom_right.y,
+                                },
+                            ];
+                            for band in bands {
+                                let _ = FillRect(hdc, &band, error_brush);
+                            }
                         }
                     }
                 }
