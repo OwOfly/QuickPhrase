@@ -17,6 +17,7 @@ mod single_instance;
 mod storage;
 mod theme;
 mod tray;
+mod ui;
 mod uia;
 
 use std::time::{Duration, Instant};

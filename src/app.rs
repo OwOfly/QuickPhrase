@@ -71,8 +71,11 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
 
     // Icon resource id 1 from app.rc; fall back to the system icon if missing.
     let icon = unsafe {
-        LoadIconW(Some(instance), PCWSTR(1 as *const u16))
-            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+        // Resource id 1 is the MAKEINTRESOURCE form: a small integer as a
+        // pointer, which is the documented Win32 idiom, not a real address.
+        #[allow(clippy::manual_dangling_ptr)]
+        let icon_id = PCWSTR(1 as *const u16);
+        LoadIconW(Some(instance), icon_id).or_else(|_| LoadIconW(None, IDI_APPLICATION))
     }
     .unwrap_or_default();
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();

@@ -7,11 +7,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SetBkColor, SetBkMode,
-    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH,
-    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
+    SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, SetFocus, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -22,6 +23,7 @@ use crate::hotkey;
 use crate::logging;
 use crate::platform;
 use crate::storage;
+use crate::ui;
 
 const CLASS: PCWSTR = w!("QuickPhrase.SettingsWindow");
 const TITLE: PCWSTR = w!("QuickPhrase 设置");
@@ -42,15 +44,15 @@ const ID_LBL_THEME: i32 = 312;
 const ID_LBL_DATA: i32 = 313;
 const ID_INSERTION: i32 = 314;
 const ID_LBL_INSERTION: i32 = 315;
+const ID_LBL_STARTUP: i32 = 316;
+const ID_LBL_CLIPBOARD: i32 = 317;
 
 const WIDTH: i32 = 580;
 const HEIGHT: i32 = 470;
 const MIN_WIDTH: i32 = 500;
 const MIN_HEIGHT: i32 = 420;
-const MARGIN: i32 = 16;
-const ROW: i32 = 30;
-const GAP: i32 = 10;
 const SS_LEFT: u32 = 0;
+const SS_PATHELLIPSIS: u32 = 0x0000_8000;
 
 struct SettingsUi {
     hwnd: HWND,
@@ -59,6 +61,8 @@ struct SettingsUi {
     lbl_tab: HWND,
     lbl_theme: HWND,
     lbl_data: HWND,
+    lbl_startup: HWND,
+    lbl_clipboard: HWND,
     hotkey_record: HWND,
     insertion: HWND,
     lbl_insertion: HWND,
@@ -72,7 +76,9 @@ struct SettingsUi {
     status: HWND,
     font: HFONT,
     brush: HBRUSH,
+    card_brush: HBRUSH,
     field_brush: HBRUSH,
+    card: RECT,
     palette: crate::theme::Palette,
     dpi: u32,
     capturing: bool,
@@ -156,95 +162,150 @@ fn set_combo(combo: HWND, index: usize) {
     }
 }
 
-fn layout(ui: &SettingsUi, width: i32, height: i32) {
+fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let margin = scaled(MARGIN, ui.dpi);
-    let row = scaled(ROW, ui.dpi);
-    let gap = scaled(GAP, ui.dpi);
-    let label_width = scaled(110, ui.dpi);
-    let field_x = margin + label_width;
-    let field_width = (width - field_x - margin).max(1);
-    let mut y = margin;
+    let margin = scaled(16, ui.dpi);
+    let row = scaled(34, ui.dpi);
+    let gap = scaled(8, ui.dpi);
+    let label_width = scaled(112, ui.dpi);
+    let card = RECT {
+        left: margin,
+        top: margin,
+        right: width - margin,
+        bottom: height - margin - scaled(48, ui.dpi),
+    };
+    ui.card = card;
+    let pad = scaled(16, ui.dpi);
+    let field_x = card.left + pad + label_width;
+    let field_right = card.right - pad;
+    let field_width = (field_right - field_x).max(1);
+    let mut y = card.top + pad;
 
     unsafe {
-        let _ = MoveWindow(ui.lbl_hotkey, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(
+            ui.lbl_hotkey,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
         let _ = MoveWindow(
             ui.hotkey_text,
             field_x,
             y,
-            (field_width - scaled(90, ui.dpi)).max(1),
+            (field_width - scaled(80, ui.dpi)).max(1),
             row,
             true,
         );
         let _ = MoveWindow(
             ui.hotkey_record,
-            width - margin - scaled(84, ui.dpi),
+            field_right - scaled(72, ui.dpi),
             y,
-            scaled(84, ui.dpi),
+            scaled(72, ui.dpi),
             row,
             true,
         );
         y += row + gap;
-        let _ = MoveWindow(ui.lbl_insertion, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(
+            ui.lbl_insertion,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
         let _ = MoveWindow(
             ui.insertion,
             field_x,
             y,
-            scaled(320, ui.dpi),
-            scaled(180, ui.dpi),
+            scaled(300, ui.dpi),
+            ui::combo_height(ui.insertion, ui.dpi),
             true,
         );
         y += row + gap;
-        let _ = MoveWindow(ui.lbl_tab, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(ui.lbl_tab, card.left + pad, y, label_width - gap, row, true);
         let _ = MoveWindow(
             ui.tab_policy,
             field_x,
             y,
             scaled(260, ui.dpi),
-            scaled(180, ui.dpi),
+            ui::combo_height(ui.tab_policy, ui.dpi),
             true,
         );
         y += row + gap;
-        let _ = MoveWindow(ui.lbl_theme, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(
+            ui.lbl_theme,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
         let _ = MoveWindow(
             ui.theme,
             field_x,
             y,
             scaled(200, ui.dpi),
-            scaled(180, ui.dpi),
+            ui::combo_height(ui.theme, ui.dpi),
             true,
         );
         y += row + gap;
+        let _ = MoveWindow(
+            ui.lbl_startup,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
         let _ = MoveWindow(ui.startup, field_x, y, field_width, row, true);
         y += row + gap;
-        let _ = MoveWindow(ui.lbl_data, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(
+            ui.lbl_data,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
         let _ = MoveWindow(ui.data_dir, field_x, y, field_width, row, true);
         y += row + gap;
-        let _ = MoveWindow(ui.restore_clip, field_x, y, field_width, row, true);
+        let _ = MoveWindow(
+            ui.lbl_clipboard,
+            card.left + pad,
+            y,
+            label_width - gap,
+            row,
+            true,
+        );
+        let _ = MoveWindow(ui.restore_clip, field_x, y, scaled(250, ui.dpi), row, true);
+
+        let actions_top = height - margin - scaled(32, ui.dpi);
         let _ = MoveWindow(
             ui.status,
             margin,
-            height - margin - row * 2 - gap,
-            width - margin * 2,
-            row,
+            actions_top,
+            (width - margin * 2 - scaled(190, ui.dpi)).max(1),
+            scaled(32, ui.dpi),
             true,
         );
         let _ = MoveWindow(
             ui.save,
-            width - margin - scaled(180, ui.dpi),
-            height - margin - row,
-            scaled(85, ui.dpi),
-            row,
+            width - margin - scaled(176, ui.dpi),
+            actions_top,
+            scaled(84, ui.dpi),
+            scaled(32, ui.dpi),
             true,
         );
         let _ = MoveWindow(
             ui.cancel,
-            width - margin - scaled(85, ui.dpi),
-            height - margin - row,
-            scaled(85, ui.dpi),
-            row,
+            width - margin - scaled(84, ui.dpi),
+            actions_top,
+            scaled(84, ui.dpi),
+            scaled(32, ui.dpi),
             true,
         );
     }
@@ -321,8 +382,10 @@ fn create() -> Option<SettingsUi> {
     }
     .ok()?;
 
+    crate::ui::apply_window_style(hwnd);
     let font = make_font(dpi);
     let control_brush = unsafe { CreateSolidBrush(palette.page) };
+    let card_brush = unsafe { CreateSolidBrush(palette.card) };
     let field_brush = unsafe { CreateSolidBrush(palette.field) };
     let hotkey_text = create_control(
         w!("STATIC"),
@@ -372,10 +435,28 @@ fn create() -> Option<SettingsUi> {
         ID_LBL_INSERTION,
         instance,
     );
+    let lbl_startup = create_control(
+        w!("STATIC"),
+        "启动",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_STARTUP,
+        instance,
+    );
+    let lbl_clipboard = create_control(
+        w!("STATIC"),
+        "剪贴板",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_CLIPBOARD,
+        instance,
+    );
     let insertion = create_control(
         w!("COMBOBOX"),
         "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
         hwnd,
         ID_INSERTION,
         instance,
@@ -383,7 +464,7 @@ fn create() -> Option<SettingsUi> {
     let hotkey_record = create_control(
         w!("BUTTON"),
         "录制",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_HOTKEY_RECORD,
         instance,
@@ -391,7 +472,9 @@ fn create() -> Option<SettingsUi> {
     let tab_policy = create_control(
         w!("COMBOBOX"),
         "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
         hwnd,
         ID_TAB_POLICY,
         instance,
@@ -399,7 +482,9 @@ fn create() -> Option<SettingsUi> {
     let theme = create_control(
         w!("COMBOBOX"),
         "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
         hwnd,
         ID_THEME,
         instance,
@@ -415,7 +500,7 @@ fn create() -> Option<SettingsUi> {
     let data_dir = create_control(
         w!("STATIC"),
         "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT | SS_PATHELLIPSIS),
         hwnd,
         ID_DATA_DIR,
         instance,
@@ -423,7 +508,7 @@ fn create() -> Option<SettingsUi> {
     let restore_clip = create_control(
         w!("BUTTON"),
         "恢复上次复制的剪贴板内容",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_RESTORE_CLIP,
         instance,
@@ -431,7 +516,7 @@ fn create() -> Option<SettingsUi> {
     let save = create_control(
         w!("BUTTON"),
         "保存",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_SAVE,
         instance,
@@ -439,7 +524,7 @@ fn create() -> Option<SettingsUi> {
     let cancel = create_control(
         w!("BUTTON"),
         "取消",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_CANCEL,
         instance,
@@ -460,6 +545,8 @@ fn create() -> Option<SettingsUi> {
         lbl_tab,
         lbl_theme,
         lbl_data,
+        lbl_startup,
+        lbl_clipboard,
         hotkey_record,
         insertion,
         lbl_insertion,
@@ -471,9 +558,11 @@ fn create() -> Option<SettingsUi> {
         save,
         cancel,
         status,
+        card: RECT::default(),
         font,
         palette,
         brush: control_brush,
+        card_brush,
         field_brush,
         dpi,
         capturing: false,
@@ -481,6 +570,28 @@ fn create() -> Option<SettingsUi> {
         original_hotkey: String::new(),
         loading: true,
     };
+
+    for button in [hotkey_record, restore_clip, save, cancel] {
+        crate::ui::install_button(button);
+    }
+    for control in [
+        hotkey_text,
+        hotkey_record,
+        insertion,
+        tab_policy,
+        theme,
+        startup,
+        data_dir,
+        restore_clip,
+        save,
+        cancel,
+    ] {
+        ui::theme_control(control, palette.dark);
+    }
+    for combo in [insertion, tab_policy, theme] {
+        ui::theme_combo(combo, palette.dark);
+        ui::install_combo(combo);
+    }
 
     for control in [
         hotkey_text,
@@ -507,7 +618,32 @@ fn create() -> Option<SettingsUi> {
         }
     }
 
-    for label in [lbl_hotkey, lbl_insertion, lbl_tab, lbl_theme, lbl_data] {
+    for combo in [insertion, tab_policy, theme] {
+        unsafe {
+            let _ = SendMessageW(
+                combo,
+                CB_SETITEMHEIGHT,
+                Some(WPARAM(usize::MAX)),
+                Some(LPARAM(scaled(31, dpi) as isize)),
+            );
+            let _ = SendMessageW(
+                combo,
+                CB_SETITEMHEIGHT,
+                Some(WPARAM(0)),
+                Some(LPARAM(scaled(28, dpi) as isize)),
+            );
+        }
+    }
+
+    for label in [
+        lbl_hotkey,
+        lbl_insertion,
+        lbl_tab,
+        lbl_theme,
+        lbl_startup,
+        lbl_data,
+        lbl_clipboard,
+    ] {
         unsafe {
             let _ = SendMessageW(
                 label,
@@ -524,7 +660,7 @@ fn create() -> Option<SettingsUi> {
     unsafe {
         let _ = GetClientRect(hwnd, &mut rect);
     }
-    layout(&ui, rect.right, rect.bottom);
+    layout(&mut ui, rect.right, rect.bottom);
     load(&mut ui);
     ui.loading = false;
     Some(ui)
@@ -622,11 +758,31 @@ pub fn show() {
             if palette != ui.palette {
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+                    let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
                     let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                 }
                 ui.brush = unsafe { CreateSolidBrush(palette.page) };
+                ui.card_brush = unsafe { CreateSolidBrush(palette.card) };
                 ui.field_brush = unsafe { CreateSolidBrush(palette.field) };
                 ui.palette = palette;
+                for control in [
+                    ui.hotkey_text,
+                    ui.hotkey_record,
+                    ui.insertion,
+                    ui.tab_policy,
+                    ui.theme,
+                    ui.startup,
+                    ui.data_dir,
+                    ui.restore_clip,
+                    ui.save,
+                    ui.cancel,
+                ] {
+                    ui::theme_control(control, palette.dark);
+                }
+                for combo in [ui.insertion, ui.tab_policy, ui.theme] {
+                    ui::theme_combo(combo, palette.dark);
+                }
+                ui::apply_window_style(ui.hwnd);
                 unsafe {
                     let _ = InvalidateRect(Some(ui.hwnd), None, true);
                 }
@@ -663,6 +819,7 @@ pub fn shutdown() {
         let _ = DestroyWindow(ui.hwnd);
         let _ = DeleteObject(HGDIOBJ(ui.font.0));
         let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+        let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
         let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
     }
 }
@@ -820,8 +977,8 @@ unsafe extern "system" fn window_proc(
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
             UI.with(|slot| {
-                if let Ok(guard) = slot.try_borrow() {
-                    if let Some(ui) = guard.as_ref() {
+                if let Ok(mut guard) = slot.try_borrow_mut() {
+                    if let Some(ui) = guard.as_mut() {
                         layout(ui, width, height);
                     }
                 }
@@ -889,6 +1046,22 @@ unsafe extern "system" fn window_proc(
                             WM_SETFONT,
                             Some(WPARAM(ui.font.0 as usize)),
                             Some(LPARAM(1)),
+                        );
+                    }
+                }
+                for combo in [ui.insertion, ui.tab_policy, ui.theme] {
+                    unsafe {
+                        let _ = SendMessageW(
+                            combo,
+                            CB_SETITEMHEIGHT,
+                            Some(WPARAM(usize::MAX)),
+                            Some(LPARAM(scaled(31, dpi) as isize)),
+                        );
+                        let _ = SendMessageW(
+                            combo,
+                            CB_SETITEMHEIGHT,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(scaled(28, dpi) as isize)),
                         );
                     }
                 }
@@ -1072,13 +1245,21 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLORSTATIC => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let control = HWND(lparam.0 as *mut core::ffi::c_void);
             let (color, brush) = UI.with(|slot| {
                 slot.try_borrow()
                     .ok()
                     .and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .map(|ui| (ui.palette.secondary, ui.brush.0 as isize))
+                        guard.as_ref().map(|ui| {
+                            // Labels sit on the card; the status line sits on
+                            // the page below it, so it must not leave a band.
+                            let brush = if control == ui.status {
+                                ui.brush
+                            } else {
+                                ui.card_brush
+                            };
+                            (ui.palette.secondary, brush.0 as isize)
+                        })
                     })
                     .unwrap_or((COLORREF(0), 0))
             });
@@ -1111,6 +1292,49 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(brush)
         }
+        WM_DRAWITEM => {
+            let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            let (palette, dpi, font) = UI.with(|slot| {
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|ui| (ui.palette, ui.dpi, ui.font)))
+                    .unwrap_or((crate::theme::LIGHT, 96, HFONT::default()))
+            });
+            if matches!(draw.CtlID as i32, ID_INSERTION | ID_TAB_POLICY | ID_THEME) {
+                ui::draw_combo_item(draw, palette, dpi, font);
+                return LRESULT(1);
+            }
+            let kind = if draw.CtlID == ID_SAVE as u32 {
+                ui::ButtonKind::Primary
+            } else {
+                ui::ButtonKind::Secondary
+            };
+            // Save/cancel sit on the page below the card; the rest are inside.
+            let background = if draw.CtlID == ID_SAVE as u32 || draw.CtlID == ID_CANCEL as u32 {
+                palette.page
+            } else {
+                palette.card
+            };
+            ui::draw_button(draw, palette, kind, dpi, background);
+            LRESULT(1)
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            unsafe {
+                let hdc = BeginPaint(hwnd, &mut paint);
+                let (card, palette, dpi) = UI.with(|slot| {
+                    slot.try_borrow()
+                        .ok()
+                        .and_then(|guard| guard.as_ref().map(|ui| (ui.card, ui.palette, ui.dpi)))
+                        .unwrap_or((RECT::default(), crate::theme::LIGHT, 96))
+                });
+                if card.right > card.left && card.bottom > card.top {
+                    ui::card(hdc, &card, palette, dpi);
+                }
+                let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
+        }
         WM_CLOSE => {
             if QUIT_ON_CLOSE.load(Ordering::Relaxed) {
                 unsafe {
@@ -1133,6 +1357,7 @@ unsafe extern "system" fn window_proc(
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(ui.font.0));
                         let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+                        let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
                         let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                     }
                 }

@@ -8,16 +8,18 @@ use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POI
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
     ScreenToClient, SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    TRANSPARENT,
+    DEFAULT_CHARSET, DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+    DT_VCENTER, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::search::{self, Doc};
 use crate::storage::{self, Snippet};
+use crate::ui;
 use crate::{logging, platform};
 
 const CLASS: PCWSTR = w!("QuickPhrase.ManageWindow");
@@ -45,8 +47,8 @@ const MIN_HEIGHT: i32 = 540;
 const DEFAULT_WIDTH: i32 = 1040;
 const DEFAULT_HEIGHT: i32 = 650;
 
-const LEFT_WIDTH: i32 = 180;
-const MIDDLE_WIDTH: i32 = 300;
+const LEFT_WIDTH: i32 = 190;
+const MIDDLE_WIDTH: i32 = 320;
 const MARGIN: i32 = 12;
 const ROW: i32 = 32;
 const SS_LEFT: u32 = 0;
@@ -72,6 +74,7 @@ enum View {
 struct Fonts {
     body: HFONT,
     title: HFONT,
+    small: HFONT,
 }
 
 struct Manage {
@@ -92,9 +95,11 @@ struct Manage {
     save_button: HWND,
     cancel_button: HWND,
     status: HWND,
+    cards: [RECT; 3],
     fonts: Fonts,
     palette: crate::theme::Palette,
     page_brush: HBRUSH,
+    card_brush: HBRUSH,
     field_brush: HBRUSH,
     error_brush: HBRUSH,
     error_field: Option<i32>,
@@ -341,8 +346,14 @@ fn reload_list(manage: &mut Manage) {
         }
     }
 
-    // Remember ids per list position for selection handling.
+    // Remember ids and categories per list position for selection handling.
     LIST_IDS.with(|slot| *slot.borrow_mut() = rows.iter().map(|(id, _, _)| id.clone()).collect());
+    LIST_CATEGORIES.with(|slot| {
+        *slot.borrow_mut() = rows
+            .iter()
+            .map(|(_, _, category)| category.clone())
+            .collect()
+    });
 
     if manage.selected.is_some() {
         if let Some(position) = rows
@@ -361,6 +372,7 @@ fn reload_list(manage: &mut Manage) {
 
 thread_local! {
     static LIST_IDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    static LIST_CATEGORIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn load_editor(manage: &mut Manage, id: Option<&str>) {
@@ -539,124 +551,285 @@ fn delete_selected(manage: &mut Manage) {
     }
 }
 
-fn layout(manage: &Manage, width: i32, height: i32) {
+fn draw_list_row(
+    draw: &DRAWITEMSTRUCT,
+    palette: crate::theme::Palette,
+    dpi: u32,
+    fonts: (HFONT, HFONT, HFONT),
+    two_line: bool,
+) {
+    let hdc = draw.hDC;
+    let rect = draw.rcItem;
+    unsafe {
+        let brush = CreateSolidBrush(palette.card);
+        FillRect(hdc, &rect, brush);
+        let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    if draw.itemID == u32::MAX {
+        return;
+    }
+    let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+    if selected {
+        let mut pill = rect;
+        pill.left += scaled(4, dpi);
+        pill.top += scaled(4, dpi);
+        pill.right -= scaled(4, dpi);
+        pill.bottom -= scaled(4, dpi);
+        let brush = unsafe { CreateSolidBrush(palette.selection) };
+        ui::fill_round(hdc, &pill, scaled(8, dpi), brush);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+    }
+    let mut buffer = [0u16; 256];
+    let length = unsafe {
+        SendMessageW(
+            draw.hwndItem,
+            LB_GETTEXT,
+            draw.itemID as usize,
+            buffer.as_mut_ptr() as isize,
+        )
+    }
+    .0;
+    let title = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    let mut text_rect = rect;
+    text_rect.left += scaled(12, dpi);
+    text_rect.right -= scaled(10, dpi);
+    let title_color = if selected {
+        palette.primary
+    } else {
+        palette.heading
+    };
+    if two_line {
+        let category = LIST_CATEGORIES.with(|slot| {
+            slot.borrow()
+                .get(draw.itemID as usize)
+                .cloned()
+                .unwrap_or_default()
+        });
+        let mut title_rect = RECT {
+            top: rect.top + scaled(6, dpi),
+            bottom: rect.top + scaled(28, dpi),
+            ..text_rect
+        };
+        ui::label(
+            hdc,
+            &title,
+            &mut title_rect,
+            fonts.1,
+            title_color,
+            DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+        if !category.is_empty() {
+            let mut category_rect = RECT {
+                top: rect.top + scaled(28, dpi),
+                bottom: rect.bottom - scaled(4, dpi),
+                ..text_rect
+            };
+            ui::label(
+                hdc,
+                &category,
+                &mut category_rect,
+                fonts.2,
+                palette.secondary,
+                DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+    } else {
+        ui::label(
+            hdc,
+            &title,
+            &mut text_rect,
+            fonts.0,
+            title_color,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
+        );
+    }
+}
+
+fn relayout(manage: &mut Manage) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(manage.hwnd, &mut rect);
+    }
+    layout(manage, rect.right, rect.bottom);
+}
+
+fn layout(manage: &mut Manage, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
     let margin = scaled(MARGIN, manage.dpi);
+    let gap = scaled(14, manage.dpi);
     let row = scaled(ROW, manage.dpi);
     let left_width = scaled(LEFT_WIDTH, manage.dpi);
-    let middle_width = scaled(MIDDLE_WIDTH, manage.dpi);
-    let right_x = margin + left_width + margin + middle_width + margin;
-    let right_width = (width - right_x - margin).max(1);
-    let actions_top = height - margin - row;
-    let meta_top = actions_top - row - margin / 2;
-    let content_bottom = meta_top - margin / 2;
+    let middle_width = scaled(MIDDLE_WIDTH, manage.dpi).min(
+        (width - margin * 2 - left_width - gap * 2 - scaled(220, manage.dpi))
+            .max(scaled(200, manage.dpi)),
+    );
+    let card_top = margin;
+    let card_height = (height - margin * 2).max(1);
+    let left_card = RECT {
+        left: margin,
+        top: card_top,
+        right: margin + left_width,
+        bottom: card_top + card_height,
+    };
+    let middle_card = RECT {
+        left: left_card.right + gap,
+        top: card_top,
+        right: left_card.right + gap + middle_width,
+        bottom: card_top + card_height,
+    };
+    let right_card = RECT {
+        left: middle_card.right + gap,
+        top: card_top,
+        right: width - margin,
+        bottom: card_top + card_height,
+    };
+    manage.cards = [left_card, middle_card, right_card];
 
-    // Keep the category combo and the pinned checkbox on their own row so the
-    // save/cancel buttons never overlap them at the minimum window width.
-    let pinned_width = scaled(100, manage.dpi);
-    let combo_width = (right_width - pinned_width - margin / 2)
-        .clamp(scaled(120, manage.dpi), scaled(200, manage.dpi));
+    let pad = scaled(14, manage.dpi);
+    let header = scaled(40, manage.dpi);
 
+    // Left card: category navigation.
+    let left_inner = left_card.left + pad;
+    let left_inner_width = (left_card.right - left_card.left - pad * 2).max(1);
+    let cat_delete_top = left_card.bottom - pad - row;
+    let cat_name_top = cat_delete_top - scaled(8, manage.dpi) - row;
+    let list_top = left_card.top + header;
     unsafe {
         let _ = MoveWindow(
             manage.left,
-            margin,
-            margin,
-            left_width,
-            (height - margin * 2 - row * 2 - margin / 2).max(1),
+            left_inner,
+            list_top,
+            left_inner_width,
+            (cat_name_top - scaled(10, manage.dpi) - list_top).max(1),
             true,
         );
         let _ = MoveWindow(
             manage.cat_name,
-            margin,
-            height - margin - row * 2,
-            (left_width - scaled(66, manage.dpi)).max(1),
+            left_inner,
+            cat_name_top,
+            (left_inner_width - scaled(68, manage.dpi)).max(1),
             row,
             true,
         );
         let _ = MoveWindow(
             manage.cat_add,
-            margin + left_width - scaled(64, manage.dpi),
-            height - margin - row * 2,
+            left_inner + left_inner_width - scaled(64, manage.dpi),
+            cat_name_top,
             scaled(64, manage.dpi),
             row,
             true,
         );
         let _ = MoveWindow(
             manage.cat_delete,
-            margin,
-            height - margin - row,
-            left_width,
+            left_inner,
+            cat_delete_top,
+            left_inner_width,
             row,
             true,
         );
+    }
+
+    // Middle card: search, list and actions.
+    let middle_inner = middle_card.left + pad;
+    let middle_inner_width = (middle_card.right - middle_card.left - pad * 2).max(1);
+    let search_top = middle_card.top + header;
+    let actions_top = middle_card.bottom - pad - row;
+    unsafe {
         let _ = MoveWindow(
             manage.search,
-            margin + left_width + margin,
-            margin,
-            middle_width,
+            middle_inner,
+            search_top,
+            middle_inner_width,
             row,
             true,
         );
-        let list_top = margin + row + margin / 2;
-        let list_height = (meta_top - list_top - margin / 2).max(1);
+    }
+    let list_top = search_top + row + scaled(10, manage.dpi);
+    unsafe {
         let _ = MoveWindow(
             manage.list,
-            margin + left_width + margin,
+            middle_inner,
             list_top,
-            middle_width,
-            list_height,
+            middle_inner_width,
+            (actions_top - scaled(12, manage.dpi) - list_top).max(1),
             true,
         );
-        let _ = MoveWindow(
-            manage.new_button,
-            margin + left_width + margin,
-            actions_top,
-            scaled(90, manage.dpi),
-            row,
-            true,
-        );
-        let _ = MoveWindow(
-            manage.delete_button,
-            margin + left_width + margin + scaled(100, manage.dpi),
-            actions_top,
-            scaled(90, manage.dpi),
-            row,
-            true,
-        );
-        let _ = MoveWindow(
-            manage.restore_button,
-            margin + left_width + margin + scaled(200, manage.dpi),
-            actions_top,
-            scaled(90, manage.dpi),
-            row,
-            true,
-        );
+    }
+    let button_width = scaled(84, manage.dpi);
+    let button_gap = scaled(8, manage.dpi);
+    for (index, control) in [
+        manage.new_button,
+        manage.delete_button,
+        manage.restore_button,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        unsafe {
+            let _ = MoveWindow(
+                control,
+                middle_inner + (button_width + button_gap) * index as i32,
+                actions_top,
+                button_width,
+                row,
+                true,
+            );
+        }
+    }
 
-        let _ = MoveWindow(manage.title_edit, right_x, margin, right_width, row, true);
-        let content_top = margin + row + margin;
-        let content_height = (content_bottom - content_top).max(1);
+    // Right card: title, body, metadata and save actions.
+    let right_inner = right_card.left + pad;
+    let right_inner_width = (right_card.right - right_card.left - pad * 2).max(1);
+    let title_label_top = right_card.top + pad;
+    let title_top = title_label_top + scaled(20, manage.dpi);
+    unsafe {
+        let _ = MoveWindow(
+            manage.title_edit,
+            right_inner,
+            title_top,
+            right_inner_width,
+            scaled(34, manage.dpi),
+            true,
+        );
+    }
+    let content_label_top = title_top + scaled(34, manage.dpi) + scaled(10, manage.dpi);
+    let content_top = content_label_top + scaled(20, manage.dpi);
+    let actions_top = right_card.bottom - pad - row;
+    // Status gets its own line above the buttons: at the 800 px minimum width
+    // the right card is too narrow to share a row with them.
+    let status_top = actions_top - scaled(24, manage.dpi);
+    let meta_top = status_top - scaled(8, manage.dpi) - scaled(30, manage.dpi);
+    unsafe {
         let _ = MoveWindow(
             manage.content_edit,
-            right_x,
+            right_inner,
             content_top,
-            right_width,
-            content_height,
+            right_inner_width,
+            (meta_top - scaled(10, manage.dpi) - content_top).max(1),
             true,
         );
+    }
+    let pinned_width = scaled(100, manage.dpi);
+    // Never let the combo overlap the pinned checkbox: at the minimum window
+    // width the remaining space is only ~94 logical px.
+    let combo_width = (right_inner_width - pinned_width - scaled(8, manage.dpi))
+        .clamp(scaled(80, manage.dpi), scaled(220, manage.dpi));
+    unsafe {
         let _ = MoveWindow(
             manage.category,
-            right_x,
+            right_inner,
             meta_top,
             combo_width,
-            scaled(200, manage.dpi),
+            ui::combo_height(manage.category, manage.dpi),
             true,
         );
         let _ = MoveWindow(
             manage.pinned,
-            right_x + right_width - pinned_width,
+            right_inner + right_inner_width - pinned_width,
             meta_top + scaled(4, manage.dpi),
             pinned_width,
             row,
@@ -664,26 +837,26 @@ fn layout(manage: &Manage, width: i32, height: i32) {
         );
         let _ = MoveWindow(
             manage.save_button,
-            right_x + right_width - scaled(180, manage.dpi),
+            right_inner + right_inner_width - scaled(176, manage.dpi),
             actions_top,
-            scaled(85, manage.dpi),
+            scaled(84, manage.dpi),
             row,
             true,
         );
         let _ = MoveWindow(
             manage.cancel_button,
-            right_x + right_width - scaled(85, manage.dpi),
+            right_inner + right_inner_width - scaled(84, manage.dpi),
             actions_top,
-            scaled(85, manage.dpi),
+            scaled(84, manage.dpi),
             row,
             true,
         );
         let _ = MoveWindow(
             manage.status,
-            right_x,
-            actions_top,
-            (right_width - scaled(190, manage.dpi)).max(1),
-            row,
+            right_inner,
+            status_top,
+            right_inner_width,
+            scaled(20, manage.dpi),
             true,
         );
     }
@@ -728,6 +901,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let instance = HINSTANCE(module.0);
     let palette = crate::theme::current();
     let page_brush = unsafe { CreateSolidBrush(palette.page) };
+    let card_brush = unsafe { CreateSolidBrush(palette.card) };
     let field_brush = unsafe { CreateSolidBrush(palette.field) };
     let error_brush = unsafe { CreateSolidBrush(palette.error) };
     let class = WNDCLASSW {
@@ -748,6 +922,7 @@ fn create(owner: HWND) -> Option<Manage> {
             logging::error(&format!("manage: RegisterClassW failed: {error:?}"));
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(card_brush.0));
                 let _ = DeleteObject(HGDIOBJ(field_brush.0));
                 let _ = DeleteObject(HGDIOBJ(error_brush.0));
             }
@@ -777,6 +952,7 @@ fn create(owner: HWND) -> Option<Manage> {
             logging::error(&format!("manage: CreateWindowExW failed: {err}"));
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(card_brush.0));
                 let _ = DeleteObject(HGDIOBJ(field_brush.0));
                 let _ = DeleteObject(HGDIOBJ(error_brush.0));
             }
@@ -784,11 +960,13 @@ fn create(owner: HWND) -> Option<Manage> {
         }
     };
 
+    ui::apply_window_style(hwnd);
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
     let fonts = Fonts {
         body: make_font(14, 400, dpi),
         title: make_font(16, 600, dpi),
+        small: make_font(11, 400, dpi),
     };
 
     let left = create_control(
@@ -797,7 +975,9 @@ fn create(owner: HWND) -> Option<Manage> {
         WS_CHILD
             | WS_VISIBLE
             | WS_VSCROLL
-            | WINDOW_STYLE((LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32),
+            | WINDOW_STYLE(
+                (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32,
+            ),
         hwnd,
         ID_LEFT,
         instance,
@@ -813,7 +993,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let cat_add = create_control(
         w!("BUTTON"),
         "添加",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_CAT_ADD,
         instance,
@@ -821,7 +1001,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let cat_delete = create_control(
         w!("BUTTON"),
         "删除分类",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_CAT_DELETE,
         instance,
@@ -840,7 +1020,9 @@ fn create(owner: HWND) -> Option<Manage> {
         WS_CHILD
             | WS_VISIBLE
             | WS_VSCROLL
-            | WINDOW_STYLE((LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32),
+            | WINDOW_STYLE(
+                (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32,
+            ),
         hwnd,
         ID_LIST,
         instance,
@@ -848,7 +1030,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let new_button = create_control(
         w!("BUTTON"),
         "新建",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_NEW,
         instance,
@@ -856,7 +1038,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let delete_button = create_control(
         w!("BUTTON"),
         "删除",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_DELETE,
         instance,
@@ -864,7 +1046,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let restore_button = create_control(
         w!("BUTTON"),
         "恢复",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_RESTORE,
         instance,
@@ -891,7 +1073,9 @@ fn create(owner: HWND) -> Option<Manage> {
     let category = create_control(
         w!("COMBOBOX"),
         "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
         hwnd,
         ID_CATEGORY,
         instance,
@@ -907,7 +1091,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let save_button = create_control(
         w!("BUTTON"),
         "保存",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_DEFPUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_SAVE,
         instance,
@@ -915,7 +1099,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let cancel_button = create_control(
         w!("BUTTON"),
         "取消",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
         hwnd,
         ID_CANCEL,
         instance,
@@ -928,6 +1112,47 @@ fn create(owner: HWND) -> Option<Manage> {
         ID_STATUS,
         instance,
     );
+
+    for button in [
+        cat_add,
+        cat_delete,
+        new_button,
+        delete_button,
+        restore_button,
+        save_button,
+        cancel_button,
+    ] {
+        ui::install_button(button);
+    }
+    for control in [
+        left,
+        list,
+        category,
+        cat_name,
+        search,
+        title_edit,
+        content_edit,
+    ] {
+        ui::theme_control(control, palette.dark);
+    }
+    ui::theme_combo(category, palette.dark);
+    ui::install_combo(category);
+    ui::theme_scrollbar(content_edit, palette.dark);
+    ui::cue_banner(search, "搜索标题或正文");
+    ui::cue_banner(title_edit, "标题（必填）");
+    ui::cue_banner(cat_name, "新分类名称");
+    ui::cue_banner(content_edit, "在此输入短语正文");
+    unsafe {
+        let _ = SendMessageW(left, LB_SETITEMHEIGHT, 0, scaled(34, dpi) as isize);
+        let _ = SendMessageW(list, LB_SETITEMHEIGHT, 0, scaled(50, dpi) as isize);
+        let _ = SendMessageW(
+            category,
+            CB_SETITEMHEIGHT,
+            usize::MAX,
+            scaled(31, dpi) as isize,
+        );
+        let _ = SendMessageW(category, CB_SETITEMHEIGHT, 0, scaled(28, dpi) as isize);
+    }
 
     let mut manage = Manage {
         hwnd,
@@ -947,9 +1172,11 @@ fn create(owner: HWND) -> Option<Manage> {
         save_button,
         cancel_button,
         status,
+        cards: [RECT::default(); 3],
         fonts,
         palette,
         page_brush,
+        card_brush,
         field_brush,
         error_brush,
         error_field: None,
@@ -994,11 +1221,14 @@ fn create(owner: HWND) -> Option<Manage> {
     unsafe {
         let _ = GetClientRect(hwnd, &mut rect);
     }
-    layout(&manage, rect.right, rect.bottom);
+    layout(&mut manage, rect.right, rect.bottom);
     reload_left(&manage);
     reload_categories(&manage);
     reload_list(&mut manage);
     load_editor(&mut manage, None);
+    // The category combo height depends on its item count, so it can only be
+    // sized after the categories have been loaded.
+    relayout(&mut manage);
     manage.loading = false;
     Some(manage)
 }
@@ -1047,13 +1277,29 @@ pub fn show(owner: HWND) {
         if palette != manage.palette {
             unsafe {
                 let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(manage.card_brush.0));
                 let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
                 let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
             }
             manage.page_brush = unsafe { CreateSolidBrush(palette.page) };
+            manage.card_brush = unsafe { CreateSolidBrush(palette.card) };
             manage.field_brush = unsafe { CreateSolidBrush(palette.field) };
             manage.error_brush = unsafe { CreateSolidBrush(palette.error) };
             manage.palette = palette;
+            for control in [
+                manage.left,
+                manage.list,
+                manage.category,
+                manage.cat_name,
+                manage.search,
+                manage.title_edit,
+                manage.content_edit,
+            ] {
+                ui::theme_control(control, palette.dark);
+            }
+            ui::theme_combo(manage.category, palette.dark);
+            ui::theme_scrollbar(manage.content_edit, palette.dark);
+            ui::apply_window_style(manage.hwnd);
             unsafe {
                 let _ = InvalidateRect(Some(manage.hwnd), None, true);
             }
@@ -1106,7 +1352,9 @@ pub fn shutdown() {
         let _ = DestroyWindow(manage.hwnd);
         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
+        let _ = DeleteObject(HGDIOBJ(manage.fonts.small.0));
         let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.card_brush.0));
         let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
         let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
     }
@@ -1139,11 +1387,11 @@ unsafe extern "system" fn window_proc(
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
             MANAGE.with(|slot| {
-                let guard = match slot.try_borrow() {
+                let mut guard = match slot.try_borrow_mut() {
                     Ok(guard) => guard,
                     Err(_) => return,
                 };
-                if let Some(manage) = guard.as_ref() {
+                if let Some(manage) = guard.as_mut() {
                     layout(manage, width, height);
                 }
             });
@@ -1184,10 +1432,12 @@ unsafe extern "system" fn window_proc(
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
                     let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
+                    let _ = DeleteObject(HGDIOBJ(manage.fonts.small.0));
                 }
                 manage.fonts = Fonts {
                     body: make_font(14, 400, dpi),
                     title: make_font(16, 600, dpi),
+                    small: make_font(11, 400, dpi),
                 };
                 manage.dpi = dpi;
                 for control in [
@@ -1217,6 +1467,22 @@ unsafe extern "system" fn window_proc(
                         WM_SETFONT,
                         manage.fonts.title.0 as usize,
                         1,
+                    );
+                    let _ =
+                        SendMessageW(manage.left, LB_SETITEMHEIGHT, 0, scaled(34, dpi) as isize);
+                    let _ =
+                        SendMessageW(manage.list, LB_SETITEMHEIGHT, 0, scaled(50, dpi) as isize);
+                    let _ = SendMessageW(
+                        manage.category,
+                        CB_SETITEMHEIGHT,
+                        usize::MAX,
+                        scaled(31, dpi) as isize,
+                    );
+                    let _ = SendMessageW(
+                        manage.category,
+                        CB_SETITEMHEIGHT,
+                        0,
+                        scaled(28, dpi) as isize,
                     );
                 }
                 layout(manage, width, height);
@@ -1331,6 +1597,7 @@ unsafe extern "system" fn window_proc(
                                 reload_left(manage);
                                 reload_categories(manage);
                                 reload_list(manage);
+                                relayout(manage);
                             }
                             Some(Err(code)) => status_message(manage, error_text(&code)),
                             None => status_message(manage, "存储未初始化"),
@@ -1371,6 +1638,7 @@ unsafe extern "system" fn window_proc(
                                 reload_left(manage);
                                 reload_categories(manage);
                                 reload_list(manage);
+                                relayout(manage);
                             }
                             Some(Err(code)) => status_message(manage, error_text(&code)),
                             None => status_message(manage, "存储未初始化"),
@@ -1479,13 +1747,13 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
-            let (heading, secondary, page, field, field_color) =
+            let (heading, secondary, card, field, field_color) =
                 MANAGE.with(|slot| match slot.try_borrow() {
                     Ok(guard) => match guard.as_ref() {
                         Some(manage) => (
                             manage.palette.heading,
                             manage.palette.secondary,
-                            manage.page_brush,
+                            manage.card_brush,
                             manage.field_brush,
                             manage.palette.field,
                         ),
@@ -1518,8 +1786,8 @@ unsafe extern "system" fn window_proc(
             unsafe {
                 SetTextColor(hdc, secondary);
             }
-            if !page.0.is_null() {
-                return LRESULT(page.0 as isize);
+            if !card.0.is_null() {
+                return LRESULT(card.0 as isize);
             }
             LRESULT(0)
         }
@@ -1543,10 +1811,130 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(field.0 as isize)
         }
+        WM_DRAWITEM => {
+            let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
+            let (palette, fonts, dpi) = MANAGE.with(|slot| match slot.try_borrow() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(manage) => (
+                        manage.palette,
+                        (manage.fonts.body, manage.fonts.title, manage.fonts.small),
+                        manage.dpi,
+                    ),
+                    None => (
+                        crate::theme::LIGHT,
+                        (HFONT::default(), HFONT::default(), HFONT::default()),
+                        96,
+                    ),
+                },
+                Err(_) => (
+                    crate::theme::LIGHT,
+                    (HFONT::default(), HFONT::default(), HFONT::default()),
+                    96,
+                ),
+            });
+            match draw.CtlID as i32 {
+                ID_LEFT => draw_list_row(draw, palette, dpi, fonts, false),
+                ID_LIST => draw_list_row(draw, palette, dpi, fonts, true),
+                ID_CATEGORY => ui::draw_combo_item(draw, palette, dpi, fonts.0),
+                ID_SAVE => {
+                    ui::draw_button(draw, palette, ui::ButtonKind::Primary, dpi, palette.card)
+                }
+                ID_DELETE | ID_CAT_DELETE => {
+                    ui::draw_button(draw, palette, ui::ButtonKind::Danger, dpi, palette.card)
+                }
+                _ => ui::draw_button(draw, palette, ui::ButtonKind::Secondary, dpi, palette.card),
+            }
+            LRESULT(1)
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             unsafe {
                 let hdc = BeginPaint(hwnd, &mut paint);
+                let (cards, palette, fonts, dpi) = MANAGE.with(|slot| match slot.try_borrow() {
+                    Ok(guard) => match guard.as_ref() {
+                        Some(manage) => (
+                            manage.cards,
+                            manage.palette,
+                            (manage.fonts.small, manage.fonts.body),
+                            manage.dpi,
+                        ),
+                        None => (
+                            [RECT::default(); 3],
+                            crate::theme::LIGHT,
+                            (HFONT::default(), HFONT::default()),
+                            96,
+                        ),
+                    },
+                    Err(_) => (
+                        [RECT::default(); 3],
+                        crate::theme::LIGHT,
+                        (HFONT::default(), HFONT::default()),
+                        96,
+                    ),
+                });
+                for card in &cards {
+                    if card.right > card.left && card.bottom > card.top {
+                        ui::card(hdc, card, palette, dpi);
+                    }
+                }
+                let pad = scaled(14, dpi);
+                let mut header = RECT {
+                    left: cards[0].left + pad,
+                    top: cards[0].top + scaled(12, dpi),
+                    right: cards[0].right - pad,
+                    bottom: cards[0].top + scaled(34, dpi),
+                };
+                ui::label(
+                    hdc,
+                    "分类",
+                    &mut header,
+                    fonts.0,
+                    palette.secondary,
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                let mut header = RECT {
+                    left: cards[1].left + pad,
+                    top: cards[1].top + scaled(12, dpi),
+                    right: cards[1].right - pad,
+                    bottom: cards[1].top + scaled(34, dpi),
+                };
+                ui::label(
+                    hdc,
+                    "短语",
+                    &mut header,
+                    fonts.0,
+                    palette.secondary,
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                let right_card = cards[2];
+                let mut title_label = RECT {
+                    left: right_card.left + pad,
+                    top: right_card.top + scaled(14, dpi),
+                    right: right_card.right - pad,
+                    bottom: right_card.top + scaled(32, dpi),
+                };
+                ui::label(
+                    hdc,
+                    "标题",
+                    &mut title_label,
+                    fonts.0,
+                    palette.secondary,
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                let mut content_label = RECT {
+                    left: right_card.left + pad,
+                    top: right_card.top + scaled(78, dpi),
+                    right: right_card.right - pad,
+                    bottom: right_card.top + scaled(96, dpi),
+                };
+                ui::label(
+                    hdc,
+                    "正文",
+                    &mut content_label,
+                    fonts.0,
+                    palette.secondary,
+                    DT_LEFT | DT_SINGLELINE | DT_NOPREFIX,
+                );
                 let (error_field, error_brush) = MANAGE.with(|slot| match slot.try_borrow() {
                     Ok(guard) => match guard.as_ref() {
                         Some(manage) => (manage.error_field, manage.error_brush),
@@ -1656,7 +2044,9 @@ unsafe extern "system" fn window_proc(
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.fonts.small.0));
                         let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.card_brush.0));
                         let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
                         let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
                     }

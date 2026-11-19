@@ -11,9 +11,9 @@ use windows::Win32::Graphics::Dwm::{
     DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    FrameRect, GetDC, GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint,
-    ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
+    GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, ReleaseDC,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY,
     CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
     DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
@@ -36,7 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::capture::Report;
-use crate::{inject, logging, platform};
+use crate::{inject, logging, platform, ui};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
@@ -736,6 +736,10 @@ fn create() -> Option<Panel> {
             let _ = send(control, WM_SETFONT, fonts.body.0 as usize, 1);
         }
     }
+    // Dark scroll bars and combo chrome do not follow WM_CTLCOLOR*.
+    ui::set_dark_mode(palette.dark);
+    ui::theme_control(list, palette.dark);
+    ui::theme_control(edit, palette.dark);
 
     let settings_link = match create_static_link(hwnd, instance, SETTINGS_LINK_ID, "设置") {
         Some(link) => link,
@@ -1359,10 +1363,24 @@ fn draw_categories(hdc: HDC, panel: &Panel, right_limit: i32, dpi: u32) {
             } else {
                 panel.brushes.search
             };
-            FillRect(hdc, &rect, brush);
-            if selected {
-                let _ = FrameRect(hdc, &rect, panel.brushes.accent);
-            }
+            let radius = (rect.bottom - rect.top) / 2;
+            ui::fill_round(hdc, &rect, radius, brush);
+            let mut outline = rect;
+            outline.left += 1;
+            outline.top += 1;
+            outline.right -= 1;
+            outline.bottom -= 1;
+            ui::stroke_round(
+                hdc,
+                &outline,
+                radius - 1,
+                if selected {
+                    panel.palette.primary
+                } else {
+                    panel.palette.border
+                },
+                1,
+            );
             SetTextColor(
                 hdc,
                 if selected {
@@ -1474,7 +1492,12 @@ fn draw_match(
             DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
         if match_rect.right > match_rect.left {
-            FillRect(hdc, &match_rect, panel.brushes.highlight);
+            ui::fill_round(
+                hdc,
+                &match_rect,
+                scaled(3, panel.dpi),
+                panel.brushes.highlight,
+            );
             SetTextColor(hdc, panel.palette.highlight_text);
             DrawTextW(
                 hdc,
@@ -2018,8 +2041,25 @@ unsafe extern "system" fn window_proc(
                         right: rect.right - margin + 1,
                         bottom: scaled(SEARCH_TOP + SEARCH_HEIGHT, panel.dpi) + 1,
                     };
-                    FillRect(hdc, &search_rect, panel.brushes.search);
-                    let _ = FrameRect(hdc, &search_rect, panel.brushes.border);
+                    // Rounded search surface.
+                    ui::fill_round(
+                        hdc,
+                        &search_rect,
+                        scaled(10, panel.dpi),
+                        panel.brushes.search,
+                    );
+                    let mut search_border = search_rect;
+                    search_border.left += 1;
+                    search_border.top += 1;
+                    search_border.right -= 1;
+                    search_border.bottom -= 1;
+                    ui::stroke_round(
+                        hdc,
+                        &search_border,
+                        scaled(9, panel.dpi),
+                        panel.palette.border,
+                        1,
+                    );
 
                     // Search glyph at the left of the field.
                     let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.icon.0));
@@ -2237,21 +2277,25 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 
     unsafe {
         let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
-        let background = if selected {
-            panel.brushes.selected
+        if selected {
+            let mut pill = rect;
+            pill.left += scaled(4, panel.dpi);
+            pill.top += scaled(4, panel.dpi);
+            pill.right -= scaled(4, panel.dpi);
+            pill.bottom -= scaled(4, panel.dpi);
+            ui::fill_round(hdc, &pill, scaled(10, panel.dpi), panel.brushes.selected);
+            if GetFocus() == panel.list || GetFocus() == panel.edit {
+                // Keyboard focus must be visible and not colour-only (§14.2).
+                ui::stroke_round(
+                    hdc,
+                    &pill,
+                    scaled(10, panel.dpi),
+                    panel.palette.primary,
+                    scaled(1, panel.dpi),
+                );
+            }
         } else {
-            panel.brushes.background
-        };
-        FillRect(hdc, &rect, background);
-        if selected && (GetFocus() == panel.list || GetFocus() == panel.edit) {
-            // Keyboard focus must be visible and not colour-only (§14.2).
-            let mut border = rect;
-            let _ = FrameRect(hdc, &border, panel.brushes.accent);
-            border.left += 1;
-            border.top += 1;
-            border.right -= 1;
-            border.bottom -= 1;
-            let _ = FrameRect(hdc, &border, panel.brushes.accent);
+            FillRect(hdc, &rect, panel.brushes.background);
         }
         SetBkMode(hdc, TRANSPARENT);
     }
@@ -2267,7 +2311,12 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
         bottom: rect.top + ((rect.bottom - rect.top) - icon_size) / 2 + icon_size,
     };
     unsafe {
-        FillRect(hdc, &icon_rect, panel.brushes.selected);
+        ui::fill_round(
+            hdc,
+            &icon_rect,
+            scaled(8, panel.dpi),
+            panel.brushes.selected,
+        );
         let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.title.0));
         SetTextColor(hdc, panel.palette.primary);
         let mut glyph = platform::wide("T");
