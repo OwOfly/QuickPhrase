@@ -20,8 +20,8 @@
 
 ```
 exe bytes=498176
-zip bytes=261773
-sha256=20fb32b2d1870f6f373617247dd0b925f92dc08a21d2a1af32414d754940a9da
+zip bytes=261769
+sha256=80b3d9ee29148ab34535ce7ffd0fe43abb0ed9c4f47af321e3426b91de04d887
 fileVersion=0.1.0 product=QuickPhrase 快语
 zip contents: LICENSE, QuickPhrase.exe, README.md
 ```
