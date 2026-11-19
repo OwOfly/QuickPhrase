@@ -30,6 +30,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AnimateWindow, SystemParametersInfoW, AW_BLEND, SPI_GETCLIENTAREAANIMATION,
+};
 
 use crate::capture::Report;
 use crate::{inject, logging, platform};
@@ -38,6 +41,8 @@ const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
 const LIST_ID: i32 = 101;
 const FOOTER_ID: i32 = 102;
+const SETTINGS_LINK_ID: i32 = 103;
+const MANAGE_LINK_ID: i32 = 104;
 
 const PANEL_WIDTH: i32 = 520;
 const PANEL_HEIGHT: i32 = 420;
@@ -47,6 +52,8 @@ const CATEGORY_TOP: i32 = 54;
 const CATEGORY_HEIGHT: i32 = 46;
 const LIST_TOP: i32 = 104;
 const FOOTER_HEIGHT: i32 = 42;
+const SS_CENTER: i32 = 0x0001;
+const SS_NOTIFY: i32 = 0x0100;
 const SS_CENTERIMAGE: i32 = 0x0200;
 const ITEM_HEIGHT: i32 = 64;
 
@@ -82,12 +89,14 @@ pub struct PanelData {
     pub copy_only: Option<String>,
     pub paste_mode: bool,
     pub keep_tabs: bool,
+    pub hotkey_hint: String,
 }
 
 struct Fonts {
     title: HFONT,
     body: HFONT,
     small: HFONT,
+    icon: HFONT,
 }
 
 struct Brushes {
@@ -104,6 +113,8 @@ struct Panel {
     edit: HWND,
     list: HWND,
     footer: HWND,
+    settings_link: HWND,
+    manage_link: HWND,
     filtered: Vec<usize>,
     items: Vec<Item>,
     categories: Vec<(String, String)>,
@@ -112,6 +123,8 @@ struct Panel {
     notice: Option<String>,
     paste_mode: bool,
     keep_tabs: bool,
+    hotkey_hint: String,
+    palette: crate::theme::Palette,
     title_highlights: Vec<Option<(usize, usize)>>,
     content_highlights: Vec<Option<(usize, usize)>>,
     last_query: String,
@@ -148,16 +161,50 @@ pub fn is_injecting() -> bool {
     INJECTING.load(Ordering::Relaxed)
 }
 
-fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF(r | (g << 8) | (b << 16))
-}
-
 fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
 }
 
-fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
-    let face = platform::wide("Microsoft YaHei UI");
+fn animations_enabled() -> bool {
+    if std::env::var_os("QUICKPHRASE_TEST_NO_ANIMATION").is_some() {
+        return false;
+    }
+    let mut enabled = 1u32;
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut enabled as *mut u32 as *mut core::ffi::c_void),
+            Default::default(),
+        )
+    }
+    .is_ok();
+    ok && enabled != 0
+}
+
+fn create_static_link(parent: HWND, instance: HINSTANCE, id: i32, text: &str) -> Option<HWND> {
+    let text = platform::wide(text);
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("STATIC"),
+            PCWSTR(text.as_ptr()),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE((SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY) as u32),
+            0,
+            0,
+            10,
+            10,
+            Some(parent),
+            Some(HMENU(id as isize as *mut core::ffi::c_void)),
+            Some(instance),
+            None,
+        )
+        .ok()
+    }
+}
+
+fn create_font_face(size: i32, weight: i32, face: &str, dpi: u32) -> HFONT {
+    let face = platform::wide(face);
     unsafe {
         CreateFontW(
             -scaled(size, dpi),
@@ -178,6 +225,10 @@ fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
     }
 }
 
+fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
+    create_font_face(size, weight, "Microsoft YaHei UI", dpi)
+}
+
 unsafe fn send(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> LRESULT {
     SendMessageW(hwnd, message, Some(WPARAM(wparam)), Some(LPARAM(lparam)))
 }
@@ -187,6 +238,7 @@ fn make_fonts(dpi: u32) -> Fonts {
         title: create_font(14, 700, dpi),
         body: create_font(12, 400, dpi),
         small: create_font(11, 400, dpi),
+        icon: create_font_face(13, 400, "Segoe MDL2 Assets", dpi),
     }
 }
 
@@ -195,17 +247,29 @@ fn destroy_fonts(fonts: &Fonts) {
         let _ = DeleteObject(HGDIOBJ(fonts.title.0));
         let _ = DeleteObject(HGDIOBJ(fonts.body.0));
         let _ = DeleteObject(HGDIOBJ(fonts.small.0));
+        let _ = DeleteObject(HGDIOBJ(fonts.icon.0));
     }
 }
 
-fn make_brushes() -> Brushes {
+fn make_brushes(palette: crate::theme::Palette) -> Brushes {
+    use crate::theme::Palette;
+    let Palette {
+        page: _,
+        card,
+        selection,
+        field,
+        border,
+        highlight,
+        primary,
+        ..
+    } = palette;
     Brushes {
-        background: unsafe { CreateSolidBrush(rgb(255, 255, 255)) },
-        selected: unsafe { CreateSolidBrush(rgb(240, 237, 255)) },
-        search: unsafe { CreateSolidBrush(rgb(248, 248, 253)) },
-        border: unsafe { CreateSolidBrush(rgb(233, 235, 243)) },
-        highlight: unsafe { CreateSolidBrush(rgb(255, 241, 184)) },
-        accent: unsafe { CreateSolidBrush(rgb(0x76, 0x55, 0xE9)) },
+        background: unsafe { CreateSolidBrush(card) },
+        selected: unsafe { CreateSolidBrush(selection) },
+        search: unsafe { CreateSolidBrush(field) },
+        border: unsafe { CreateSolidBrush(border) },
+        highlight: unsafe { CreateSolidBrush(highlight) },
+        accent: unsafe { CreateSolidBrush(primary) },
     }
 }
 
@@ -287,6 +351,7 @@ pub fn show_test() -> u128 {
             copy_only: None,
             paste_mode: false,
             keep_tabs: false,
+            hotkey_hint: String::new(),
         },
         true,
         true,
@@ -316,6 +381,14 @@ fn present(
         let Some(panel) = guard.as_mut() else {
             return (HWND::default(), HWND::default());
         };
+        if activate {
+            let palette = crate::theme::current();
+            if palette != panel.palette {
+                destroy_brushes(&panel.brushes);
+                panel.brushes = make_brushes(palette);
+                panel.palette = palette;
+            }
+        }
         panel.report = report;
         panel.monitor = monitor;
         panel.notify = notify;
@@ -325,6 +398,7 @@ fn present(
         panel.copy_only = data.copy_only;
         panel.paste_mode = data.paste_mode;
         panel.keep_tabs = data.keep_tabs;
+        panel.hotkey_hint = data.hotkey_hint;
         panel.active_category = None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
@@ -357,8 +431,16 @@ fn present(
     });
 
     unsafe {
-        let _ = ShowWindow(hwnd, if activate { SW_SHOW } else { SW_SHOWNOACTIVATE });
         if activate {
+            if animations_enabled() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                let _ = AnimateWindow(hwnd, 120, AW_BLEND);
+                if !IsWindowVisible(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                }
+            } else {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
             force_foreground(hwnd);
             let _ = SetFocus(Some(edit));
             let _ = send(edit, EM_SETSEL, 0, -1);
@@ -374,6 +456,8 @@ fn present(
                     return 0;
                 }
             }
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         let _ = UpdateWindow(hwnd);
     }
@@ -529,7 +613,8 @@ fn create() -> Option<Panel> {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
     let fonts = make_fonts(dpi);
-    let brushes = make_brushes();
+    let palette = crate::theme::current();
+    let brushes = make_brushes(palette);
 
     let edit = match unsafe {
         CreateWindowExW(
@@ -630,6 +715,37 @@ fn create() -> Option<Panel> {
         }
     }
 
+    let settings_link = match create_static_link(hwnd, instance, SETTINGS_LINK_ID, "设置") {
+        Some(link) => link,
+        None => {
+            logging::error("CreateWindowExW(settings link) failed");
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
+    let manage_link = match create_static_link(hwnd, instance, MANAGE_LINK_ID, "管理短语") {
+        Some(link) => link,
+        None => {
+            logging::error("CreateWindowExW(manage link) failed");
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            destroy_fonts(&fonts);
+            destroy_brushes(&brushes);
+            CREATE_FAILED.store(true, Ordering::Relaxed);
+            return None;
+        }
+    };
+    unsafe {
+        let _ = send(settings_link, WM_SETFONT, fonts.small.0 as usize, 1);
+        let _ = send(manage_link, WM_SETFONT, fonts.small.0 as usize, 1);
+    }
+
     let cue = platform::wide("搜索短语…");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
@@ -655,6 +771,8 @@ fn create() -> Option<Panel> {
         edit,
         list,
         footer,
+        settings_link,
+        manage_link,
         filtered: Vec::new(),
         items: Vec::new(),
         categories: Vec::new(),
@@ -663,6 +781,8 @@ fn create() -> Option<Panel> {
         notice: None,
         paste_mode: false,
         keep_tabs: false,
+        hotkey_hint: String::new(),
+        palette,
         title_highlights: Vec::new(),
         content_highlights: Vec::new(),
         last_query: String::new(),
@@ -686,6 +806,8 @@ fn create() -> Option<Panel> {
         panel.edit,
         panel.list,
         panel.footer,
+        panel.settings_link,
+        panel.manage_link,
         panel.dpi,
         rect.right,
         rect.bottom,
@@ -982,21 +1104,45 @@ fn place() {
     }
 }
 
-fn layout_controls(edit: HWND, list: HWND, footer: HWND, dpi: u32, width: i32, height: i32) {
+#[allow(clippy::too_many_arguments)]
+fn layout_controls(
+    edit: HWND,
+    list: HWND,
+    footer: HWND,
+    settings_link: HWND,
+    manage_link: HWND,
+    dpi: u32,
+    width: i32,
+    height: i32,
+) {
     if width <= 0 || height <= 0 {
         return;
     }
     let margin = scaled(16, dpi);
     let edit_height = scaled(SEARCH_HEIGHT, dpi);
     let footer_height = scaled(FOOTER_HEIGHT, dpi);
+    let icon_width = scaled(26, dpi);
+    let hint_width = scaled(84, dpi);
+    let link_width = scaled(52, dpi);
 
     unsafe {
+        let edit_left = margin + icon_width + scaled(6, dpi);
+        let edit_width =
+            (width - edit_left - margin - hint_width - link_width - scaled(8, dpi)).max(1);
         let _ = MoveWindow(
             edit,
-            margin,
+            edit_left,
             scaled(SEARCH_TOP, dpi),
-            width - margin * 2,
+            edit_width,
             edit_height,
+            true,
+        );
+        let _ = MoveWindow(
+            settings_link,
+            width - margin - link_width,
+            scaled(SEARCH_TOP, dpi) + scaled(4, dpi),
+            link_width,
+            scaled(26, dpi),
             true,
         );
         let list_top = scaled(LIST_TOP, dpi);
@@ -1009,11 +1155,20 @@ fn layout_controls(edit: HWND, list: HWND, footer: HWND, dpi: u32, width: i32, h
             list_height,
             true,
         );
+        let footer_width = (width - margin * 2 - scaled(94, dpi)).max(1);
         let _ = MoveWindow(
             footer,
             margin,
             height - footer_height - scaled(8, dpi),
-            width - margin * 2,
+            footer_width,
+            footer_height,
+            true,
+        );
+        let _ = MoveWindow(
+            manage_link,
+            margin + footer_width,
+            height - footer_height - scaled(8, dpi),
+            scaled(94, dpi),
             footer_height,
             true,
         );
@@ -1175,9 +1330,9 @@ fn draw_categories(hdc: HDC, panel: &Panel, right_limit: i32, dpi: u32) {
             SetTextColor(
                 hdc,
                 if selected {
-                    rgb(0x5B, 0x3F, 0xD6)
+                    panel.palette.primary
                 } else {
-                    rgb(0x55, 0x5B, 0x70)
+                    panel.palette.secondary
                 },
             );
             DrawTextW(
@@ -1205,7 +1360,7 @@ fn draw_empty_message(hdc: HDC, panel: &Panel, rect: &RECT, dpi: u32) {
     unsafe {
         let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.body.0));
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, rgb(0x8A, 0x90, 0xA6));
+        SetTextColor(hdc, panel.palette.secondary);
         DrawTextW(
             hdc,
             &mut text,
@@ -1284,7 +1439,7 @@ fn draw_match(
         );
         if match_rect.right > match_rect.left {
             FillRect(hdc, &match_rect, panel.brushes.highlight);
-            SetTextColor(hdc, rgb(0x4A, 0x2C, 0xB8));
+            SetTextColor(hdc, panel.palette.highlight_text);
             DrawTextW(
                 hdc,
                 &mut matched_wide,
@@ -1629,19 +1784,58 @@ unsafe extern "system" fn window_proc(
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
             let parts = PANEL.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|panel| (panel.edit, panel.list, panel.footer, panel.dpi))
+                slot.borrow().as_ref().map(|panel| {
+                    (
+                        panel.edit,
+                        panel.list,
+                        panel.footer,
+                        panel.settings_link,
+                        panel.manage_link,
+                        panel.dpi,
+                    )
+                })
             });
-            if let Some((edit, list, footer, dpi)) = parts {
-                layout_controls(edit, list, footer, dpi, width, height);
+            if let Some((edit, list, footer, settings_link, manage_link, dpi)) = parts {
+                layout_controls(
+                    edit,
+                    list,
+                    footer,
+                    settings_link,
+                    manage_link,
+                    dpi,
+                    width,
+                    height,
+                );
             }
             LRESULT(0)
         }
         WM_COMMAND => {
             let control = (wparam.0 & 0xffff) as i32;
             let code = ((wparam.0 >> 16) & 0xffff) as u32;
-            if control == EDIT_ID && code == EN_CHANGE {
+            if (control == SETTINGS_LINK_ID || control == MANAGE_LINK_ID) && code == 0 {
+                let notify = PANEL.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|panel| panel.notify)
+                        .unwrap_or_default()
+                });
+                let id = if control == SETTINGS_LINK_ID {
+                    1004 // ID_SETTINGS
+                } else {
+                    1002 // ID_MANAGE
+                };
+                if !notify.0.is_null() {
+                    unsafe {
+                        let _ = PostMessageW(Some(notify), WM_COMMAND, WPARAM(id), LPARAM(0));
+                    }
+                }
+                hide_and_restore();
+                logging::info(if control == SETTINGS_LINK_ID {
+                    "panel settings link"
+                } else {
+                    "panel manage link"
+                });
+            } else if control == EDIT_ID && code == EN_CHANGE {
                 let edit = HWND(lparam.0 as *mut core::ffi::c_void);
                 let text = read_text(edit);
                 populate(&text);
@@ -1679,10 +1873,16 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let (field, heading) = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| (panel.palette.field, panel.palette.heading))
+                    .unwrap_or((COLORREF(0xFFFFFF), COLORREF(0)))
+            });
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
-                SetBkColor(hdc, rgb(248, 248, 253));
-                SetTextColor(hdc, rgb(0x22, 0x24, 0x3E));
+                SetBkColor(hdc, field);
+                SetTextColor(hdc, heading);
             }
             let brush = PANEL.with(|slot| {
                 slot.borrow()
@@ -1694,9 +1894,23 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLORSTATIC => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let control = HWND(lparam.0 as *mut core::ffi::c_void);
+            let id = unsafe { GetDlgCtrlID(control) };
+            let color = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| {
+                        if id == SETTINGS_LINK_ID || id == MANAGE_LINK_ID {
+                            panel.palette.primary
+                        } else {
+                            panel.palette.secondary
+                        }
+                    })
+                    .unwrap_or(COLORREF(0))
+            });
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, rgb(0x77, 0x7D, 0x92));
+                SetTextColor(hdc, color);
             }
             let brush = PANEL.with(|slot| {
                 slot.borrow()
@@ -1741,6 +1955,51 @@ unsafe extern "system" fn window_proc(
                     };
                     FillRect(hdc, &search_rect, panel.brushes.search);
                     let _ = FrameRect(hdc, &search_rect, panel.brushes.border);
+
+                    // Search glyph at the left of the field.
+                    let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.icon.0));
+                    SetTextColor(hdc, panel.palette.secondary);
+                    SetBkMode(hdc, TRANSPARENT);
+                    let mut search_glyph = platform::wide("\u{E721}");
+                    let mut glyph_rect = RECT {
+                        left: margin - 1,
+                        top: search_rect.top,
+                        right: margin + scaled(26, panel.dpi),
+                        bottom: search_rect.bottom,
+                    };
+                    DrawTextW(
+                        hdc,
+                        &mut search_glyph,
+                        &mut glyph_rect,
+                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                    );
+                    let _ = SelectObject(hdc, previous);
+
+                    // Shortcut hint sits between the field and the settings link.
+                    if !panel.hotkey_hint.is_empty() {
+                        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.small.0));
+                        SetTextColor(hdc, panel.palette.secondary);
+                        let mut hint = platform::wide(&panel.hotkey_hint);
+                        let mut hint_rect = RECT {
+                            left: rect.right
+                                - margin
+                                - scaled(52, panel.dpi)
+                                - scaled(84, panel.dpi),
+                            top: search_rect.top,
+                            right: rect.right
+                                - margin
+                                - scaled(52, panel.dpi)
+                                - scaled(2, panel.dpi),
+                            bottom: search_rect.bottom,
+                        };
+                        DrawTextW(
+                            hdc,
+                            &mut hint,
+                            &mut hint_rect,
+                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                        );
+                        let _ = SelectObject(hdc, previous);
+                    }
 
                     draw_categories(hdc, panel, rect.right - margin, panel.dpi);
                     draw_empty_message(hdc, panel, &rect, panel.dpi);
@@ -1887,16 +2146,51 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     let rect = draw.rcItem;
 
     unsafe {
-        let background = if draw.itemState.0 & ODS_SELECTED.0 != 0 {
+        let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+        let background = if selected {
             panel.brushes.selected
         } else {
             panel.brushes.background
         };
         FillRect(hdc, &rect, background);
+        if selected && GetFocus() == panel.list {
+            // Keyboard focus must be visible and not colour-only (§14.2).
+            let mut border = rect;
+            let _ = FrameRect(hdc, &border, panel.brushes.accent);
+            border.left += 1;
+            border.top += 1;
+            border.right -= 1;
+            border.bottom -= 1;
+            let _ = FrameRect(hdc, &border, panel.brushes.accent);
+        }
         SetBkMode(hdc, TRANSPARENT);
     }
 
     let pad = scaled(12, panel.dpi);
+
+    // 36 px type icon: a tinted square with a letter, per PRD §14.3.
+    let icon_size = scaled(36, panel.dpi);
+    let icon_rect = RECT {
+        left: rect.left + pad,
+        top: rect.top + ((rect.bottom - rect.top) - icon_size) / 2,
+        right: rect.left + pad + icon_size,
+        bottom: rect.top + ((rect.bottom - rect.top) - icon_size) / 2 + icon_size,
+    };
+    unsafe {
+        FillRect(hdc, &icon_rect, panel.brushes.selected);
+        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.title.0));
+        SetTextColor(hdc, panel.palette.primary);
+        let mut glyph = platform::wide("T");
+        let mut glyph_rect = icon_rect;
+        DrawTextW(
+            hdc,
+            &mut glyph,
+            &mut glyph_rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        );
+        let _ = SelectObject(hdc, previous);
+    }
+    let text_left = icon_rect.right + scaled(10, panel.dpi);
 
     let title_highlight = panel
         .title_highlights
@@ -1904,7 +2198,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
         .copied()
         .flatten();
     let mut title_rect = RECT {
-        left: rect.left + pad,
+        left: text_left,
         top: rect.top + scaled(8, panel.dpi),
         right: rect.right - scaled(90, panel.dpi),
         bottom: rect.top + scaled(28, panel.dpi),
@@ -1917,7 +2211,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             &item.title,
             &mut title_rect,
             title_highlight,
-            rgb(0x22, 0x24, 0x3E),
+            panel.palette.heading,
         );
         let _ = SelectObject(hdc, previous);
     }
@@ -1928,7 +2222,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
         .copied()
         .flatten();
     let mut preview_rect = RECT {
-        left: rect.left + pad,
+        left: text_left,
         top: rect.top + scaled(30, panel.dpi),
         right: rect.right - scaled(12, panel.dpi),
         bottom: rect.bottom - scaled(6, panel.dpi),
@@ -1941,7 +2235,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             &item.content,
             &mut preview_rect,
             content_highlight,
-            rgb(0x77, 0x7D, 0x92),
+            panel.palette.secondary,
         );
         let _ = SelectObject(hdc, previous);
     }
@@ -1955,7 +2249,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     };
     unsafe {
         let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.small.0));
-        SetTextColor(hdc, rgb(0x76, 0x55, 0xE9));
+        SetTextColor(hdc, panel.palette.primary);
         DrawTextW(
             hdc,
             &mut tag,
@@ -1983,6 +2277,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
                 copy_only: None,
                 paste_mode: false,
                 keep_tabs: false,
+                hotkey_hint: String::new(),
             },
             false,
             false,

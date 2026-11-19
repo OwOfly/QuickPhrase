@@ -1,4 +1,4 @@
-# M0-3 panel smoke test
+﻿# M0-3 panel smoke test
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\panel-smoke.ps1 [-SkipBuild]
 
 param([switch]$SkipBuild)
@@ -112,6 +112,7 @@ if ([QPPanelSmoke]::GetForegroundWindow() -eq [IntPtr]::Zero) {
 # 2. show via hotkey message
 $env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
 $env:QUICKPHRASE_TEST_NO_INJECT = "1"
+$env:QUICKPHRASE_TEST_NO_ANIMATION = "1"
 $app = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Milliseconds 900
 $beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
@@ -158,7 +159,7 @@ Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $re
 Start-Sleep -Milliseconds 700
 Check "app exits 0" ($app.HasExited -and $app.ExitCode -eq 0) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "n/a" }))
 Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL -ErrorAction SilentlyContinue
-Remove-Item Env:QUICKPHRASE_TEST_NO_INJECT -ErrorAction SilentlyContinue
+Remove-Item Env:QUICKPHRASE_TEST_NO_INJECT, Env:QUICKPHRASE_TEST_NO_ANIMATION -ErrorAction SilentlyContinue
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize

@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, GetStockObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, TRANSPARENT,
+    CreateFontW, CreateSolidBrush, DeleteObject, FillRect, InvalidateRect, SetBkColor, SetBkMode,
+    SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH,
+    HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::GetDpiForSystem;
@@ -72,6 +72,7 @@ struct SettingsUi {
     status: HWND,
     font: HFONT,
     brush: HBRUSH,
+    palette: crate::theme::Palette,
     dpi: u32,
     capturing: bool,
     hotkey_candidate: String,
@@ -87,10 +88,6 @@ static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
 
 fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
-}
-
-fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF(r | (g << 8) | (b << 16))
 }
 
 fn make_font(dpi: u32) -> HFONT {
@@ -283,8 +280,7 @@ fn create_control(
 fn create() -> Option<SettingsUi> {
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
     let instance = HINSTANCE(module.0);
-    let class_brush =
-        unsafe { HBRUSH(GetStockObject(windows::Win32::Graphics::Gdi::WHITE_BRUSH).0) };
+    let palette = crate::theme::current();
     let class = WNDCLASSW {
         style: Default::default(),
         lpfnWndProc: Some(window_proc),
@@ -293,7 +289,7 @@ fn create() -> Option<SettingsUi> {
         hInstance: instance,
         hIcon: Default::default(),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-        hbrBackground: class_brush,
+        hbrBackground: HBRUSH::default(),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: CLASS,
     };
@@ -325,7 +321,7 @@ fn create() -> Option<SettingsUi> {
     .ok()?;
 
     let font = make_font(dpi);
-    let control_brush = unsafe { CreateSolidBrush(rgb(246, 247, 251)) };
+    let control_brush = unsafe { CreateSolidBrush(palette.page) };
     let hotkey_text = create_control(
         w!("STATIC"),
         "",
@@ -474,6 +470,7 @@ fn create() -> Option<SettingsUi> {
         cancel,
         status,
         font,
+        palette,
         brush: control_brush,
         dpi,
         capturing: false,
@@ -618,6 +615,17 @@ pub fn show() {
             }
         };
         if let Some(ui) = guard.as_mut() {
+            let palette = crate::theme::current();
+            if palette != ui.palette {
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+                }
+                ui.brush = unsafe { CreateSolidBrush(palette.page) };
+                ui.palette = palette;
+                unsafe {
+                    let _ = InvalidateRect(Some(ui.hwnd), None, true);
+                }
+            }
             load(ui);
             status(ui, "就绪");
         }
@@ -1036,23 +1044,62 @@ unsafe extern "system" fn window_proc(
             }
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC => {
+        WM_ERASEBKGND => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let mut rect = RECT::default();
             unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, rgb(0x55, 0x5B, 0x70));
+                let _ = GetClientRect(hwnd, &mut rect);
             }
             let brush = UI.with(|slot| {
                 slot.try_borrow()
                     .ok()
-                    .and_then(|guard| guard.as_ref().map(|ui| ui.brush.0 as isize))
-                    .unwrap_or(0)
+                    .and_then(|guard| guard.as_ref().map(|ui| ui.brush))
+                    .unwrap_or_default()
             });
-            if brush != 0 {
-                return LRESULT(brush);
+            if !brush.0.is_null() {
+                unsafe {
+                    FillRect(hdc, &rect, brush);
+                }
+                return LRESULT(1);
             }
-            let stock = unsafe { GetStockObject(windows::Win32::Graphics::Gdi::WHITE_BRUSH) };
-            LRESULT(stock.0 as isize)
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let (color, brush) = UI.with(|slot| {
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|ui| (ui.palette.secondary, ui.brush.0 as isize))
+                    })
+                    .unwrap_or((COLORREF(0), 0))
+            });
+            unsafe {
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, color);
+            }
+            LRESULT(brush)
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let (heading, field, brush) = UI.with(|slot| {
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard
+                            .as_ref()
+                            .map(|ui| (ui.palette.heading, ui.palette.field, ui.brush.0 as isize))
+                    })
+                    .unwrap_or((COLORREF(0), COLORREF(0), 0))
+            });
+            unsafe {
+                SetBkMode(hdc, TRANSPARENT);
+                SetBkColor(hdc, field);
+                SetTextColor(hdc, heading);
+            }
+            LRESULT(brush)
         }
         WM_CLOSE => {
             if QUIT_ON_CLOSE.load(Ordering::Relaxed) {

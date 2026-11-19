@@ -4,11 +4,12 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, GetStockObject, SetBkMode, SetTextColor,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, FrameRect,
+    InvalidateRect, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
@@ -92,8 +93,11 @@ struct Manage {
     cancel_button: HWND,
     status: HWND,
     fonts: Fonts,
-    brush: HBRUSH,
-    class_brush: HBRUSH,
+    palette: crate::theme::Palette,
+    page_brush: HBRUSH,
+    field_brush: HBRUSH,
+    error_brush: HBRUSH,
+    error_field: Option<i32>,
     dpi: u32,
     view: View,
     editing: Option<String>,
@@ -110,10 +114,6 @@ static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
 
 fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
-}
-
-fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF(r | (g << 8) | (b << 16))
 }
 
 fn make_font(size: i32, weight: i32, dpi: u32) -> HFONT {
@@ -249,11 +249,28 @@ fn reload_left(manage: &Manage) {
     unsafe {
         let _ = SendMessageW(manage.left, LB_RESETCONTENT, 0, 0);
     }
-    let mut items: Vec<(String, View)> = vec![("全部".to_string(), View::All)];
+    let active: Vec<&Snippet> = data
+        .snippets
+        .iter()
+        .filter(|snippet| snippet.deleted_at.is_none())
+        .collect();
+    let deleted = data
+        .snippets
+        .iter()
+        .filter(|snippet| snippet.deleted_at.is_some())
+        .count();
+    let mut items: Vec<(String, View)> = vec![(format!("全部 ({})", active.len()), View::All)];
     for category in &data.categories {
-        items.push((category.name.clone(), View::Category(category.id.clone())));
+        let count = active
+            .iter()
+            .filter(|snippet| snippet.category_id.as_deref() == Some(category.id.as_str()))
+            .count();
+        items.push((
+            format!("{} ({count})", category.name),
+            View::Category(category.id.clone()),
+        ));
     }
-    items.push(("回收站".to_string(), View::Recycle));
+    items.push((format!("回收站 ({deleted})"), View::Recycle));
     for (label, _) in &items {
         let wide = platform::wide(label);
         unsafe {
@@ -448,6 +465,17 @@ fn save_editor(manage: &mut Manage) {
         Some(Err(code)) => {
             let message = error_text(&code);
             status_message(manage, message);
+            manage.error_field = match code.as_str() {
+                "title_empty" | "title_too_long" | "duplicate_title" => Some(ID_TITLE),
+                "content_empty" | "content_too_long" => Some(ID_CONTENT),
+                "category_missing" => Some(ID_CATEGORY),
+                _ => None,
+            };
+            if manage.error_field.is_some() {
+                unsafe {
+                    let _ = InvalidateRect(Some(manage.hwnd), None, true);
+                }
+            }
             logging::warn(&format!("manage: save rejected ({code})"));
         }
         None => status_message(manage, "存储未初始化"),
@@ -692,7 +720,10 @@ fn create(owner: HWND) -> Option<Manage> {
         }
     };
     let instance = HINSTANCE(module.0);
-    let class_brush = unsafe { CreateSolidBrush(rgb(246, 247, 251)) };
+    let palette = crate::theme::current();
+    let page_brush = unsafe { CreateSolidBrush(palette.page) };
+    let field_brush = unsafe { CreateSolidBrush(palette.field) };
+    let error_brush = unsafe { CreateSolidBrush(palette.error) };
     let class = WNDCLASSW {
         style: Default::default(),
         lpfnWndProc: Some(window_proc),
@@ -701,7 +732,7 @@ fn create(owner: HWND) -> Option<Manage> {
         hInstance: instance,
         hIcon: Default::default(),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
-        hbrBackground: class_brush,
+        hbrBackground: HBRUSH::default(),
         lpszMenuName: PCWSTR::null(),
         lpszClassName: CLASS,
     };
@@ -882,8 +913,6 @@ fn create(owner: HWND) -> Option<Manage> {
         instance,
     );
 
-    let brush = unsafe { CreateSolidBrush(rgb(246, 247, 251)) };
-
     let mut manage = Manage {
         hwnd,
         left,
@@ -903,8 +932,11 @@ fn create(owner: HWND) -> Option<Manage> {
         cancel_button,
         status,
         fonts,
-        brush,
-        class_brush,
+        palette,
+        page_brush,
+        field_brush,
+        error_brush,
+        error_field: None,
         dpi,
         view: View::All,
         editing: None,
@@ -995,6 +1027,21 @@ pub fn show(owner: HWND) {
         let Some(manage) = guard.as_mut() else {
             return;
         };
+        let palette = crate::theme::current();
+        if palette != manage.palette {
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
+                let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
+            }
+            manage.page_brush = unsafe { CreateSolidBrush(palette.page) };
+            manage.field_brush = unsafe { CreateSolidBrush(palette.field) };
+            manage.error_brush = unsafe { CreateSolidBrush(palette.error) };
+            manage.palette = palette;
+            unsafe {
+                let _ = InvalidateRect(Some(manage.hwnd), None, true);
+            }
+        }
         unsafe {
             let _ = SetFocus(Some(manage.search));
         }
@@ -1043,8 +1090,9 @@ pub fn shutdown() {
         let _ = DestroyWindow(manage.hwnd);
         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
-        let _ = DeleteObject(HGDIOBJ(manage.brush.0));
-        let _ = DeleteObject(HGDIOBJ(manage.class_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
     }
 }
 
@@ -1357,6 +1405,12 @@ unsafe extern "system" fn window_proc(
                         load_editor(manage, id.as_deref());
                     }
                     ID_TITLE | ID_CONTENT if notification == EN_CHANGE => {
+                        if manage.error_field == Some(id as i32) {
+                            manage.error_field = None;
+                            unsafe {
+                                let _ = InvalidateRect(Some(manage.hwnd), None, true);
+                            }
+                        }
                         if !manage.loading {
                             manage.dirty = true;
                             status_message(manage, "未保存");
@@ -1379,33 +1433,136 @@ unsafe extern "system" fn window_proc(
             });
             LRESULT(0)
         }
-        WM_CTLCOLORSTATIC => {
+        WM_ERASEBKGND => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let mut rect = RECT::default();
             unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, rgb(0x55, 0x5B, 0x70));
+                let _ = GetClientRect(hwnd, &mut rect);
             }
             let brush = MANAGE.with(|slot| match slot.try_borrow() {
                 Ok(guard) => guard
                     .as_ref()
-                    .map(|manage| manage.brush.0 as isize)
-                    .unwrap_or(0),
-                Err(_) => 0,
+                    .map(|manage| manage.page_brush)
+                    .unwrap_or_default(),
+                Err(_) => HBRUSH::default(),
             });
-            if brush != 0 {
-                return LRESULT(brush);
+            if !brush.0.is_null() {
+                unsafe {
+                    FillRect(hdc, &rect, brush);
+                }
+                return LRESULT(1);
             }
-            let stock = unsafe { GetStockObject(windows::Win32::Graphics::Gdi::WHITE_BRUSH) };
-            LRESULT(stock.0 as isize)
+            LRESULT(0)
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX => {
+            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let (heading, secondary, page, field, field_color) =
+                MANAGE.with(|slot| match slot.try_borrow() {
+                    Ok(guard) => match guard.as_ref() {
+                        Some(manage) => (
+                            manage.palette.heading,
+                            manage.palette.secondary,
+                            manage.page_brush,
+                            manage.field_brush,
+                            manage.palette.field,
+                        ),
+                        None => (
+                            COLORREF(0),
+                            COLORREF(0),
+                            HBRUSH::default(),
+                            HBRUSH::default(),
+                            COLORREF(0),
+                        ),
+                    },
+                    Err(_) => (
+                        COLORREF(0),
+                        COLORREF(0),
+                        HBRUSH::default(),
+                        HBRUSH::default(),
+                        COLORREF(0),
+                    ),
+                });
+            unsafe {
+                SetBkMode(hdc, TRANSPARENT);
+            }
+            if message == WM_CTLCOLORLISTBOX {
+                unsafe {
+                    SetBkColor(hdc, field_color);
+                    SetTextColor(hdc, heading);
+                }
+                return LRESULT(field.0 as isize);
+            }
+            unsafe {
+                SetTextColor(hdc, secondary);
+            }
+            if !page.0.is_null() {
+                return LRESULT(page.0 as isize);
+            }
+            LRESULT(0)
         }
         WM_CTLCOLOREDIT => {
             let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
+            let (heading, field, field_color) = MANAGE.with(|slot| match slot.try_borrow() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(manage) => (
+                        manage.palette.heading,
+                        manage.field_brush,
+                        manage.palette.field,
+                    ),
+                    None => (COLORREF(0), HBRUSH::default(), COLORREF(0)),
+                },
+                Err(_) => (COLORREF(0), HBRUSH::default(), COLORREF(0)),
+            });
             unsafe {
                 SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, rgb(0x22, 0x24, 0x3E));
+                SetBkColor(hdc, field_color);
+                SetTextColor(hdc, heading);
             }
-            let stock = unsafe { GetStockObject(windows::Win32::Graphics::Gdi::WHITE_BRUSH) };
-            LRESULT(stock.0 as isize)
+            LRESULT(field.0 as isize)
+        }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            unsafe {
+                let hdc = BeginPaint(hwnd, &mut paint);
+                let (error_field, error_brush) = MANAGE.with(|slot| match slot.try_borrow() {
+                    Ok(guard) => match guard.as_ref() {
+                        Some(manage) => (manage.error_field, manage.error_brush),
+                        None => (None, HBRUSH::default()),
+                    },
+                    Err(_) => (None, HBRUSH::default()),
+                });
+                if let Some(id) = error_field {
+                    if let Ok(control) = GetDlgItem(Some(hwnd), id) {
+                        let mut rect = RECT::default();
+                        if GetWindowRect(control, &mut rect).is_ok() && !error_brush.0.is_null() {
+                            let mut top_left = POINT {
+                                x: rect.left,
+                                y: rect.top,
+                            };
+                            let mut bottom_right = POINT {
+                                x: rect.right,
+                                y: rect.bottom,
+                            };
+                            let _ = ScreenToClient(hwnd, &mut top_left);
+                            let _ = ScreenToClient(hwnd, &mut bottom_right);
+                            let mut frame = RECT {
+                                left: top_left.x - 2,
+                                top: top_left.y - 2,
+                                right: bottom_right.x + 2,
+                                bottom: bottom_right.y + 2,
+                            };
+                            let _ = FrameRect(hdc, &frame, error_brush);
+                            frame.left += 1;
+                            frame.top += 1;
+                            frame.right -= 1;
+                            frame.bottom -= 1;
+                            let _ = FrameRect(hdc, &frame, error_brush);
+                        }
+                    }
+                }
+                let _ = EndPaint(hwnd, &paint);
+            }
+            LRESULT(0)
         }
         WM_CLOSE => {
             let (should_close, had_dirty) = MANAGE.with(|slot| match slot.try_borrow() {
@@ -1450,8 +1607,9 @@ unsafe extern "system" fn window_proc(
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.body.0));
                         let _ = DeleteObject(HGDIOBJ(manage.fonts.title.0));
-                        let _ = DeleteObject(HGDIOBJ(manage.brush.0));
-                        let _ = DeleteObject(HGDIOBJ(manage.class_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.page_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
+                        let _ = DeleteObject(HGDIOBJ(manage.error_brush.0));
                     }
                 }
             });

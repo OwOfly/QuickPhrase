@@ -11,6 +11,7 @@ $log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -
 # The panel may open on a locked desktop; keep injection out of the smoke run.
 $env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
 $env:QUICKPHRASE_TEST_NO_INJECT = "1"
+$env:QUICKPHRASE_TEST_NO_ANIMATION = "1"
 
 Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
@@ -199,7 +200,7 @@ $results | Format-Table -AutoSize
 "--- tray log ---"
 $lines | Where-Object { $_ -match "tray|hotkey|second instance|exit" } | ForEach-Object { $_ }
 
-Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL, Env:QUICKPHRASE_TEST_NO_INJECT -ErrorAction SilentlyContinue
+Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL, Env:QUICKPHRASE_TEST_NO_INJECT, Env:QUICKPHRASE_TEST_NO_ANIMATION -ErrorAction SilentlyContinue
 
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"
