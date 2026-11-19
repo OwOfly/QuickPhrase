@@ -109,6 +109,20 @@ function Wait-Exit($Proc, [int]$TimeoutMs) {
     return $Proc.HasExited
 }
 
+# The panel may flash visible and lose activation on a locked desktop; poll
+# briefly instead of sampling once.
+function Wait-PanelVisible([int]$TimeoutMs) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $panel = Find-Class "QuickPhrase.Panel"
+        if ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) {
+            return $panel
+        }
+        Start-Sleep -Milliseconds 50
+    }
+    return [IntPtr]::Zero
+}
+
 $before = 0
 if (Test-Path $log) { $before = (Get-Item $log).Length }
 
@@ -146,8 +160,14 @@ Start-Sleep -Milliseconds 900
 $lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "second instance activation" ($text -match "second instance activation requested") ""
-$panel = Find-Class "QuickPhrase.Panel"
-Check "second instance opens the panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
+$panel = Wait-PanelVisible 3000
+Check "second instance opens the panel" ($panel -ne [IntPtr]::Zero) ""
+
+# Ensure the panel is open before checking that a later instance leaves it open.
+if ($panel -eq [IntPtr]::Zero -or -not [QPTray]::IsWindowVisible($panel)) {
+    [void][QPTray]::PostMessage($main, 0x0111, [IntPtr]1001, [IntPtr]::Zero)
+    $panel = Wait-PanelVisible 3000
+}
 
 $second2 = Start-Process -FilePath $exe -PassThru
 $second2Exited = Wait-Exit $second2 10000
