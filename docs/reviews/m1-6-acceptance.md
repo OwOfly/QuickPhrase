@@ -2,7 +2,7 @@
 
 - 范围：托盘菜单、暂停/恢复、第二实例、退出与资源释放
 - 依据：`docs/_ref/prd-v1.1.md` §14.6、`docs/_ref/final-plan.md` §8 M1-6
-- 复核：待独立复核
+- 复核：r1 glm/qwen PASS、kimi CHANGES_REQUIRED（F-01/F-02）→ r2 **三家 PASS**，S1–S11 全 CLOSED
 
 ## 已实现
 
@@ -27,6 +27,7 @@ pause releases the hotkey            True
 resume takes the hotkey again        True
 pause hotkey                         True
 resume hotkey                        True
+second instance exits                True exit=0
 second instance exits 0              True exit=0
 second instance activation           True
 second instance opens the panel      True
@@ -64,4 +65,6 @@ message loop ended                   True
 
 ## 结论
 
-托盘菜单、暂停/恢复、第二实例与退出释放已接入并通过自动冒烟；待复核后进入 M1-7 注入加固。
+托盘菜单、暂停/恢复、第二实例与退出释放已接入并通过自动冒烟（19/19，含真实热键与面板可见性探测）。r1/r2 发现全部闭环，**三家 r2 PASS，M1-6 过门，M1-7 可开。**
+
+残留：暂停不持久化；托盘气泡失败无降级；默认图标（M1-9）；真实鼠标菜单未自动化。`open_panel` 的置前受前台锁影响时仍可见但不保证聚焦（已记 qwen minor）。
