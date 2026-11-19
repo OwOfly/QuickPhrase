@@ -2141,7 +2141,7 @@ unsafe extern "system" fn window_proc(
                             panel.deferred_inactive = true;
                         }
                     });
-                } else {
+                } else if std::env::var_os("QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL").is_none() {
                     hide_only();
                 }
             } else {
