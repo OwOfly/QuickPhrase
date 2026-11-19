@@ -69,7 +69,12 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     let module = unsafe { GetModuleHandleW(None) }.unwrap_or_default();
     let instance = HINSTANCE(module.0);
 
-    let icon = unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default();
+    // Icon resource id 1 from app.rc; fall back to the system icon if missing.
+    let icon = unsafe {
+        LoadIconW(Some(instance), PCWSTR(1 as *const u16))
+            .or_else(|_| LoadIconW(None, IDI_APPLICATION))
+    }
+    .unwrap_or_default();
     let cursor = unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default();
 
     let window_class = WNDCLASSW {

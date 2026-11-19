@@ -2,3 +2,5 @@
 /review-input
 *.pdb
 *.ilk
+
+/dist

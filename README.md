@@ -1,6 +1,6 @@
 # QuickPhrase 快语
 
-Windows 桌面全局快捷短语输入器。当前进度：**M1-8 UI Spec**。
+Windows 桌面全局快捷短语输入器。当前进度：**M1-9 打包**。
 
 完整技术方案见 `docs/_ref/final-plan.md`（v4.1），需求见 `docs/_ref/prd-v1.1.md`。
 
@@ -30,7 +30,7 @@ Windows 桌面全局快捷短语输入器。当前进度：**M1-8 UI Spec**。
 - 注入加固：粘贴兼容模式（警示 + Ctrl+V）、剪贴板序列保护、长文本、UIA 连续超时降级、区域策略
 - UI Spec：统一主题令牌与浅/深/跟随系统、面板搜索图标/快捷键提示/设置与管理入口、36 px 类型图标、键盘焦点边框、120 ms 淡入、管理窗口分类计数与校验红框
 
-**尚未实现**：导入/导出、托盘气泡失败降级、暂停状态持久化、回收站 30 天清理、打包与签名（M1-9）。
+**尚未实现 / 已知限制**：导入/导出、托盘气泡失败降级、暂停状态持久化、回收站 30 天清理、代码签名；真实跨应用输入矩阵与 125/150/200% 视觉矩阵待交互桌面验证。
 
 ## 环境
 
@@ -44,7 +44,30 @@ Windows 桌面全局快捷短语输入器。当前进度：**M1-8 UI Spec**。
 cargo build --release
 ```
 
-产物：`target\release\quickphrase.exe`（当前约 155 KB）。
+产物：`target\release\quickphrase.exe`（当前约 490 KB，含图标与版本资源）。
+
+## 打包
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
+```
+
+产物在 `dist\`：
+
+- `QuickPhrase-<version>-win-x64.zip`（EXE + README + LICENSE）
+- `SHA256SUMS.txt`
+
+脚本会校验 zip ≤15 MB，并打印版本资源与打标签命令（`git tag v<version>`）。
+图标由 `scripts\make-icon.ps1` 生成，不需要外部素材。
+
+## 安装 / 卸载
+
+- 安装：解压 zip 到任意目录，运行 `QuickPhrase.exe`。无需管理员权限。
+- 开机启动：托盘「设置」→ 勾选「开机启动」；卸载前取消勾选或删除
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\QuickPhrase`。
+- 卸载：退出托盘程序，删除解压目录；如需清除数据，删除
+  `%LocalAppData%\QuickPhrase`（含短语、设置、备份与日志）。
+- 版本：EXE 内含文件版本 0.1.0、产品名与图标。
 
 ## 运行
 
@@ -115,31 +138,38 @@ src/
   main.rs          入口、CLI 参数
   app.rs           隐藏主窗口、消息循环、托盘菜单
   context.rs       原生窗口/进程/完整性/焦点快照
-  uia.rs           UI Automation 常驻线程、捕获、身份比对
+  uia.rs           UI Automation 常驻线程、捕获、身份比对、降级
   capture.rs       捕获编排、能力与区域判定、JSON 报告
-  panel.rs         快捷面板、搜索框、OwnerDraw 列表、定位与 DPI
-  inject.rs        输入策略、守卫、SendInput、三态结果、注入自测
-  clipboard.rs     纯文本剪贴板写入（只复制路径）
+  panel.rs         快捷面板、搜索、分类、高亮、定位与 DPI
+  inject.rs        输入策略、守卫、SendInput/粘贴、三态结果、注入自测
+  clipboard.rs     剪贴板快照、序列保护、恢复
+  storage.rs       数据/设置/规则持久化、CRUD、备份与恢复
+  search.rs        D16 打分、排序与命中区间
+  manage.rs        三栏管理窗口、CRUD、回收站、校验
+  settings_ui.rs   设置窗口、热键录制、启动项、剪贴板恢复
+  theme.rs         浅/深/跟随系统主题令牌与对比度校验
   foreground.rs    前台切换监听
   hotkey.rs        RegisterHotKey 封装
   single_instance.rs  命名互斥 + 第二实例唤起
   tray.rs          Shell_NotifyIcon 封装
   logging.rs       本地滚动日志
-  platform.rs      DPI、消息框、数据目录
+  platform.rs      DPI、消息框、数据目录、启动项
 scripts/smoke.ps1          M0-1 冒烟测试
 scripts/capture-smoke.ps1  M0-2 捕获冒烟测试
 scripts/panel-smoke.ps1    M0-3 面板冒烟测试
 scripts/inject-smoke.ps1   M0-4 注入自测
-docs/_ref/         方案、PRD、评审记录
+scripts/tray-smoke.ps1     M1-6 托盘冒烟
+scripts/make-icon.ps1      生成 assets/quickphrase.ico
+scripts/package.ps1        打包 zip 与 SHA256
+docs/_ref/         方案、PRD
+docs/reviews/      各里程碑验收与复核记录
 ```
 
-## 已知限制（M0-3 阶段）
+## 已知限制（V1）
 
-- 托盘使用系统默认应用图标，正式图标在 M1-9 打包阶段替换。
-- 热键目前是写死的 `Ctrl+Alt+Q`，设置界面在 M1-5。
-- 日志只记元数据，不记短语正文；捕获 JSON 会含 UIA 元素名称，仅本机诊断使用。
-- 焦点切换类反例（A→B→A、UIA 挂起）尚未在真实交互桌面验证，M0-5 补。
-- 面板列表是 3 条硬编码数据；存储与检索在 M1。
-- 本机桌面受 UIPI 限制，脚本用 `WM_HOTKEY` 消息驱动面板；真实热键已在手工测试中验证。
-- 跨应用注入矩阵尚未执行；M0-5 覆盖 Chrome、VS Code、Word、微信、终端等。
-- 剪贴板兼容输入模式与序列号保护在 M1-7。
+- 导入/导出、回收站 30 天自动清理、按应用输入模式未实现。
+- 暂停状态不持久化；托盘气泡失败无降级提示。
+- 代码签名未做，Windows 可能显示未知发布者。
+- 真实跨应用输入矩阵（Chrome/Word/VS Code/WeChat/终端）与 125/150/200% 视觉矩阵待交互桌面验证。
+- 浏览器多行、终端、未知区域固定只复制；粘贴模式也受同样区域限制。
+- 日志只记元数据，不记短语正文；捕获 JSON 含 UIA 元素名称，仅本机诊断使用。
