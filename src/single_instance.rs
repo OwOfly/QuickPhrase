@@ -33,15 +33,22 @@ pub fn activation_message() -> u32 {
     unsafe { RegisterWindowMessageW(ACTIVATION_MESSAGE) }
 }
 
-pub fn signal_existing() {
+pub fn signal_existing() -> bool {
     let message = activation_message();
     if message == 0 {
-        return;
+        return false;
     }
 
-    if let Ok(hwnd) = unsafe { FindWindowW(w!("QuickPhrase.MainWindow"), PCWSTR::null()) } {
-        unsafe {
-            let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0));
+    // The first instance may still be creating its window right after it took
+    // the mutex; retry briefly instead of losing the activation.
+    for _ in 0..40 {
+        if let Ok(hwnd) = unsafe { FindWindowW(w!("QuickPhrase.MainWindow"), PCWSTR::null()) } {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0));
+            }
+            return true;
         }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    false
 }

@@ -45,8 +45,11 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     let _mutex = match single_instance::acquire() {
         single_instance::Acquire::First(handle) => handle,
         single_instance::Acquire::AlreadyRunning => {
-            logging::warn("another instance is running; signalling it");
-            single_instance::signal_existing();
+            if single_instance::signal_existing() {
+                logging::info("signalled the running instance");
+            } else {
+                logging::warn("another instance is running but did not respond to activation");
+            }
             return 0;
         }
         single_instance::Acquire::Failed(code) => {
@@ -244,6 +247,9 @@ unsafe extern "system" fn window_proc(
         });
         let tip = if paused { TIP_PAUSED } else { TIP_NORMAL };
         let ok = tray::add(hwnd, icon, tip);
+        if !ok {
+            logging::error("TaskbarCreated: re-adding the tray icon failed");
+        }
         STATE.with(|state| state.borrow_mut().tray_ok = ok);
         return LRESULT(0);
     }
@@ -317,35 +323,68 @@ unsafe extern "system" fn window_proc(
     }
 }
 
+fn append_item(menu: HMENU, flags: MENU_ITEM_FLAGS, id: usize, text: PCWSTR, label: &str) {
+    if unsafe { AppendMenuW(menu, flags, id, text) }.is_err() {
+        logging::warn(&format!("tray menu: could not add {label}"));
+    }
+}
+
 unsafe fn show_menu(hwnd: HWND) {
-    let paused = STATE.with(|state| state.borrow().paused);
+    let (paused, hotkey_ok) = STATE.with(|state| {
+        let state = state.borrow();
+        (state.paused, state.hotkey_ok)
+    });
     let Ok(menu) = CreatePopupMenu() else {
+        logging::warn("tray menu: CreatePopupMenu failed");
         return;
     };
 
-    let _ = AppendMenuW(menu, MF_STRING, ID_OPEN as usize, w!("打开快捷面板"));
-    let _ = AppendMenuW(menu, MF_STRING, ID_MANAGE as usize, w!("管理短语"));
-    let _ = AppendMenuW(
+    append_item(
         menu,
         MF_STRING,
-        ID_PAUSE as usize,
-        if paused {
-            w!("恢复快捷键")
-        } else {
-            w!("暂停快捷键")
-        },
+        ID_OPEN as usize,
+        w!("打开快捷面板"),
+        "open",
     );
-    let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS as usize, w!("设置"));
-    let _ = AppendMenuW(
+    append_item(
+        menu,
+        MF_STRING,
+        ID_MANAGE as usize,
+        w!("管理短语"),
+        "manage",
+    );
+    let pause_label = if paused {
+        w!("恢复快捷键")
+    } else if !hotkey_ok {
+        w!("重试注册快捷键")
+    } else {
+        w!("暂停快捷键")
+    };
+    append_item(menu, MF_STRING, ID_PAUSE as usize, pause_label, "pause");
+    append_item(
+        menu,
+        MF_STRING,
+        ID_SETTINGS as usize,
+        w!("设置"),
+        "settings",
+    );
+    append_item(
         menu,
         MF_STRING,
         ID_RESTORE_CLIP as usize,
         w!("恢复上次剪贴板内容"),
+        "restore clipboard",
     );
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT as usize, w!("关于 QuickPhrase"));
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    let _ = AppendMenuW(menu, MF_STRING, ID_EXIT as usize, w!("退出"));
+    append_item(menu, MF_SEPARATOR, 0, PCWSTR::null(), "separator");
+    append_item(
+        menu,
+        MF_STRING,
+        ID_ABOUT as usize,
+        w!("关于 QuickPhrase"),
+        "about",
+    );
+    append_item(menu, MF_SEPARATOR, 0, PCWSTR::null(), "separator");
+    append_item(menu, MF_STRING, ID_EXIT as usize, w!("退出"), "exit");
 
     let mut point = POINT { x: 0, y: 0 };
     let _ = GetCursorPos(&mut point);
@@ -384,7 +423,7 @@ fn handle_command(id: u32) {
                         tray::balloon(
                             hwnd,
                             "QuickPhrase",
-                            "无法恢复：剪贴板已被其他程序修改或快照已失效",
+                            "无法恢复：剪贴板内容已变化（可能已恢复过，或被其他程序修改）",
                         );
                     }
                 }
@@ -550,12 +589,14 @@ fn panel_data(copy_only: Option<String>) -> panel::PanelData {
 }
 
 fn toggle_hotkey() {
-    let (hwnd, paused) = STATE.with(|state| {
+    let (hwnd, paused, hotkey_ok) = STATE.with(|state| {
         let state = state.borrow();
-        (state.hwnd, state.paused)
+        (state.hwnd, state.paused, state.hotkey_ok)
     });
 
-    if paused {
+    if paused || !hotkey_ok {
+        // Either the user is resuming, or startup registration failed and this
+        // entry retries it instead of pretending to pause an inactive hotkey.
         match hotkey::register_text(hwnd, &current_hotkey()) {
             Ok(_) => {
                 STATE.with(|state| {
@@ -564,13 +605,17 @@ fn toggle_hotkey() {
                     state.hotkey_ok = true;
                 });
                 tray::set_tip(hwnd, TIP_NORMAL);
-                logging::info("hotkey resumed");
+                logging::info(if paused {
+                    "hotkey resumed"
+                } else {
+                    "hotkey retry succeeded"
+                });
             }
             Err(code) => {
-                logging::error(&format!("resume hotkey failed: {code}"));
+                logging::error(&format!("register hotkey failed: {code}"));
                 platform::error_box(
                     "快捷键冲突",
-                    &format!("无法恢复 {}（错误码 {code}）。", current_hotkey()),
+                    &format!("无法注册 {}（错误码 {code}）。", current_hotkey()),
                 );
             }
         }
@@ -592,7 +637,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M1-5 设置）\n\
+             全局快捷短语输入器（M1-6 托盘）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()

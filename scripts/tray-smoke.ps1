@@ -31,12 +31,22 @@ public class QPTray {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder sb, int n);
   [DllImport("user32.dll", EntryPoint="PostMessageW")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint modifiers, uint vk);
+  [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
 }
 "@
 
 $results = New-Object System.Collections.Generic.List[object]
 function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
+}
+
+# Ctrl+Alt+Q under a temporary id: true only when no other process holds it.
+function Test-HotkeyFree {
+    $id = 49211
+    $free = [QPTray]::RegisterHotKey([IntPtr]::Zero, $id, 3, 0x51)
+    if ($free) { [void][QPTray]::UnregisterHotKey([IntPtr]::Zero, $id) }
+    return $free
 }
 
 function Find-Main {
@@ -69,12 +79,15 @@ if (Test-Path $log) { $lines = @(Get-Content $log -Encoding UTF8 | Select-Object
 $text = $lines -join "`n"
 Check "tray icon added" ($text -match "tray icon added") ""
 Check "hotkey registered" ($text -match "hotkey registered:") ""
+Check "hotkey is held while running" (-not (Test-HotkeyFree)) ""
 
 # Pause / resume
 [void][QPTray]::PostMessage($main, 0x0111, [IntPtr]1003, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 500
+Check "pause releases the hotkey" (Test-HotkeyFree) ""
 [void][QPTray]::PostMessage($main, 0x0111, [IntPtr]1003, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 500
+Check "resume takes the hotkey again" (-not (Test-HotkeyFree)) ""
 $lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
 $text = $lines -join "`n"
 Check "pause hotkey" ($text -match "hotkey paused") ""
@@ -93,10 +106,11 @@ Check "second instance activation" ($text -match "second instance activation req
 Start-Sleep -Milliseconds 1200
 $app.Refresh()
 Check "app exits 0" ($app.HasExited -and $app.ExitCode -eq 0) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "running" }))
+Check "hotkey released on exit" (Test-HotkeyFree) ""
 
 $lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
 $text = $lines -join "`n"
-Check "hotkey released" ($text -match "message loop ended") ""
+Check "message loop ended" ($text -match "message loop ended") ""
 
 if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
 

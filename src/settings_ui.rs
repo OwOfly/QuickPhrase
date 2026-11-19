@@ -849,7 +849,7 @@ unsafe extern "system" fn window_proc(
                                 if crate::clipboard::restore(&snapshot) {
                                     status(ui, "已恢复上次剪贴板内容");
                                 } else {
-                                    status(ui, "无法恢复：剪贴板已被其他程序修改或快照已失效");
+                                    status(ui, "无法恢复：剪贴板内容已变化（可能已恢复过，或被其他程序修改）");
                                 }
                             }
                             _ => status(ui, "没有可恢复的剪贴板内容"),
