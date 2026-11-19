@@ -440,13 +440,16 @@ impl Store {
         for snippet in &mut self.data.snippets {
             snippet.rebuild_blob();
         }
+        let previous_revision = self.data.revision;
         let next_revision = self.data.revision.max(read_hwm(&self.dir)) + 1;
         write_hwm(&self.dir, next_revision)?;
         self.data.revision = next_revision;
         match self.write_typed(DATA_FILE, &self.data, rotate_backup) {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.data.revision = next_revision - 1;
+                // Restore the pre-call value: the high-water mark may already
+                // be ahead, so `next_revision - 1` would leak an increment.
+                self.data.revision = previous_revision;
                 Err(err)
             }
         }
@@ -1108,6 +1111,18 @@ mod tests {
         let broken = Store::load_from(&dir);
         assert!(broken.is_read_only());
         assert_eq!(broken.notice(), Some("settings_recovery_failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_write_does_not_leak_revision() {
+        let dir = temp_dir("writefail");
+        let mut store = Store::load_from(&dir);
+        let before = store.data().revision;
+        // A directory at the temp path makes File::create fail deterministically.
+        fs::create_dir_all(dir.join(format!("{DATA_FILE}.tmp"))).unwrap();
+        assert!(store.save_data().is_err());
+        assert_eq!(store.data().revision, before);
         let _ = fs::remove_dir_all(&dir);
     }
 
