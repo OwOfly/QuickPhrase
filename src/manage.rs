@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Gdi::{
     DT_VCENTER, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -569,6 +569,7 @@ fn draw_list_row(
         return;
     }
     let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+    let focused = draw.itemState.0 & ODS_FOCUS.0 != 0;
     if selected {
         let mut pill = rect;
         pill.left += scaled(4, dpi);
@@ -579,6 +580,9 @@ fn draw_list_row(
         ui::fill_round(hdc, &pill, scaled(8, dpi), brush);
         unsafe {
             let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+        if focused {
+            ui::stroke_round(hdc, &pill, scaled(8, dpi), palette.primary, scaled(1, dpi));
         }
     }
     let mut buffer = [0u16; 256];
@@ -591,7 +595,8 @@ fn draw_list_row(
         )
     }
     .0;
-    let title = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
+    let length = length.clamp(0, buffer.len() as isize) as usize;
+    let title = String::from_utf16_lossy(&buffer[..length]);
     let mut text_rect = rect;
     text_rect.left += scaled(12, dpi);
     text_rect.right -= scaled(10, dpi);
@@ -1821,13 +1826,13 @@ unsafe extern "system" fn window_proc(
                         manage.dpi,
                     ),
                     None => (
-                        crate::theme::LIGHT,
+                        crate::theme::current(),
                         (HFONT::default(), HFONT::default(), HFONT::default()),
                         96,
                     ),
                 },
                 Err(_) => (
-                    crate::theme::LIGHT,
+                    crate::theme::current(),
                     (HFONT::default(), HFONT::default(), HFONT::default()),
                     96,
                 ),
@@ -1860,14 +1865,14 @@ unsafe extern "system" fn window_proc(
                         ),
                         None => (
                             [RECT::default(); 3],
-                            crate::theme::LIGHT,
+                            crate::theme::current(),
                             (HFONT::default(), HFONT::default()),
                             96,
                         ),
                     },
                     Err(_) => (
                         [RECT::default(); 3],
-                        crate::theme::LIGHT,
+                        crate::theme::current(),
                         (HFONT::default(), HFONT::default()),
                         96,
                     ),

@@ -15,16 +15,19 @@ use windows::Win32::Graphics::Gdi::{
     HBRUSH, HDC, HFONT, HGDIOBJ, NULL_BRUSH, NULL_PEN, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
 use windows::Win32::UI::Controls::{
-    SetWindowTheme, DRAWITEMSTRUCT, EM_SETCUEBANNER, ODS_COMBOBOXEDIT, ODS_DISABLED, ODS_SELECTED,
-    WM_MOUSELEAVE,
+    SetWindowTheme, DRAWITEMSTRUCT, EM_SETCUEBANNER, ODS_COMBOBOXEDIT, ODS_DISABLED, ODS_FOCUS,
+    ODS_SELECTED, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, GetClientRect, GetWindowLongPtrW, GetWindowTextW,
     SendMessageW, SetWindowLongPtrW, CB_GETCOUNT, CB_GETLBTEXT, GWLP_WNDPROC, WM_GETFONT,
-    WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT,
+    WM_KILLFOCUS, WM_MOUSEMOVE, WM_NCDESTROY, WM_PAINT, WM_SETFOCUS,
 };
 
 use crate::theme::Palette;
@@ -132,11 +135,16 @@ pub fn install_button(hwnd: HWND) {
             return;
         }
         OLD_PROCS.with(|map| map.borrow_mut().insert(key, old));
-        SetWindowLongPtrW(
+        let previous = SetWindowLongPtrW(
             hwnd,
             GWLP_WNDPROC,
             button_proc as *const () as usize as isize,
         );
+        if previous != old {
+            OLD_PROCS.with(|map| {
+                map.borrow_mut().remove(&key);
+            });
+        }
     }
 }
 
@@ -147,6 +155,9 @@ unsafe extern "system" fn button_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let key = hwnd.0 as isize;
+    let old = OLD_PROCS
+        .with(|map| map.borrow().get(&key).copied())
+        .unwrap_or(0);
     match message {
         WM_MOUSEMOVE => {
             let first = HOVERED.with(|set| set.borrow_mut().insert(key));
@@ -167,26 +178,24 @@ unsafe extern "system" fn button_proc(
             });
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
-        WM_NCDESTROY => {
-            HOVERED.with(|set| {
-                set.borrow_mut().remove(&key);
-            });
-            OLD_PROCS.with(|map| {
-                map.borrow_mut().remove(&key);
-            });
-        }
         _ => {}
     }
 
-    let old = OLD_PROCS
-        .with(|map| map.borrow().get(&key).copied())
-        .unwrap_or(0);
     if old == 0 {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
     let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
         std::mem::transmute(old);
-    CallWindowProcW(Some(proc), hwnd, message, wparam, lparam)
+    let result = CallWindowProcW(Some(proc), hwnd, message, wparam, lparam);
+    if message == WM_NCDESTROY {
+        HOVERED.with(|set| {
+            set.borrow_mut().remove(&key);
+        });
+        OLD_PROCS.with(|map| {
+            map.borrow_mut().remove(&key);
+        });
+    }
+    result
 }
 
 /// Subclass a combo box so its drop-down button follows the theme instead of
@@ -206,11 +215,16 @@ pub fn install_combo(hwnd: HWND) {
             return;
         }
         COMBO_PROCS.with(|map| map.borrow_mut().insert(key, old));
-        SetWindowLongPtrW(
+        let previous = SetWindowLongPtrW(
             hwnd,
             GWLP_WNDPROC,
             combo_proc as *const () as usize as isize,
         );
+        if previous != old {
+            COMBO_PROCS.with(|map| {
+                map.borrow_mut().remove(&key);
+            });
+        }
     }
 }
 
@@ -232,6 +246,10 @@ unsafe extern "system" fn combo_proc(
     let result = CallWindowProcW(Some(proc), hwnd, message, wparam, lparam);
     if message == WM_PAINT {
         paint_combo_arrow(hwnd);
+        paint_combo_focus(hwnd);
+    }
+    if message == WM_SETFOCUS || message == WM_KILLFOCUS {
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 
     if message == WM_NCDESTROY {
@@ -240,6 +258,34 @@ unsafe extern "system" fn combo_proc(
         });
     }
     result
+}
+
+fn paint_combo_focus(hwnd: HWND) {
+    // The closed display's WM_DRAWITEM has no ODS_FOCUS, so detect focus here.
+    if unsafe { GetFocus() } != hwnd {
+        return;
+    }
+    let palette = crate::theme::current();
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = if dpi == 0 { 96 } else { dpi };
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rect);
+    }
+    let inset = scaled(2, dpi);
+    let ring = RECT {
+        left: rect.left + inset,
+        top: rect.top + inset,
+        right: rect.right - inset,
+        bottom: rect.bottom - inset,
+    };
+    if ring.right > ring.left && ring.bottom > ring.top {
+        unsafe {
+            let hdc = GetDC(Some(hwnd));
+            stroke_round(hdc, &ring, scaled(4, dpi), palette.primary, scaled(2, dpi));
+            let _ = ReleaseDC(Some(hwnd), hdc);
+        }
+    }
 }
 
 fn paint_combo_arrow(hwnd: HWND) {
@@ -305,6 +351,7 @@ pub fn draw_button(
     let radius = round_radius(dpi, height);
     let pressed = draw.itemState.0 & ODS_SELECTED.0 != 0;
     let disabled = draw.itemState.0 & ODS_DISABLED.0 != 0;
+    let focused = draw.itemState.0 & ODS_FOCUS.0 != 0;
     let hover = hovered(draw.hwndItem);
 
     let (fill, border, text) = match kind {
@@ -312,6 +359,9 @@ pub fn draw_button(
             let fill = if disabled {
                 palette.border
             } else if pressed || hover {
+                palette.primary_active
+            } else if palette.dark {
+                // #7A58E8 keeps white text at 4.79:1; #8B6CF2 is 3.80:1.
                 palette.primary_hover
             } else {
                 palette.primary
@@ -334,12 +384,12 @@ pub fn draw_button(
             let border = if disabled {
                 palette.border
             } else {
-                palette.error
+                palette.danger
             };
             let text = if disabled {
                 palette.secondary
             } else {
-                palette.error
+                palette.danger
             };
             (fill, border, text)
         }
@@ -373,6 +423,20 @@ pub fn draw_button(
         inset.right -= 1;
         inset.bottom -= 1;
         stroke_round(hdc, &inset, radius, border, 1);
+    }
+    if focused && !disabled {
+        let ring = scaled(3, dpi);
+        let mut inset = rect;
+        inset.left += ring;
+        inset.top += ring;
+        inset.right -= ring;
+        inset.bottom -= ring;
+        let color = if kind == ButtonKind::Primary {
+            COLORREF(0xFFFFFF)
+        } else {
+            palette.primary
+        };
+        stroke_round(hdc, &inset, (radius - ring).max(2), color, scaled(2, dpi));
     }
 
     let mut buffer = [0u16; 128];
@@ -412,6 +476,7 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, font: 
     let closed = draw.itemState.0 & ODS_COMBOBOXEDIT.0 != 0;
     let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
     let disabled = draw.itemState.0 & ODS_DISABLED.0 != 0;
+    let focused = draw.itemState.0 & ODS_FOCUS.0 != 0;
     let fill = if selected && !closed {
         palette.selection
     } else {
@@ -421,6 +486,29 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, font: 
         let brush = CreateSolidBrush(fill);
         FillRect(hdc, &rect, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
+    }
+    if selected && !closed {
+        // A left accent bar keeps selection visible without relying on fill
+        // colour alone.
+        let bar = RECT {
+            left: rect.left + scaled(2, dpi),
+            top: rect.top + scaled(5, dpi),
+            right: rect.left + scaled(5, dpi),
+            bottom: rect.bottom - scaled(5, dpi),
+        };
+        unsafe {
+            let brush = CreateSolidBrush(palette.primary);
+            FillRect(hdc, &bar, brush);
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
+    }
+    if focused {
+        let mut inset = rect;
+        inset.left += scaled(2, dpi);
+        inset.top += scaled(2, dpi);
+        inset.right -= scaled(2, dpi);
+        inset.bottom -= scaled(2, dpi);
+        stroke_round(hdc, &inset, scaled(4, dpi), palette.primary, 1);
     }
     if draw.itemID == u32::MAX {
         return;
@@ -461,6 +549,9 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, font: 
 pub fn set_dark_mode(dark: bool) {
     type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
     type FlushMenuThemes = unsafe extern "system" fn();
+    if !dark_ordinals_supported() {
+        return;
+    }
     let module = uxtheme();
     if module.0.is_null() {
         return;
@@ -475,6 +566,30 @@ pub fn set_dark_mode(dark: bool) {
             flush();
         }
     }
+}
+
+/// The uxtheme ordinals used here only exist from Windows 10 1809 (17763).
+/// Older builds can export those slots for something else, so gate by build.
+fn dark_ordinals_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| unsafe {
+        type RtlGetVersion = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+        let Ok(module) = LoadLibraryW(windows::core::w!("ntdll.dll")) else {
+            return false;
+        };
+        let Some(proc) = GetProcAddress(module, windows::core::s!("RtlGetVersion")) else {
+            return false;
+        };
+        let get_version: RtlGetVersion = std::mem::transmute(proc);
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        if get_version(&mut info) != 0 {
+            return false;
+        }
+        (info.dwMajorVersion > 10) || (info.dwMajorVersion == 10 && info.dwBuildNumber >= 17763)
+    })
 }
 
 fn uxtheme() -> HMODULE {
@@ -493,6 +608,7 @@ pub fn theme_control(hwnd: HWND, dark: bool) {
     if hwnd.0.is_null() {
         return;
     }
+    let dark = dark && dark_ordinals_supported();
     type AllowDarkModeForWindow =
         unsafe extern "system" fn(HWND, windows::core::BOOL) -> windows::core::BOOL;
     let module = uxtheme();
@@ -518,6 +634,7 @@ pub fn theme_scrollbar(hwnd: HWND, dark: bool) {
     if hwnd.0.is_null() {
         return;
     }
+    let dark = dark && dark_ordinals_supported();
     let name = if dark {
         windows::core::w!("DarkMode_Explorer")
     } else {
@@ -531,6 +648,7 @@ pub fn theme_combo(hwnd: HWND, dark: bool) {
     if hwnd.0.is_null() {
         return;
     }
+    let dark = dark && dark_ordinals_supported();
     let name = if dark {
         windows::core::w!("DarkMode_CFD")
     } else {

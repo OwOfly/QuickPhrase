@@ -666,7 +666,15 @@ fn create() -> Option<SettingsUi> {
     Some(ui)
 }
 
-fn fill_tab_items(ui: &SettingsUi, paste_mode: bool) {
+fn relayout(ui: &mut SettingsUi) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(ui.hwnd, &mut rect);
+    }
+    layout(ui, rect.right, rect.bottom);
+}
+
+fn fill_tab_items(ui: &mut SettingsUi, paste_mode: bool) {
     if paste_mode {
         add_combo_items(
             ui.tab_policy,
@@ -675,6 +683,8 @@ fn fill_tab_items(ui: &SettingsUi, paste_mode: bool) {
     } else {
         add_combo_items(ui.tab_policy, &["Tab 转 4 空格（Unicode 模式固定）"]);
     }
+    // The combo's window height depends on its item count.
+    relayout(ui);
 }
 
 fn load(ui: &mut SettingsUi) {
@@ -716,6 +726,8 @@ fn load(ui: &mut SettingsUi) {
         );
     }
     set_text(ui.data_dir, &platform::data_dir().display().to_string());
+    // `load` fills the insertion combo after the initial layout.
+    relayout(ui);
     ui.loading = false;
 }
 
@@ -1028,7 +1040,9 @@ unsafe extern "system" fn window_proc(
                     ui.lbl_insertion,
                     ui.lbl_tab,
                     ui.lbl_theme,
+                    ui.lbl_startup,
                     ui.lbl_data,
+                    ui.lbl_clipboard,
                     ui.hotkey_record,
                     ui.insertion,
                     ui.tab_policy,
@@ -1298,7 +1312,7 @@ unsafe extern "system" fn window_proc(
                 slot.try_borrow()
                     .ok()
                     .and_then(|guard| guard.as_ref().map(|ui| (ui.palette, ui.dpi, ui.font)))
-                    .unwrap_or((crate::theme::LIGHT, 96, HFONT::default()))
+                    .unwrap_or((crate::theme::current(), 96, HFONT::default()))
             });
             if matches!(draw.CtlID as i32, ID_INSERTION | ID_TAB_POLICY | ID_THEME) {
                 ui::draw_combo_item(draw, palette, dpi, font);
@@ -1326,7 +1340,7 @@ unsafe extern "system" fn window_proc(
                     slot.try_borrow()
                         .ok()
                         .and_then(|guard| guard.as_ref().map(|ui| (ui.card, ui.palette, ui.dpi)))
-                        .unwrap_or((RECT::default(), crate::theme::LIGHT, 96))
+                        .unwrap_or((RECT::default(), crate::theme::current(), 96))
                 });
                 if card.right > card.left && card.bottom > card.top {
                     ui::card(hdc, &card, palette, dpi);

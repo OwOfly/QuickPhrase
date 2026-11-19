@@ -22,11 +22,16 @@ pub struct Palette {
     pub selection: COLORREF,
     pub primary: COLORREF,
     pub primary_hover: COLORREF,
+    /// Pressed/hover fill where white button text must keep >=4.5:1.
+    pub primary_active: COLORREF,
     pub highlight: COLORREF,
     pub highlight_text: COLORREF,
     pub success: COLORREF,
     pub warning: COLORREF,
     pub error: COLORREF,
+    /// Destructive-button text/border; darker than `error` so white cards
+    /// keep >=4.5:1.
+    pub danger: COLORREF,
     /// Background used by inputs (search box, edits).
     pub field: COLORREF,
 }
@@ -45,11 +50,13 @@ pub const LIGHT: Palette = Palette {
     selection: c(0xF0, 0xED, 0xFF),
     primary: c(0x76, 0x55, 0xE9),
     primary_hover: c(0x5E, 0x45, 0xD7),
+    primary_active: c(0x5E, 0x45, 0xD7),
     highlight: c(0xFF, 0xF1, 0xB8),
     highlight_text: c(0x4A, 0x2C, 0xB8),
     success: c(0x22, 0xC5, 0x5E),
     warning: c(0xF5, 0x9E, 0x0B),
     error: c(0xEF, 0x44, 0x44),
+    danger: c(0xC6, 0x28, 0x28),
     field: c(0xF1, 0xF2, 0xF9),
 };
 
@@ -63,11 +70,13 @@ pub const DARK: Palette = Palette {
     selection: c(0x2A, 0x24, 0x50),
     primary: c(0x8B, 0x6C, 0xF2),
     primary_hover: c(0x7A, 0x58, 0xE8),
+    primary_active: c(0x6D, 0x4A, 0xD8),
     highlight: c(0x4B, 0x3D, 0x12),
     highlight_text: c(0xFF, 0xE9, 0xA8),
     success: c(0x4A, 0xDE, 0x80),
     warning: c(0xFB, 0xBF, 0x24),
     error: c(0xF8, 0x71, 0x71),
+    danger: c(0xF8, 0x71, 0x71),
     field: c(0x23, 0x26, 0x34),
 };
 
@@ -137,7 +146,7 @@ fn luminance(color: COLORREF) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{contrast_ratio, resolve, DARK, LIGHT};
+    use super::{contrast_ratio, resolve, COLORREF, DARK, LIGHT};
 
     #[test]
     fn explicit_preferences_resolve() {
@@ -177,6 +186,19 @@ mod tests {
             assert!(
                 contrast_ratio(palette.secondary, palette.page) >= 3.0,
                 "secondary on page"
+            );
+            let button_fill = if palette.dark {
+                palette.primary_hover
+            } else {
+                palette.primary
+            };
+            assert!(
+                contrast_ratio(COLORREF(0xFFFFFF), button_fill) >= 4.5,
+                "white primary-button text"
+            );
+            assert!(
+                contrast_ratio(palette.danger, palette.card) >= 4.5,
+                "danger button text"
             );
         }
     }

@@ -412,6 +412,10 @@ fn present(
                 destroy_brushes(&panel.brushes);
                 panel.brushes = make_brushes(palette);
                 panel.palette = palette;
+                // Native edit/list chrome is not driven by brushes.
+                ui::set_dark_mode(palette.dark);
+                ui::theme_control(panel.edit, palette.dark);
+                ui::theme_control(panel.list, palette.dark);
             }
         }
         panel.report = report;
@@ -2277,6 +2281,9 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 
     unsafe {
         let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+        // Clear the whole row: the pill is inset, so the corners must still be
+        // the current card colour after a theme switch.
+        FillRect(hdc, &rect, panel.brushes.background);
         if selected {
             let mut pill = rect;
             pill.left += scaled(4, panel.dpi);
@@ -2294,8 +2301,6 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
                     scaled(1, panel.dpi),
                 );
             }
-        } else {
-            FillRect(hdc, &rect, panel.brushes.background);
         }
         SetBkMode(hdc, TRANSPARENT);
     }
