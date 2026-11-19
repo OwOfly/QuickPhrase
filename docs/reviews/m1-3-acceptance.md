@@ -2,7 +2,7 @@
 
 - 范围：分类栏、空态、只读态、捕获失败仅复制态、关键词高亮
 - 依据：`docs/_ref/prd-v1.1.md` §14.3、`docs/_ref/final-plan.md` §8 M1-3
-- 复核：待独立复核
+- 复核：r1 三家 CHANGES_REQUIRED → r2 glm/qwen PASS、kimi 单点 → r3 **glm PASS、qwen PASS、kimi S1–S3 CLOSED（S4 因脚本打包路径缺失记 INCOMPLETE，diff 已证）**
 
 ## 已实现
 
@@ -59,4 +59,6 @@ panel filter: matches=0
 
 ## 结论
 
-M1-3 的分类、空态、只读态、仅复制态与高亮已接入；r1 三家发现已修（焦点、命中字体、空态可见性、剪贴板快照、能力失败分流）。待 r2 复核后进入 M1-4 管理窗口。
+M1-3 的分类、空态、只读态、仅复制态与高亮已接入。r1/r2 发现全部闭环，r3 两家 PASS、kimi 仅因 `panel-smoke.ps1` 打包在快照根而非 `scripts/` 目录记 INCOMPLETE（内容已由 diff 复核）。**M1-3 过门，M1-4 可开。**
+
+残留：分类横向滚动、类型/搜索图标、快捷键提示、分类键盘访问归 M1-8；剪贴板恢复入口归 M1-5；仅复制真实捕获失败 E2E 待解锁桌面。
