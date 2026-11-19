@@ -115,7 +115,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         }
     };
 
-    let activate_message = unsafe { RegisterWindowMessageW(w!("QuickPhrase.Activate")) };
+    let activate_message = single_instance::activation_message();
     let taskbar_message = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
 
     STATE.with(|state| {
@@ -440,6 +440,14 @@ fn handle_command(id: u32) {
         }
         ID_ABOUT => about(),
         ID_EXIT => {
+            if panel::is_injecting() {
+                logging::warn("exit deferred: injection in flight");
+                let hwnd = STATE.with(|state| state.borrow().hwnd);
+                if !hwnd.0.is_null() {
+                    tray::balloon(hwnd, "QuickPhrase", "正在输入，请稍候再退出");
+                }
+                return;
+            }
             if !manage::confirm_exit() {
                 return;
             }

@@ -72,8 +72,45 @@ function Find-Class([string]$Class) {
 
 function Find-Main { return Find-Class "QuickPhrase.MainWindow" }
 
+# Read only what the app appended since $offset bytes. A rotated/truncated file
+# falls back to a full read instead of producing a false negative. The log is
+# opened read/write by the app, so share both modes.
+function Read-NewLog([long]$Offset, [string]$Path) {
+    if (-not (Test-Path $Path)) { return @() }
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $length = $stream.Length
+        $start = 0
+        if ($length -gt $Offset) { $start = [int]$Offset }
+        if ($length -le $start) { return @() }
+        $count = [int]($length - $start)
+        $bytes = New-Object byte[] $count
+        [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
+        $read = 0
+        while ($read -lt $count) {
+            $n = $stream.Read($bytes, $read, $count - $read)
+            if ($n -le 0) { break }
+            $read += $n
+        }
+        $text = [Text.Encoding]::UTF8.GetString($bytes, 0, $read)
+        return @($text -split "`r?`n")
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Wait-Exit($Proc, [int]$TimeoutMs) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while (-not $Proc.HasExited -and [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 100
+        $Proc.Refresh()
+    }
+    return $Proc.HasExited
+}
+
 $before = 0
-if (Test-Path $log) { $before = (Get-Content $log).Count }
+if (Test-Path $log) { $before = (Get-Item $log).Length }
 
 $app = Start-Process -FilePath $exe -PassThru
 Start-Sleep -Milliseconds 1500
@@ -81,8 +118,7 @@ $main = Find-Main
 Check "app running" (-not $app.HasExited) ("pid=" + $app.Id)
 Check "main window exists" ($main -ne [IntPtr]::Zero) ""
 
-$lines = @()
-if (Test-Path $log) { $lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before) }
+$lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "tray icon added" ($text -match "tray icon added") ""
 Check "hotkey registered" ($text -match "hotkey registered:") ""
@@ -95,22 +131,28 @@ Check "pause releases the hotkey" (Test-HotkeyFree) ""
 [void][QPTray]::PostMessage($main, 0x0111, [IntPtr]1003, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 500
 Check "resume takes the hotkey again" (-not (Test-HotkeyFree)) ""
-$lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
+$lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "pause hotkey" ($text -match "hotkey paused") ""
 Check "resume hotkey" ($text -match "hotkey resumed") ""
 
 # Second instance opens the panel and exits; a second run must not close it.
-$second = Start-Process -FilePath $exe -PassThru -Wait
+$second = Start-Process -FilePath $exe -PassThru
+$secondExited = Wait-Exit $second 10000
+Check "second instance exits" $secondExited ("exit=" + $(if ($second.HasExited) { $second.ExitCode } else { "running" }))
+Check "second instance exits 0" ($second.HasExited -and $second.ExitCode -eq 0) ("exit=" + $(if ($second.HasExited) { $second.ExitCode } else { "running" }))
+if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force }
 Start-Sleep -Milliseconds 900
-Check "second instance exits 0" ($second.ExitCode -eq 0) ("exit=" + $second.ExitCode)
-$lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
+$lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "second instance activation" ($text -match "second instance activation requested") ""
 $panel = Find-Class "QuickPhrase.Panel"
 Check "second instance opens the panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
 
-$second2 = Start-Process -FilePath $exe -PassThru -Wait
+$second2 = Start-Process -FilePath $exe -PassThru
+$second2Exited = Wait-Exit $second2 10000
+Check "second instance (panel open) exits 0" ($second2Exited -and $second2.ExitCode -eq 0) ("exit=" + $(if ($second2.HasExited) { $second2.ExitCode } else { "running" }))
+if (-not $second2.HasExited) { Stop-Process -Id $second2.Id -Force }
 Start-Sleep -Milliseconds 900
 $panel = Find-Class "QuickPhrase.Panel"
 Check "second instance keeps an open panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
@@ -126,7 +168,7 @@ $app.Refresh()
 Check "app exits 0" ($app.HasExited -and $app.ExitCode -eq 0) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "running" }))
 Check "hotkey released on exit" (Test-HotkeyFree) ""
 
-$lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
+$lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "message loop ended" ($text -match "message loop ended") ""
 
