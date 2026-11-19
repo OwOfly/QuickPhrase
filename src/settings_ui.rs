@@ -584,13 +584,24 @@ fn load(ui: &mut SettingsUi) {
 }
 
 pub fn show() {
-    let needs_create = UI.with(|slot| slot.borrow().is_none());
+    let needs_create = UI.with(|slot| match slot.try_borrow() {
+        Ok(guard) => guard.is_none(),
+        Err(_) => false,
+    });
     if needs_create {
         if let Some(ui) = create() {
-            UI.with(|slot| *slot.borrow_mut() = Some(ui));
+            UI.with(|slot| {
+                if let Ok(mut guard) = slot.try_borrow_mut() {
+                    *guard = Some(ui);
+                }
+            });
         }
     }
-    let hwnd = UI.with(|slot| slot.borrow().as_ref().map(|ui| ui.hwnd));
+    let hwnd = UI.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|ui| ui.hwnd))
+    });
     let Some(hwnd) = hwnd else {
         return;
     };
@@ -599,7 +610,14 @@ pub fn show() {
         let _ = SetForegroundWindow(hwnd);
     }
     UI.with(|slot| {
-        if let Some(ui) = slot.borrow_mut().as_mut() {
+        let mut guard = match slot.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => {
+                logging::warn("settings: window is busy (modal dialog?)");
+                return;
+            }
+        };
+        if let Some(ui) = guard.as_mut() {
             load(ui);
             status(ui, "就绪");
         }
@@ -618,7 +636,13 @@ pub fn show_test() -> bool {
 }
 
 pub fn shutdown() {
-    let ui = UI.with(|slot| slot.borrow_mut().take());
+    let ui = UI.with(|slot| match slot.try_borrow_mut() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => {
+            logging::warn("settings: shutdown skipped while a dialog is open");
+            None
+        }
+    });
     let Some(ui) = ui else {
         return;
     };
@@ -871,9 +895,9 @@ unsafe extern "system" fn window_proc(
         }
         WM_KEYDOWN | WM_SYSKEYDOWN
             if UI.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|ui| ui.capturing)
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|ui| ui.capturing))
                     .unwrap_or(false)
             }) =>
         {
@@ -889,6 +913,7 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            let mut ask_paste_warning = false;
             UI.with(|slot| {
                 let mut guard = match slot.try_borrow_mut() {
                     Ok(guard) => guard,
@@ -927,35 +952,13 @@ unsafe extern "system" fn window_proc(
                             return;
                         }
                         if combo_index(ui.insertion) == 1 {
-                            let text = platform::wide(
-                                "粘贴模式会用 Ctrl+V 插入，并替换当前剪贴板。\n\
-                                 原纯文本内容可在托盘恢复；非文本内容无法恢复。\n\
-                                 终端、未知区域与多行文本仍只会复制，不会粘贴。\n\n\
-                                 启用粘贴模式吗？",
-                            );
-                            let caption = platform::wide("QuickPhrase 粘贴模式");
-                            let answer = unsafe {
-                                MessageBoxW(
-                                    Some(ui.hwnd),
-                                    PCWSTR(text.as_ptr()),
-                                    PCWSTR(caption.as_ptr()),
-                                    MB_YESNO | MB_ICONWARNING,
-                                )
-                            };
-                            if answer != IDYES {
-                                set_combo(ui.insertion, 0);
-                                fill_tab_items(ui, false);
-                                set_combo(ui.tab_policy, 0);
-                                status(ui, "未启用粘贴模式");
-                                return;
-                            }
-                            fill_tab_items(ui, true);
-                            set_combo(ui.tab_policy, 0);
+                            // Ask outside this borrow: MessageBoxW pumps messages.
+                            ask_paste_warning = true;
                         } else {
                             fill_tab_items(ui, false);
                             set_combo(ui.tab_policy, 0);
+                            status(ui, "未保存：已选择 Unicode");
                         }
-                        status(ui, "未保存：粘贴模式会替换剪贴板");
                     }
                     ID_TAB_POLICY | ID_THEME if notification == CBN_SELCHANGE => {
                         if !ui.loading {
@@ -970,6 +973,64 @@ unsafe extern "system" fn window_proc(
                     _ => {}
                 }
             });
+
+            if ask_paste_warning {
+                let text = platform::wide(
+                    "粘贴模式会用 Ctrl+V 插入，并替换当前剪贴板。\n\
+                     原纯文本内容可在托盘恢复；非文本内容无法恢复。\n\
+                     终端、未知区域与多行文本仍只会复制，不会粘贴。\n\n\
+                     启用粘贴模式吗？",
+                );
+                let caption = platform::wide("QuickPhrase 粘贴模式");
+                let answer = unsafe {
+                    MessageBoxW(
+                        Some(hwnd),
+                        PCWSTR(text.as_ptr()),
+                        PCWSTR(caption.as_ptr()),
+                        MB_YESNO | MB_ICONWARNING,
+                    )
+                };
+                let persisted = storage::settings_clone().unwrap_or_default();
+                let persisted_paste = persisted.insertion_mode == "paste";
+                UI.with(|slot| {
+                    let mut guard = match slot.try_borrow_mut() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            logging::warn(
+                                "settings: window closed while the paste warning was open",
+                            );
+                            return;
+                        }
+                    };
+                    let Some(ui) = guard.as_mut() else {
+                        return;
+                    };
+                    if answer != IDYES {
+                        set_combo(ui.insertion, if persisted_paste { 1 } else { 0 });
+                        fill_tab_items(ui, persisted_paste);
+                        set_combo(
+                            ui.tab_policy,
+                            if persisted_paste && persisted.tab_policy == "tab" {
+                                1
+                            } else {
+                                0
+                            },
+                        );
+                        status(
+                            ui,
+                            if persisted_paste {
+                                "保持原设置：粘贴模式"
+                            } else {
+                                "未启用粘贴模式"
+                            },
+                        );
+                    } else {
+                        fill_tab_items(ui, true);
+                        set_combo(ui.tab_policy, 0);
+                        status(ui, "未保存：粘贴模式会替换剪贴板");
+                    }
+                });
+            }
             LRESULT(0)
         }
         WM_CTLCOLORSTATIC => {
@@ -1004,7 +1065,11 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             UI.with(|slot| {
-                if let Some(ui) = slot.borrow_mut().take() {
+                let mut guard = match slot.try_borrow_mut() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                if let Some(ui) = guard.take() {
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(ui.font.0));
                         let _ = DeleteObject(HGDIOBJ(ui.brush.0));

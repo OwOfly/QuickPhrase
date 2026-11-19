@@ -538,16 +538,17 @@ fn open_panel() {
     // Install the foreground monitor before capturing, so a switch between the
     // hotkey and the panel becoming visible is still observed by G3.
     let monitor = foreground::start();
+    let paste_mode = paste_mode_setting();
 
     match capture::once() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
-            let copy_only = copy_only_reason(&report);
+            let copy_only = copy_only_reason(&report, paste_mode);
             if let Some(reason) = &copy_only {
                 logging::info(&format!("panel opens copy-only: {reason}"));
             }
-            let data = panel_data(copy_only);
+            let data = panel_data(copy_only, paste_mode);
             let micros = panel::show(report, monitor, main, data);
 
             if micros == 0 {
@@ -564,7 +565,7 @@ fn open_panel() {
         None => {
             logging::warn("capture returned no usable foreground window");
             // Per PRD 14.3 the panel still opens; Enter copies instead of typing.
-            let data = panel_data(Some("未捕获到目标窗口".to_string()));
+            let data = panel_data(Some("未捕获到目标窗口".to_string()), paste_mode);
             let micros = panel::show_copy_only(main, data);
             if micros == 0 {
                 logging::warn("copy-only panel show failed");
@@ -581,7 +582,7 @@ fn open_panel() {
     ));
 }
 
-fn copy_only_reason(report: &capture::Report) -> Option<String> {
+fn copy_only_reason(report: &capture::Report, paste_mode: bool) -> Option<String> {
     if report.identity != "verified" {
         return Some("无法验证目标身份".to_string());
     }
@@ -594,10 +595,21 @@ fn copy_only_reason(report: &capture::Report) -> Option<String> {
     if report.target.integrity == "unknown" || report.target.own_integrity == "unknown" {
         return Some("无法确认完整性".to_string());
     }
+    // Paste mode is forbidden for terminals and unverified regions; say so up
+    // front so the footer never promises a paste that cannot happen.
+    if paste_mode && report.region != "text_editor" {
+        return Some("粘贴模式不支持该区域".to_string());
+    }
     None
 }
 
-fn panel_data(copy_only: Option<String>) -> panel::PanelData {
+fn paste_mode_setting() -> bool {
+    storage::settings_clone()
+        .map(|settings| settings.insertion_mode == "paste")
+        .unwrap_or(false)
+}
+
+fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
     let items = storage::panel_items()
         .into_iter()
         .map(|row| panel::Item {
@@ -618,9 +630,7 @@ fn panel_data(copy_only: Option<String>) -> panel::PanelData {
         categories: storage::categories(),
         notice: storage::read_only_notice(),
         copy_only,
-        paste_mode: storage::settings_clone()
-            .map(|settings| settings.insertion_mode == "paste")
-            .unwrap_or(false),
+        paste_mode,
     }
 }
 
@@ -673,7 +683,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M1-6 托盘）\n\
+             全局快捷短语输入器（M1-7 注入加固）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()

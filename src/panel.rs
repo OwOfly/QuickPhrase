@@ -734,12 +734,15 @@ fn commit() {
         let (copied, snapshot) = crate::clipboard::set_text_with_snapshot(&content);
         crate::storage::record_use(&item_id, "rejected");
         logging::info(&format!(
-            "panel copy-only commit: index={item_index} category={category_id} copied={copied} non_text={}",
-            snapshot.had_non_text
+            "panel copy-only commit: index={item_index} category={category_id} copied={copied} non_text={} read_ok={}",
+            snapshot.had_non_text,
+            snapshot.read_ok
         ));
         if !notify.0.is_null() {
             let message = if !copied {
                 format!("复制失败（{reason}）")
+            } else if !snapshot.read_ok {
+                format!("已复制（{reason}；原剪贴板内容无法确认，可能不可恢复）")
             } else if snapshot.had_non_text {
                 format!("已复制（{reason}；原剪贴板含非文本内容，仅文本可恢复）")
             } else if snapshot.text.is_some() {
@@ -1041,6 +1044,24 @@ fn move_selection(delta: i32) {
     unsafe {
         let _ = send(list, LB_SETCURSEL, next as usize, 0);
     }
+    refresh_footer();
+}
+
+fn refresh_footer() {
+    let (footer, label) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        match guard.as_ref() {
+            Some(panel) => (panel.footer, footer_text(panel)),
+            None => (HWND::default(), String::new()),
+        }
+    });
+    if footer.0.is_null() {
+        return;
+    }
+    let wide = platform::wide(&label);
+    unsafe {
+        let _ = SetWindowTextW(footer, PCWSTR(wide.as_ptr()));
+    }
 }
 
 fn force_foreground(hwnd: HWND) {
@@ -1338,15 +1359,17 @@ fn notice_label(token: &str) -> &str {
     }
 }
 
-fn enter_verb(paste_mode: bool) -> &'static str {
-    if paste_mode {
-        "Enter 粘贴（Ctrl+V）"
-    } else {
-        "Enter 输入"
+fn enter_verb(paste_mode: bool, paste_ok: Option<bool>) -> &'static str {
+    if !paste_mode {
+        return "Enter 输入";
+    }
+    match paste_ok {
+        Some(false) => "Enter 复制（不可粘贴）",
+        _ => "Enter 粘贴（Ctrl+V）",
     }
 }
 
-fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, paste_mode: bool) -> String {
+fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, verb: &str) -> String {
     match (copy_only, notice) {
         (Some(reason), Some(token)) => format!(
             "存储只读（{}） · 仅复制（{reason}） · Enter 复制 · Esc 关闭",
@@ -1356,18 +1379,22 @@ fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, paste_mode: bo
         (None, Some(token)) => format!(
             "存储只读（{}） · ↑↓ 选择 · {} · Esc 关闭",
             notice_label(token),
-            enter_verb(paste_mode)
+            verb
         ),
-        (None, None) => format!("↑↓ 选择 · {} · Esc 关闭", enter_verb(paste_mode)),
+        (None, None) => format!("↑↓ 选择 · {} · Esc 关闭", verb),
     }
 }
 
+fn selected_paste_ok(panel: &Panel) -> Option<bool> {
+    let index = panel.selected_index()?;
+    let item_index = *panel.filtered.get(index)?;
+    let item = panel.items.get(item_index)?;
+    Some(crate::inject::paste_preview_ok(&item.content))
+}
+
 fn footer_text(panel: &Panel) -> String {
-    footer_text_for(
-        panel.copy_only.as_deref(),
-        panel.notice.as_deref(),
-        panel.paste_mode,
-    )
+    let verb = enter_verb(panel.paste_mode, selected_paste_ok(panel));
+    footer_text_for(panel.copy_only.as_deref(), panel.notice.as_deref(), verb)
 }
 
 fn empty_message_for(
@@ -1419,32 +1446,27 @@ fn empty_message(panel: &Panel) -> Option<&'static str> {
 }
 
 fn populate(query: &str) {
-    let (hwnd, list, footer, filtered, title_highlights, content_highlights, footer_label) = PANEL
-        .with(|slot| {
-            let guard = slot.borrow();
-            let Some(panel) = guard.as_ref() else {
-                return (
-                    HWND::default(),
-                    HWND::default(),
-                    HWND::default(),
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
-                    String::new(),
-                );
-            };
-            let (filtered, title_highlights, content_highlights) =
-                filter_items(&panel.items, panel.active_category.as_deref(), query);
-            (
-                panel.hwnd,
-                panel.list,
-                panel.footer,
-                filtered,
-                title_highlights,
-                content_highlights,
-                footer_text(panel),
-            )
-        });
+    let (hwnd, list, filtered, title_highlights, content_highlights) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        let Some(panel) = guard.as_ref() else {
+            return (
+                HWND::default(),
+                HWND::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+        };
+        let (filtered, title_highlights, content_highlights) =
+            filter_items(&panel.items, panel.active_category.as_deref(), query);
+        (
+            panel.hwnd,
+            panel.list,
+            filtered,
+            title_highlights,
+            content_highlights,
+        )
+    });
 
     if list.0.is_null() {
         return;
@@ -1481,10 +1503,9 @@ fn populate(query: &str) {
         }
         // The list is a child window and would paint over the empty-state text.
         let _ = ShowWindow(list, if titles.is_empty() { SW_HIDE } else { SW_SHOW });
-        let label = platform::wide(&footer_label);
-        let _ = SetWindowTextW(footer, PCWSTR(label.as_ptr()));
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+    refresh_footer();
 }
 
 fn read_text(hwnd: HWND) -> String {
@@ -1632,6 +1653,7 @@ unsafe extern "system" fn window_proc(
                         let _ = SetFocus(Some(edit));
                     }
                 }
+                refresh_footer();
             }
             LRESULT(0)
         }
@@ -2119,33 +2141,43 @@ mod tests {
     #[test]
     fn footer_priority_and_notice_mapping() {
         assert_eq!(
-            super::footer_text_for(Some("未捕获到目标窗口"), None, false),
+            super::footer_text_for(Some("未捕获到目标窗口"), None, "Enter 输入"),
             "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"
         );
         assert_eq!(
-            super::footer_text_for(Some("身份未知"), Some("schema_newer"), false),
+            super::footer_text_for(Some("身份未知"), Some("schema_newer"), "Enter 输入"),
             "存储只读（数据由更新版本写入） · 仅复制（身份未知） · Enter 复制 · Esc 关闭"
         );
-        assert!(super::footer_text_for(None, Some("schema_newer"), false)
-            .contains("数据由更新版本写入"));
         assert!(
-            super::footer_text_for(None, Some("unknown_token"), false).contains("unknown_token")
+            super::footer_text_for(None, Some("schema_newer"), "Enter 输入")
+                .contains("数据由更新版本写入")
+        );
+        assert!(
+            super::footer_text_for(None, Some("unknown_token"), "Enter 输入")
+                .contains("unknown_token")
         );
         assert_eq!(
-            super::footer_text_for(None, None, false),
+            super::footer_text_for(None, None, "Enter 输入"),
             "↑↓ 选择 · Enter 输入 · Esc 关闭"
         );
     }
 
     #[test]
-    fn footer_switches_to_paste_verb_in_paste_mode() {
+    fn footer_verb_tracks_paste_availability() {
+        assert_eq!(super::enter_verb(false, None), "Enter 输入");
+        assert_eq!(super::enter_verb(true, None), "Enter 粘贴（Ctrl+V）");
+        assert_eq!(super::enter_verb(true, Some(true)), "Enter 粘贴（Ctrl+V）");
         assert_eq!(
-            super::footer_text_for(None, None, true),
+            super::enter_verb(true, Some(false)),
+            "Enter 复制（不可粘贴）"
+        );
+        assert_eq!(
+            super::footer_text_for(None, None, "Enter 粘贴（Ctrl+V）"),
             "↑↓ 选择 · Enter 粘贴（Ctrl+V） · Esc 关闭"
         );
         // Copy-only still wins over the configured insertion mode.
         assert_eq!(
-            super::footer_text_for(Some("未捕获到目标窗口"), None, true),
+            super::footer_text_for(Some("未捕获到目标窗口"), None, "Enter 粘贴（Ctrl+V）"),
             "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"
         );
     }

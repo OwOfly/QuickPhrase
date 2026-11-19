@@ -22,6 +22,7 @@ use crate::{clipboard, context, foreground, logging, uia};
 
 const MAX_UNICODE_UNITS: usize = 2_000;
 const MAX_PASTE_UNITS: usize = 10_000;
+const VK_V: u16 = 0x56;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertionMode {
@@ -64,9 +65,15 @@ enum Plan {
 }
 
 pub enum Outcome {
-    Rejected { reason: &'static str, copied: bool },
+    Rejected {
+        reason: &'static str,
+        copied: bool,
+        restorable: bool,
+    },
     Accepted,
-    Partial { reason: &'static str },
+    Partial {
+        reason: &'static str,
+    },
 }
 
 impl Outcome {
@@ -83,12 +90,18 @@ impl Outcome {
             Outcome::Rejected {
                 reason,
                 copied: true,
+                restorable,
             } => {
-                format!("未输入，已复制（{reason}）")
+                if *restorable {
+                    format!("未输入，已复制（{reason}；原剪贴板内容可在托盘恢复）")
+                } else {
+                    format!("未输入，已复制（{reason}；原剪贴板无可恢复的纯文本）")
+                }
             }
             Outcome::Rejected {
                 reason,
                 copied: false,
+                ..
             } => format!("未输入，复制失败（{reason}）"),
             Outcome::Accepted => "已发送，请确认目标已收到".to_string(),
             Outcome::Partial { reason } => {
@@ -105,11 +118,12 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
     }
 
     if !monitor_ok {
-        let (copied, _) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
         logging::warn("inject rejected: foreground monitor unavailable");
         return Outcome::Rejected {
             reason: "monitor_unavailable",
             copied,
+            restorable: snapshot.text.is_some(),
         };
     }
 
@@ -126,29 +140,38 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
     let (text, paste) = match plan {
         Plan::Insert { text, paste } => (text, paste),
         Plan::CopyOnly(reason) => {
-            let (copied, _) = clipboard::set_text_with_snapshot(raw);
+            let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
             logging::info(&format!("inject copy-only: {reason} copied={copied}"));
-            return Outcome::Rejected { reason, copied };
+            return Outcome::Rejected {
+                reason,
+                copied,
+                restorable: snapshot.text.is_some(),
+            };
         }
     };
 
     if let Err(reason) = guard(report) {
-        let (copied, _) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
         logging::warn(&format!("inject rejected: {reason} copied={copied}"));
-        return Outcome::Rejected { reason, copied };
+        return Outcome::Rejected {
+            reason,
+            copied,
+            restorable: snapshot.text.is_some(),
+        };
     }
 
     if !final_check(report, target) {
-        let (copied, _) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
         logging::warn("inject rejected: foreground_changed_at_send");
         return Outcome::Rejected {
             reason: "foreground_changed_at_send",
             copied,
+            restorable: snapshot.text.is_some(),
         };
     }
 
     if paste {
-        return run_paste(&text);
+        return run_paste(&text, target);
     }
 
     let inputs = build_inputs(&text);
@@ -177,6 +200,15 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
         inputs.len()
     ));
     Outcome::Accepted
+}
+
+/// Whether a snippet could use paste mode at all, ignoring the target region.
+/// The panel uses this for the Enter hint; the injection guard re-checks.
+pub fn paste_preview_ok(text: &str) -> bool {
+    if text.contains('\n') || text.contains('\r') || has_forbidden_control(text) {
+        return false;
+    }
+    text.encode_utf16().count() <= MAX_PASTE_UNITS
 }
 
 fn plan_text(
@@ -218,9 +250,7 @@ fn plan_text(
         if text.contains('\n') {
             return Plan::CopyOnly("paste_multiline");
         }
-        if options.keep_tabs {
-            // keep tabs as-is for visible cursor control
-        } else if text.contains('\t') {
+        if !options.keep_tabs && text.contains('\t') {
             text = text.replace('\t', "    ");
         }
         if text.encode_utf16().count() > MAX_PASTE_UNITS {
@@ -385,7 +415,7 @@ fn modifier_down(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) 
     unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
 }
 
-fn run_paste(text: &str) -> Outcome {
+fn run_paste(text: &str, target: HWND) -> Outcome {
     // Writing the clipboard is the compatibility mode's core cost; the snapshot
     // keeps the previous plain text restorable from tray/settings.
     let (stored, snapshot) = clipboard::set_text_with_snapshot(text);
@@ -394,9 +424,32 @@ fn run_paste(text: &str) -> Outcome {
         return Outcome::Rejected {
             reason: "clipboard_write_failed",
             copied: false,
+            restorable: false,
         };
     }
-    let written_sequence = clipboard::sequence();
+    let written_sequence = snapshot.sequence;
+
+    // The clipboard write can take a few milliseconds; verify the target still
+    // owns the foreground right before Ctrl+V goes out.
+    if unsafe { GetForegroundWindow() } != target {
+        logging::warn("paste mode: foreground changed before Ctrl+V");
+        return Outcome::Rejected {
+            reason: "foreground_changed_before_paste",
+            copied: true,
+            restorable: snapshot.text.is_some(),
+        };
+    }
+
+    // Someone replaced the clipboard after our write: paste would insert their
+    // text. Abort instead of pasting the wrong content.
+    if clipboard::sequence() != written_sequence {
+        logging::warn("paste mode: clipboard changed before Ctrl+V");
+        return Outcome::Rejected {
+            reason: "clipboard_changed_before_paste",
+            copied: false,
+            restorable: false,
+        };
+    }
 
     let inputs = build_paste_inputs();
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
@@ -408,6 +461,10 @@ fn run_paste(text: &str) -> Outcome {
         };
     }
     if sent as usize != inputs.len() {
+        // A partial send may have left V and/or Ctrl down. Release both; this
+        // is cleanup, not a retry of the paste.
+        let release = [make_vk_input(VK_V, true), make_vk_input(VK_CONTROL.0, true)];
+        let _ = unsafe { SendInput(&release, std::mem::size_of::<INPUT>() as i32) };
         logging::warn(&format!(
             "paste mode: SendInput accepted {sent} of {} events",
             inputs.len()
@@ -421,15 +478,15 @@ fn run_paste(text: &str) -> Outcome {
     // overwrite that, only report it.
     let now_sequence = clipboard::sequence();
     logging::info(&format!(
-        "paste mode accepted: {} UTF-16 units, clipboard_seq {written_sequence} -> {now_sequence}, non_text={}",
+        "paste mode accepted: {} UTF-16 units, clipboard_seq {written_sequence} -> {now_sequence}, non_text={} read_ok={}",
         text.encode_utf16().count(),
-        snapshot.had_non_text
+        snapshot.had_non_text,
+        snapshot.read_ok
     ));
     Outcome::Accepted
 }
 
 fn build_paste_inputs() -> Vec<INPUT> {
-    const VK_V: u16 = 0x56;
     vec![
         make_vk_input(VK_CONTROL.0, false),
         make_vk_input(VK_V, false),

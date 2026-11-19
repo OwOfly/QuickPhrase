@@ -93,12 +93,18 @@ impl Default for DataFile {
 pub struct Settings {
     pub schema_version: u32,
     pub hotkey: String,
+    /// Missing in hand-written or older files; Unicode is always safe.
+    #[serde(default = "default_insertion_mode")]
     pub insertion_mode: String,
     pub tab_policy: String,
     pub theme: String,
     pub startup: bool,
     pub paused: bool,
     pub data_dir: Option<String>,
+}
+
+fn default_insertion_mode() -> String {
+    "unicode".to_string()
 }
 
 impl Default for Settings {
@@ -809,7 +815,7 @@ impl Store {
         &self.settings
     }
 
-    #[allow(dead_code)] // consumed by M1-7 rule evaluation
+    #[allow(dead_code)] // reserved for post-V1 rule evaluation (FR-14)
     pub fn rules(&self) -> &RulesFile {
         &self.rules
     }
@@ -1331,6 +1337,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qp-store-{tag}-{}", new_id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn old_settings_without_insertion_mode_stay_writable() {
+        let dir = temp_dir("oldmode");
+        let store = Store::load_from(&dir);
+        assert!(!store.is_read_only());
+        let path = dir.join(SETTINGS_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("insertionMode");
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        let reloaded = Store::load_from(&dir);
+        assert!(!reloaded.is_read_only());
+        assert_eq!(reloaded.settings().insertion_mode, "unicode");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
