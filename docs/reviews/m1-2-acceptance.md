@@ -2,7 +2,7 @@
 
 - 范围：blob 匹配、D16 打分、排序、前 50、命中区间
 - 依据：`docs/_ref/final-plan.md` D16、§8 M1-2
-- 复核：待独立复核
+- 复核：r1 glm/qwen PASS、kimi CHANGES_REQUIRED（D1）→ r2 **三家 PASS**，T1–T5 全 CLOSED
 
 ## 已实现
 
@@ -53,4 +53,11 @@ search bench: n=1000 queries=100 p50=227us p95=445us max=699us
 
 ## 结论
 
-D16 的打分、排序与前 50 已实现并通过单测；1,000 条 P95 远低于 50 ms。待独立复核后进入 M1-3。
+D16 的打分、排序与前 50 已实现并通过单测；1,000 条 P95 远低于 50 ms。r2 三家 PASS，T1–T5 全 CLOSED。**M1-2 过门，M1-3 可开。**
+
+r2 之后的收尾（`9ef24f8`，未改变结果集）：
+
+- 高亮小写改为与 blob 同源的整串小写，词尾 Σ（`ς`）也能命中；
+- `panel::bench` 与 `search::bench` 统一为最近邻 p95 秩。
+
+残留：多关键词不分词；拼音 M2；高亮渲染 M1-3。
