@@ -69,6 +69,7 @@ const EM_LIMITTEXT: u32 = 0x00C5;
 const LBN_SELCHANGE_CODE: u32 = 1;
 const LBN_SETFOCUS_CODE: u32 = 4;
 
+#[derive(Clone)]
 pub struct Item {
     pub id: String,
     pub title: String,
@@ -432,18 +433,17 @@ fn present(
 
     unsafe {
         if activate {
-            if animations_enabled() {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                let _ = AnimateWindow(hwnd, 120, AW_BLEND);
-                if !IsWindowVisible(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
-                }
-            } else {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-            }
+            // Take foreground and focus *before* any animation: during a fade
+            // the user must never type into the previous window.
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             force_foreground(hwnd);
             let _ = SetFocus(Some(edit));
             let _ = send(edit, EM_SETSEL, 0, -1);
+            if animations_enabled() {
+                // Best effort; AW_BLEND on an already visible window may be a
+                // no-op, which is harmless.
+                let _ = AnimateWindow(hwnd, 100, AW_BLEND);
+            }
             if GetForegroundWindow() != hwnd || GetFocus() != edit {
                 logging::warn("panel could not take foreground or focus");
                 if std::env::var_os("QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL").is_none() {
@@ -992,22 +992,36 @@ fn apply_dpi(dpi: u32) {
         return;
     }
 
-    let (edit, list, footer, font) = PANEL.with(|slot| {
+    let (edit, list, footer, settings_link, manage_link, body, small) = PANEL.with(|slot| {
         let guard = slot.borrow();
         let Some(panel) = guard.as_ref() else {
             return (
                 HWND::default(),
                 HWND::default(),
                 HWND::default(),
+                HWND::default(),
+                HWND::default(),
+                HFONT::default(),
                 HFONT::default(),
             );
         };
-        (panel.edit, panel.list, panel.footer, panel.fonts.body)
+        (
+            panel.edit,
+            panel.list,
+            panel.footer,
+            panel.settings_link,
+            panel.manage_link,
+            panel.fonts.body,
+            panel.fonts.small,
+        )
     });
 
     unsafe {
         for control in [edit, list, footer] {
-            let _ = send(control, WM_SETFONT, font.0 as usize, 1);
+            let _ = send(control, WM_SETFONT, body.0 as usize, 1);
+        }
+        for control in [settings_link, manage_link] {
+            let _ = send(control, WM_SETFONT, small.0 as usize, 1);
         }
         let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
     }
@@ -1140,9 +1154,9 @@ fn layout_controls(
         let _ = MoveWindow(
             settings_link,
             width - margin - link_width,
-            scaled(SEARCH_TOP, dpi) + scaled(4, dpi),
+            scaled(SEARCH_TOP, dpi) + scaled(1, dpi),
             link_width,
-            scaled(26, dpi),
+            scaled(32, dpi),
             true,
         );
         let list_top = scaled(LIST_TOP, dpi);
@@ -1532,7 +1546,8 @@ fn enter_verb(paste_mode: bool, paste_ok: Option<bool>) -> &'static str {
 fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, verb: &str) -> String {
     match (copy_only, notice) {
         (Some(reason), Some(token)) => format!(
-            "存储只读（{}） · 仅复制（{reason}） · Enter 复制 · Esc 关闭",
+            // Keep this rare double-warning short enough for the footer.
+            "只读（{}） · 仅复制（{reason}）",
             notice_label(token)
         ),
         (Some(reason), None) => format!("仅复制（{reason}） · Enter 复制 · Esc 关闭"),
@@ -1915,7 +1930,14 @@ unsafe extern "system" fn window_proc(
             let brush = PANEL.with(|slot| {
                 slot.borrow()
                     .as_ref()
-                    .map(|panel| panel.brushes.background.0 as isize)
+                    .map(|panel| {
+                        if id == SETTINGS_LINK_ID {
+                            // The settings link sits inside the search band.
+                            panel.brushes.search.0 as isize
+                        } else {
+                            panel.brushes.background.0 as isize
+                        }
+                    })
                     .unwrap_or(0)
             });
             LRESULT(brush)
@@ -1996,7 +2018,7 @@ unsafe extern "system" fn window_proc(
                             hdc,
                             &mut hint,
                             &mut hint_rect,
-                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
                         );
                         let _ = SelectObject(hdc, previous);
                     }
@@ -2011,6 +2033,31 @@ unsafe extern "system" fn window_proc(
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            // Clicking the search band (except the settings link) focuses the
+            // input, so the visible band is not a dead zone.
+            let focused_search = PANEL.with(|slot| {
+                let guard = slot.borrow();
+                let Some(panel) = guard.as_ref() else {
+                    return false;
+                };
+                let mut client = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut client);
+                }
+                let top = scaled(SEARCH_TOP, panel.dpi);
+                let bottom = top + scaled(SEARCH_HEIGHT, panel.dpi);
+                let link_left = client.right - scaled(16, panel.dpi) - scaled(52, panel.dpi);
+                if y >= top && y <= bottom && x >= scaled(16, panel.dpi) && x < link_left {
+                    unsafe {
+                        let _ = SetFocus(Some(panel.edit));
+                    }
+                    return true;
+                }
+                false
+            });
+            if focused_search {
+                return LRESULT(0);
+            }
             let chosen = PANEL.with(|slot| {
                 let guard = slot.borrow();
                 let panel = guard.as_ref()?;
@@ -2153,7 +2200,7 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             panel.brushes.background
         };
         FillRect(hdc, &rect, background);
-        if selected && GetFocus() == panel.list {
+        if selected && (GetFocus() == panel.list || GetFocus() == panel.edit) {
             // Keyboard focus must be visible and not colour-only (§14.2).
             let mut border = rect;
             let _ = FrameRect(hdc, &border, panel.brushes.accent);
@@ -2264,6 +2311,24 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     if iterations == 0 {
         return (0, 0, 0);
     }
+    // A representative list: the panel draws icons, titles and previews, so an
+    // empty list would hide most of the paint cost.
+    let base_items: Vec<Item> = (0..50)
+        .map(|index| Item {
+            id: format!("bench-{index}"),
+            title: format!("项目更新说明 {index}"),
+            content: "这是第 {index} 条正文，包含接口、测试与发布计划。".to_string(),
+            category: "工作沟通".to_string(),
+            category_id: None,
+            blob: format!(
+                "项目更新说明 {index}\n这是第 {index} 条正文，包含接口、测试与发布计划。"
+            ),
+            pinned: index % 7 == 0,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            sort_order: index,
+        })
+        .collect();
     let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let elapsed = present(
@@ -2271,13 +2336,13 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
             None,
             HWND::default(),
             PanelData {
-                items: Vec::new(),
-                categories: Vec::new(),
+                items: base_items.clone(),
+                categories: vec![("bench".to_string(), "工作沟通".to_string())],
                 notice: None,
                 copy_only: None,
                 paste_mode: false,
                 keep_tabs: false,
-                hotkey_hint: String::new(),
+                hotkey_hint: "Ctrl+Alt+Q".to_string(),
             },
             false,
             false,
@@ -2450,7 +2515,7 @@ mod tests {
         );
         assert_eq!(
             super::footer_text_for(Some("身份未知"), Some("schema_newer"), "Enter 输入"),
-            "存储只读（数据由更新版本写入） · 仅复制（身份未知） · Enter 复制 · Esc 关闭"
+            "只读（数据由更新版本写入） · 仅复制（身份未知）"
         );
         assert!(
             super::footer_text_for(None, Some("schema_newer"), "Enter 输入")

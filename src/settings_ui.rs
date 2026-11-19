@@ -72,6 +72,7 @@ struct SettingsUi {
     status: HWND,
     font: HFONT,
     brush: HBRUSH,
+    field_brush: HBRUSH,
     palette: crate::theme::Palette,
     dpi: u32,
     capturing: bool,
@@ -322,6 +323,7 @@ fn create() -> Option<SettingsUi> {
 
     let font = make_font(dpi);
     let control_brush = unsafe { CreateSolidBrush(palette.page) };
+    let field_brush = unsafe { CreateSolidBrush(palette.field) };
     let hotkey_text = create_control(
         w!("STATIC"),
         "",
@@ -472,6 +474,7 @@ fn create() -> Option<SettingsUi> {
         font,
         palette,
         brush: control_brush,
+        field_brush,
         dpi,
         capturing: false,
         hotkey_candidate: String::new(),
@@ -619,8 +622,10 @@ pub fn show() {
             if palette != ui.palette {
                 unsafe {
                     let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+                    let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                 }
                 ui.brush = unsafe { CreateSolidBrush(palette.page) };
+                ui.field_brush = unsafe { CreateSolidBrush(palette.field) };
                 ui.palette = palette;
                 unsafe {
                     let _ = InvalidateRect(Some(ui.hwnd), None, true);
@@ -658,6 +663,7 @@ pub fn shutdown() {
         let _ = DestroyWindow(ui.hwnd);
         let _ = DeleteObject(HGDIOBJ(ui.font.0));
         let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
     }
 }
 
@@ -1088,9 +1094,13 @@ unsafe extern "system" fn window_proc(
                 slot.try_borrow()
                     .ok()
                     .and_then(|guard| {
-                        guard
-                            .as_ref()
-                            .map(|ui| (ui.palette.heading, ui.palette.field, ui.brush.0 as isize))
+                        guard.as_ref().map(|ui| {
+                            (
+                                ui.palette.heading,
+                                ui.palette.field,
+                                ui.field_brush.0 as isize,
+                            )
+                        })
                     })
                     .unwrap_or((COLORREF(0), COLORREF(0), 0))
             });
@@ -1123,6 +1133,7 @@ unsafe extern "system" fn window_proc(
                     unsafe {
                         let _ = DeleteObject(HGDIOBJ(ui.font.0));
                         let _ = DeleteObject(HGDIOBJ(ui.brush.0));
+                        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                     }
                 }
             });

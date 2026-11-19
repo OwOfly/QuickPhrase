@@ -166,6 +166,18 @@ mod tests {
                 contrast_ratio(palette.highlight_text, palette.highlight) >= 4.5,
                 "highlight pair"
             );
+            assert!(
+                contrast_ratio(palette.heading, palette.selection) >= 4.5,
+                "heading on selection"
+            );
+            assert!(
+                contrast_ratio(palette.heading, palette.field) >= 4.5,
+                "heading on field"
+            );
+            assert!(
+                contrast_ratio(palette.secondary, palette.page) >= 3.0,
+                "secondary on page"
+            );
         }
     }
 }

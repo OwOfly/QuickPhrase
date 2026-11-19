@@ -365,6 +365,11 @@ thread_local! {
 
 fn load_editor(manage: &mut Manage, id: Option<&str>) {
     manage.loading = true;
+    if manage.error_field.take().is_some() {
+        unsafe {
+            let _ = InvalidateRect(Some(manage.hwnd), None, true);
+        }
+    }
     let snippet = id.and_then(|id| {
         data().and_then(|data| data.snippets.into_iter().find(|snippet| snippet.id == id))
     });
@@ -527,6 +532,7 @@ fn delete_selected(manage: &mut Manage) {
             );
             load_editor(manage, None);
             reload_list(manage);
+            reload_left(manage);
         }
         Some(Err(code)) => status_message(manage, error_text(&code)),
         None => status_message(manage, "存储未初始化"),
@@ -740,6 +746,11 @@ fn create(owner: HWND) -> Option<Manage> {
         let error = unsafe { windows::Win32::Foundation::GetLastError() };
         if error != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS {
             logging::error(&format!("manage: RegisterClassW failed: {error:?}"));
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(field_brush.0));
+                let _ = DeleteObject(HGDIOBJ(error_brush.0));
+            }
             return None;
         }
     }
@@ -764,6 +775,11 @@ fn create(owner: HWND) -> Option<Manage> {
         Ok(hwnd) => hwnd,
         Err(err) => {
             logging::error(&format!("manage: CreateWindowExW failed: {err}"));
+            unsafe {
+                let _ = DeleteObject(HGDIOBJ(page_brush.0));
+                let _ = DeleteObject(HGDIOBJ(field_brush.0));
+                let _ = DeleteObject(HGDIOBJ(error_brush.0));
+            }
             return None;
         }
     };
@@ -1388,6 +1404,7 @@ unsafe extern "system" fn window_proc(
                                 status_message(manage, "已恢复");
                                 reload_list(manage);
                                 load_editor(manage, None);
+                                reload_left(manage);
                             }
                             Some(Err(code)) => status_message(manage, error_text(&code)),
                             None => status_message(manage, "存储未初始化"),
@@ -1417,6 +1434,12 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     ID_CATEGORY if notification == CBN_SELCHANGE => {
+                        if manage.error_field == Some(ID_CATEGORY) {
+                            manage.error_field = None;
+                            unsafe {
+                                let _ = InvalidateRect(Some(manage.hwnd), None, true);
+                            }
+                        }
                         if !manage.loading {
                             manage.dirty = true;
                             status_message(manage, "未保存");
@@ -1545,17 +1568,24 @@ unsafe extern "system" fn window_proc(
                             };
                             let _ = ScreenToClient(hwnd, &mut top_left);
                             let _ = ScreenToClient(hwnd, &mut bottom_right);
+                            let dpi = MANAGE.with(|slot| {
+                                slot.try_borrow()
+                                    .ok()
+                                    .and_then(|guard| guard.as_ref().map(|manage| manage.dpi))
+                                    .unwrap_or(96)
+                            });
+                            let thick = scaled(2, dpi);
                             let mut frame = RECT {
-                                left: top_left.x - 2,
-                                top: top_left.y - 2,
-                                right: bottom_right.x + 2,
-                                bottom: bottom_right.y + 2,
+                                left: top_left.x - thick,
+                                top: top_left.y - thick,
+                                right: bottom_right.x + thick,
+                                bottom: bottom_right.y + thick,
                             };
                             let _ = FrameRect(hdc, &frame, error_brush);
-                            frame.left += 1;
-                            frame.top += 1;
-                            frame.right -= 1;
-                            frame.bottom -= 1;
+                            frame.left += scaled(1, dpi);
+                            frame.top += scaled(1, dpi);
+                            frame.right -= scaled(1, dpi);
+                            frame.bottom -= scaled(1, dpi);
                             let _ = FrameRect(hdc, &frame, error_brush);
                         }
                     }
