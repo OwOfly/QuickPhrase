@@ -42,6 +42,19 @@ zip contents: LICENSE, QuickPhrase.exe, README.md
 | 文件末尾缺换行 | 补尾换行 |
 | ICO 结构无产物层证据 | 生成 `icon-structure.txt`（目录项、偏移、PNG 标记） |
 
+## UI 打磨后重打包（2026-11-19）
+
+UI 深度打磨（`4979c06`、`ef20a0a`、`e55f45a`，见 `docs/reviews/ui-polish-20261119.md`）只改视觉与布局，但改变了二进制，故重新打包：
+
+```
+exe bytes=517632
+zip bytes=272369
+sha256=8e46db7cf657b5dec3e958c190b5f464bf3d2999cabe34b9344c2309103f4a40
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希**取代**上方初次打包哈希；`dist/SHA256SUMS.txt` 已同步。打包脚本的资源版本、暂存目录与 zip 内容断言全部通过，仍未自动创建或推送 `v0.1.0` 标签。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。
