@@ -9,6 +9,19 @@ use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM
 use windows::Win32::System::Ole::CF_UNICODETEXT;
 
 const MAX_SNAPSHOT_UNITS: usize = 512 * 1024;
+const CF_TEXT: u32 = 1;
+const CF_OEMTEXT: u32 = 7;
+const CF_UNICODETEXT_FORMAT: u32 = 13;
+const CF_LOCALE: u32 = 16;
+
+/// Windows synthesizes CF_TEXT / CF_OEMTEXT / CF_LOCALE alongside
+/// CF_UNICODETEXT; they are the same text, not extra non-text content.
+fn is_text_format(format: u32) -> bool {
+    matches!(
+        format,
+        CF_TEXT | CF_OEMTEXT | CF_UNICODETEXT_FORMAT | CF_LOCALE
+    )
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
@@ -57,7 +70,7 @@ fn read_snapshot() -> Snapshot {
         let mut had_non_text = false;
         let mut format = EnumClipboardFormats(0);
         while format != 0 {
-            if format != CF_UNICODETEXT.0 as u32 {
+            if !is_text_format(format) {
                 had_non_text = true;
             }
             format = EnumClipboardFormats(format);
@@ -137,4 +150,20 @@ fn write_text(text: &str) -> bool {
 #[allow(dead_code)] // used by the M1 clipboard compatibility mode
 pub fn sequence() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_text_format;
+
+    #[test]
+    fn synthesized_text_formats_are_not_non_text() {
+        assert!(is_text_format(1)); // CF_TEXT
+        assert!(is_text_format(7)); // CF_OEMTEXT
+        assert!(is_text_format(13)); // CF_UNICODETEXT
+        assert!(is_text_format(16)); // CF_LOCALE
+        assert!(!is_text_format(2)); // CF_BITMAP
+        assert!(!is_text_format(8)); // CF_DIB
+        assert!(!is_text_format(15)); // CF_HDROP
+    }
 }

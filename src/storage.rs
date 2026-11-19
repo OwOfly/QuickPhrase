@@ -528,9 +528,9 @@ impl Store {
             if status == "accepted" {
                 snippet.use_count += 1;
                 snippet.last_used_at = Some(now.clone());
+                snippet.updated_at = now;
             }
             snippet.last_insert_status = Some(status.to_string());
-            snippet.updated_at = now;
         }
         match self.save_data() {
             Ok(()) => Ok(()),
@@ -1072,6 +1072,14 @@ mod tests {
         let dir = temp_dir("rejected");
         let mut store = Store::load_from(&dir);
         let id = store.snippets()[0].id.clone();
+        let updated_before = store
+            .data()
+            .snippets
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap()
+            .updated_at
+            .clone();
         store.record_use(&id, "rejected").unwrap();
         let snippet = store
             .data()
@@ -1082,6 +1090,8 @@ mod tests {
         assert_eq!(snippet.use_count, 0);
         assert_eq!(snippet.last_insert_status.as_deref(), Some("rejected"));
         assert!(snippet.last_used_at.is_none());
+        // A rejected attempt must not reorder the list via updatedAt.
+        assert_eq!(snippet.updated_at, updated_before);
 
         store.record_use(&id, "accepted").unwrap();
         let snippet = store

@@ -714,9 +714,11 @@ fn commit() {
             let message = if !copied {
                 format!("复制失败（{reason}）")
             } else if snapshot.had_non_text {
-                format!("已复制（{reason}；原剪贴板含非文本内容，不可恢复）")
-            } else {
+                format!("已复制（{reason}；原剪贴板含非文本内容，仅文本可恢复）")
+            } else if snapshot.text.is_some() {
                 format!("已复制（{reason}；原剪贴板内容已被替换）")
+            } else {
+                format!("已复制（{reason}）")
             };
             crate::tray::balloon(notify, "QuickPhrase", &message);
         }
@@ -1350,17 +1352,26 @@ fn empty_message_for(
     None
 }
 
+fn data_load_failed(notice: Option<&str>) -> bool {
+    matches!(
+        notice,
+        Some(
+            "data_recovery_failed"
+                | "schema_newer"
+                | "schema_older"
+                | "data_dir_unavailable"
+                | "initial_save_failed"
+        )
+    )
+}
+
 fn empty_message(panel: &Panel) -> Option<&'static str> {
-    let load_failed = matches!(
-        panel.notice.as_deref(),
-        Some("data_recovery_failed" | "schema_newer" | "schema_older")
-    );
     empty_message_for(
         panel.items.len(),
         panel.filtered.len(),
         &panel.last_query,
         panel.active_category.is_some(),
-        load_failed,
+        data_load_failed(panel.notice.as_deref()),
     )
 }
 
@@ -2048,6 +2059,17 @@ mod tests {
         );
         assert_eq!(super::empty_message_for(3, 0, "", false, false), None);
         assert_eq!(super::empty_message_for(3, 1, "abc", true, false), None);
+    }
+
+    #[test]
+    fn load_failure_notice_maps_to_failed_state() {
+        assert!(super::data_load_failed(Some("data_recovery_failed")));
+        assert!(super::data_load_failed(Some("schema_newer")));
+        assert!(super::data_load_failed(Some("schema_older")));
+        assert!(super::data_load_failed(Some("data_dir_unavailable")));
+        assert!(super::data_load_failed(Some("initial_save_failed")));
+        assert!(!super::data_load_failed(Some("rules_recovery_failed")));
+        assert!(!super::data_load_failed(None));
     }
 
     #[test]

@@ -150,7 +150,7 @@ $newLines = @()
 if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before }
 $newText = $newLines -join "`n"
 Check "Enter hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
-Check "commit logged first item" ($newText -match "panel commit: index=0 ") ""
+Check "commit logged first item" ($newText -match "panel (copy-only )?commit: index=0 ") ""
 Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
 # 6. close app

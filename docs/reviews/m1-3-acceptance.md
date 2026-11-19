@@ -28,7 +28,8 @@ panel filter: matches=0
 - 分类点击经 `WM_LBUTTONDOWN` 注入验证：日志确认切换，`GetGUIThreadInfo` 确认焦点回到搜索框。
 - 输入无匹配查询后 `IsWindowVisible(list)=False`，空态不再被列表遮挡。
 - 面板冒烟 10/10（尺寸仍 520×420，Esc/Enter/提交/焦点恢复不变）。
-- `cargo test` 86/86；新增空态优先级、footer 文案、分类+查询高亮测试。
+- `cargo test` 88/88；新增空态优先级、footer 文案、分类+查询高亮、加载失败映射、文本族格式测试。
+- 面板冒烟接受正常提交与仅复制提交两种日志（前台不可输入时走仅复制）。
 
 ## 复核修复（r1）
 
@@ -43,6 +44,9 @@ panel filter: matches=0
 | 仅复制缺剪贴板快照 | 写入前保存上一份纯文本，提示覆盖与非文本不可恢复 |
 | 能力失败仍显示「Enter 输入」 | 捕获结果不可输入时进入仅复制态，提交不再走注入 |
 | 空态/文案无测试 | 抽出纯函数并补优先级与文案映射测试；补分类+查询高亮 |
+| 数据目录不可用仍显示「还没有短语」 | `data_load_failed` 纳入 `data_dir_unavailable` / `initial_save_failed` |
+| 非文本误判：`CF_TEXT/CF_OEMTEXT/CF_LOCALE` 是系统合成格式 | 视为文本族，仅真正非文本格式才提示不可恢复；补单测 |
+| `rejected` 尝试会改 `updatedAt`，影响 D16 排序 | 仅 `accepted` 更新 `updatedAt`，补断言 |
 
 ## 已知偏差 / 未覆盖
 
