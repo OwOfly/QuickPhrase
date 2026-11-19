@@ -1,0 +1,19 @@
+﻿reserved=0 type=1 count=7
+fileBytes=8518
+entry0 w=16 h=16 colors=0 planes=1 bpp=32 bytes=398 offset=118
+entry1 w=24 h=24 colors=0 planes=1 bpp=32 bytes=522 offset=516
+entry2 w=32 h=32 colors=0 planes=1 bpp=32 bytes=631 offset=1038
+entry3 w=48 h=48 colors=0 planes=1 bpp=32 bytes=816 offset=1669
+entry4 w=64 h=64 colors=0 planes=1 bpp=32 bytes=978 offset=2485
+entry5 w=128 h=128 colors=0 planes=1 bpp=32 bytes=1693 offset=3463
+entry6 w=0 h=0 colors=0 planes=1 bpp=32 bytes=3362 offset=5156
+offsetsSequential=True
+sumData=8400
+trailingBytes=0
+entry 16x16 png=True
+entry 24x24 png=True
+entry 32x32 png=True
+entry 48x48 png=True
+entry 64x64 png=True
+entry 128x128 png=True
+entry 0x0 png=True

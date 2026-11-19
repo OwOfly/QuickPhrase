@@ -1,4 +1,4 @@
-﻿# Builds the release zip with the executable, README and LICENSE.
+# Builds the release zip with the executable, README and LICENSE.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\package.ps1 [-SkipBuild]
 
 param([switch]$SkipBuild)

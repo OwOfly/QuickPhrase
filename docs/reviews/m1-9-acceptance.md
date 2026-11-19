@@ -20,13 +20,14 @@
 
 ```
 exe bytes=498176
-zip bytes=261771
-sha256=0649994224f1835f15b0b52bcdc1627777602a5a134e47c6098c3cfecd540279
+zip bytes=261773
+sha256=20fb32b2d1870f6f373617247dd0b925f92dc08a21d2a1af32414d754940a9da
 fileVersion=0.1.0 product=QuickPhrase 快语
 zip contents: LICENSE, QuickPhrase.exe, README.md
 ```
 
 - Windows 资源检查：RT_ICON 资源 ID 1 存在；RT_VERSION 资源 ID 1 存在。
+- ICO 结构：7 个条目（16/24/32/48/64/128/256），目录偏移连续、无尾随字节，全部为 PNG 数据；见 `icon-structure.txt`。
 - 打包体积 255 KB，远低于 15 MB 预算。
 
 ## 已知偏差 / 未覆盖

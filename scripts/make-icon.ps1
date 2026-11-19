@@ -1,4 +1,4 @@
-﻿# Generates assets/quickphrase.ico from code (no external assets).
+# Generates assets/quickphrase.ico from code (no external assets).
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\make-icon.ps1
 
 $ErrorActionPreference = "Stop"
