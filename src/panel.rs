@@ -190,6 +190,13 @@ fn start_fade(hwnd: HWND) {
     if !animations_enabled() {
         return;
     }
+    // Create the timer first: if it cannot be created, skip the fade entirely
+    // instead of making the window transparent forever.
+    let timer = unsafe { SetTimer(Some(hwnd), FADE_TIMER, 10, None) };
+    if timer == 0 {
+        logging::warn("panel fade timer unavailable; showing without fade");
+        return;
+    }
     // The window is already visible and focused; the fade runs on a timer so
     // keystrokes reach the panel from the first frame.
     unsafe {
@@ -198,9 +205,6 @@ fn start_fade(hwnd: HWND) {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
     }
     FADE_STEP.store(0, Ordering::Relaxed);
-    unsafe {
-        let _ = SetTimer(Some(hwnd), FADE_TIMER, 10, None);
-    }
 }
 
 fn create_static_link(parent: HWND, instance: HINSTANCE, id: i32, text: &str) -> Option<HWND> {
