@@ -49,6 +49,10 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
                 logging::info("signalled the running instance");
             } else {
                 logging::warn("another instance is running but did not respond to activation");
+                platform::error_box(
+                    "QuickPhrase 已在运行",
+                    "另一个 QuickPhrase 实例正在运行，但未能唤起它。请通过托盘图标打开。",
+                );
             }
             return 0;
         }
@@ -235,7 +239,7 @@ unsafe extern "system" fn window_proc(
 
     if activate_message != 0 && message == activate_message {
         logging::info("second instance activation requested");
-        activate_panel();
+        open_panel();
         return LRESULT(0);
     }
 
@@ -265,7 +269,7 @@ unsafe extern "system" fn window_proc(
         WM_HOTKEY => {
             if wparam.0 as i32 == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
-                activate_panel();
+                hotkey_panel();
             }
             LRESULT(0)
         }
@@ -404,7 +408,7 @@ unsafe fn show_menu(hwnd: HWND) {
 
 fn handle_command(id: u32) {
     match id {
-        ID_OPEN => activate_panel(),
+        ID_OPEN => open_panel(),
         ID_MANAGE => {
             let hwnd = STATE.with(|state| state.borrow().hwnd);
             manage::show(hwnd);
@@ -483,7 +487,7 @@ pub fn apply_hotkey(text: &str) -> Result<(), String> {
     }
 }
 
-fn activate_panel() {
+fn hotkey_panel() {
     if panel::is_injecting() {
         logging::warn("panel activation ignored: injection in flight");
         let main = STATE.with(|state| state.borrow().hwnd);
@@ -496,6 +500,27 @@ fn activate_panel() {
     if panel::is_visible() {
         panel::hide_and_restore();
         logging::info("panel closed");
+        return;
+    }
+
+    open_panel();
+}
+
+/// Menu, tray and second-instance entry: open (or focus) the panel, never close it.
+fn open_panel() {
+    if panel::is_injecting() {
+        logging::warn("panel activation ignored: injection in flight");
+        let main = STATE.with(|state| state.borrow().hwnd);
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "正在输入，请稍候");
+        }
+        return;
+    }
+
+    if panel::is_visible() {
+        if panel::focus() {
+            logging::info("panel focused (already open)");
+        }
         return;
     }
 

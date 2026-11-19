@@ -8,6 +8,10 @@ $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
 $log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
 
+# The panel may open on a locked desktop; keep injection out of the smoke run.
+$env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
+$env:QUICKPHRASE_TEST_NO_INJECT = "1"
+
 Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
 
@@ -33,6 +37,7 @@ public class QPTray {
   [DllImport("user32.dll", EntryPoint="PostMessageW")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr h, int id, uint modifiers, uint vk);
   [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr h, int id);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
 }
 "@
 
@@ -49,13 +54,13 @@ function Test-HotkeyFree {
     return $free
 }
 
-function Find-Main {
+function Find-Class([string]$Class) {
     $script:found = [IntPtr]::Zero
     $cb = [QPTray+EnumProc]{
         param($h, $l)
         $sb = New-Object System.Text.StringBuilder 256
         [void][QPTray]::GetClassName($h, $sb, 256)
-        if ($sb.ToString() -eq "QuickPhrase.MainWindow") {
+        if ($sb.ToString() -eq $Class) {
             $script:found = $h
             return $false
         }
@@ -64,6 +69,8 @@ function Find-Main {
     [void][QPTray]::EnumWindows($cb, [IntPtr]::Zero)
     return $script:found
 }
+
+function Find-Main { return Find-Class "QuickPhrase.MainWindow" }
 
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
@@ -93,13 +100,24 @@ $text = $lines -join "`n"
 Check "pause hotkey" ($text -match "hotkey paused") ""
 Check "resume hotkey" ($text -match "hotkey resumed") ""
 
-# Second instance signals the first and exits.
+# Second instance opens the panel and exits; a second run must not close it.
 $second = Start-Process -FilePath $exe -PassThru -Wait
-Start-Sleep -Milliseconds 600
+Start-Sleep -Milliseconds 900
 Check "second instance exits 0" ($second.ExitCode -eq 0) ("exit=" + $second.ExitCode)
 $lines = @(Get-Content $log -Encoding UTF8 | Select-Object -Skip $before)
 $text = $lines -join "`n"
 Check "second instance activation" ($text -match "second instance activation requested") ""
+$panel = Find-Class "QuickPhrase.Panel"
+Check "second instance opens the panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
+
+$second2 = Start-Process -FilePath $exe -PassThru -Wait
+Start-Sleep -Milliseconds 900
+$panel = Find-Class "QuickPhrase.Panel"
+Check "second instance keeps an open panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
+
+[void][QPTray]::PostMessage($panel, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 600
+Check "panel closes on WM_CLOSE" (-not [QPTray]::IsWindowVisible($panel)) ""
 
 # Exit through the tray command.
 [void][QPTray]::PostMessage($main, 0x0111, [IntPtr]1006, [IntPtr]::Zero)
@@ -118,6 +136,8 @@ $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
 "--- tray log ---"
 $lines | Where-Object { $_ -match "tray|hotkey|second instance|exit" } | ForEach-Object { $_ }
+
+Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL, Env:QUICKPHRASE_TEST_NO_INJECT -ErrorAction SilentlyContinue
 
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"

@@ -43,10 +43,10 @@ pub fn signal_existing() -> bool {
     // the mutex; retry briefly instead of losing the activation.
     for _ in 0..40 {
         if let Ok(hwnd) = unsafe { FindWindowW(w!("QuickPhrase.MainWindow"), PCWSTR::null()) } {
-            unsafe {
-                let _ = PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0));
+            let posted = unsafe { PostMessageW(Some(hwnd), message, WPARAM(0), LPARAM(0)) }.is_ok();
+            if posted {
+                return true;
             }
-            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

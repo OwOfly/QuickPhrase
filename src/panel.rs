@@ -235,6 +235,28 @@ pub fn is_visible() -> bool {
     })
 }
 
+/// Bring an already open panel back to the front without re-capturing.
+pub fn focus() -> bool {
+    let (hwnd, edit) = PANEL.with(|slot| {
+        let guard = slot.borrow();
+        match guard.as_ref() {
+            Some(panel) => (panel.hwnd, panel.edit),
+            None => (HWND::default(), HWND::default()),
+        }
+    });
+    if hwnd.0.is_null() {
+        return false;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        if !edit.0.is_null() {
+            let _ = SetFocus(Some(edit));
+        }
+    }
+    true
+}
+
 pub fn show(
     report: Report,
     monitor: Option<crate::foreground::Monitor>,
