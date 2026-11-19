@@ -684,8 +684,23 @@ fn save(ui: &mut SettingsUi) {
         logging::warn(&format!("settings: startup change failed ({code})"));
         let mut revert = settings.clone();
         revert.startup = original.startup;
-        let _ = storage::save_settings(revert);
-        status(ui, "设置已保存；开机启动未生效");
+        let rollback = storage::save_settings(revert);
+        if let Err(err) = &rollback {
+            logging::error(&format!("settings: startup rollback write failed ({err})"));
+        }
+        unsafe {
+            let _ = SendMessageW(
+                ui.startup,
+                BM_SETCHECK,
+                Some(WPARAM(if original.startup { 1 } else { 0 })),
+                Some(LPARAM(0)),
+            );
+        }
+        if rollback.is_ok() {
+            status(ui, "开机启动未生效，已恢复原设置");
+        } else {
+            status(ui, "开机启动未生效，且回滚写盘失败，请重启后检查");
+        }
         return;
     }
     status(ui, "已保存");

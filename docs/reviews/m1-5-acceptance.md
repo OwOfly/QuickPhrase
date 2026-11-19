@@ -2,7 +2,7 @@
 
 - 范围：热键录制与应用、Tab 策略、主题偏好、开机启动、数据目录展示、剪贴板恢复
 - 依据：`docs/_ref/prd-v1.1.md` §14.5、`docs/_ref/final-plan.md` §8 M1-5
-- 复核：待独立复核
+- 复核：r1 三家 CHANGES_REQUIRED → r2 **三家 PASS**，S1–S14 全 CLOSED
 
 ## 已实现
 
@@ -11,7 +11,7 @@
 | 窗口 | `QuickPhrase.SettingsWindow`，560×430，Per-Monitor DPI |
 | 热键 | 显示当前组合；「录制」后捕获下一组修饰键 + 键；保存时在主窗口重新注册，失败回滚并提示 |
 | 热键解析 | `Ctrl/Alt/Shift/Win` + `A–Z/0–9/F1–F24`，大小写不敏感 |
-| Tab 策略 | `spaces4` / `tab`，落盘 `settings.json` |
+| Tab 策略 | 当前固定 `spaces4`；「保留制表符」等粘贴模式选项在 M1-7 开放 |
 | 主题 | `system` / `light` / `dark` 偏好落盘（深色渲染属 M1-8） |
 | 开机启动 | 写/删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\QuickPhrase` |
 | 数据目录 | 只读展示 `%LocalAppData%\QuickPhrase` |
@@ -22,7 +22,7 @@
 ## 实测
 
 - `--settings-test` 窗口创建/关闭退出码 0。
-- 真实应用打开设置并保存：`settings.json` 变为 `tabPolicy=tab`、`theme=dark`，热键仍 `Ctrl+Alt+Q`。
+- 真实应用打开设置并保存：`settings.json` 中 `theme=dark`、`tabPolicy=spaces4`，热键仍 `Ctrl+Alt+Q`。
 - `cargo test` 100/100（新增热键解析 4 个）。
 
 ## 复核修复（r1）
@@ -44,6 +44,13 @@
 | 开机启动失败仍存 `startup=true` | 失败回滚该字段 |
 | 关于文案陈旧 | 改为 M1-5 |
 
+## 复核修复（r2）
+
+| 发现 | 处置 |
+| --- | --- |
+| 开机启动失败回滚写盘仍吞错 | 检查回滚结果；失败提示「回滚写盘失败」，并把复选框恢复到原值 |
+| 文档仍写 `tabPolicy=tab` | 验收记录改为当前固定 `spaces4` |
+
 ## 已知偏差 / 未覆盖
 
 - 「兼容粘贴」输入方式未暴露，属 M1-7（避免出现不可用选项）。
@@ -56,4 +63,6 @@
 
 ## 结论
 
-M1-5 的设置窗口、热键、Tab、启动与剪贴板恢复已接入；待复核后进入 M1-6 托盘。
+M1-5 的设置窗口、热键、Tab、启动与剪贴板恢复已接入并通过控件级实测。r1/r2 发现全部闭环，**r2 三家 PASS，M1-5 过门，M1-6 可开。**
+
+残留：兼容粘贴与「保留制表符」属 M1-7；深色渲染属 M1-8；数据目录迁移与托盘恢复入口分别在 M1-9/M1-6。
