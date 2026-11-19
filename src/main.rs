@@ -8,6 +8,7 @@ mod foreground;
 mod hotkey;
 mod inject;
 mod logging;
+mod manage;
 mod panel;
 mod platform;
 mod search;
@@ -18,6 +19,7 @@ mod uia;
 
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, TranslateMessage, MSG,
 };
@@ -32,6 +34,7 @@ fn main() {
     let panel_test = has(&args, "--panel-test");
     let inject_test = has(&args, "--inject-test");
     let search_bench = has(&args, "--search-bench");
+    let manage_test = has(&args, "--manage-test");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -60,6 +63,21 @@ fn main() {
         logging::info(&format!(
             "search bench: n=1000 queries=100 p50={p50}us p95={p95}us max={max}us"
         ));
+        return;
+    }
+
+    if manage_test {
+        storage::init();
+        manage::show_test(HWND::default());
+        let mut message = MSG::default();
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        manage::shutdown();
+        logging::info("manage-test done");
         return;
     }
 

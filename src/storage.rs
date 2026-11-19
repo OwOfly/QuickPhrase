@@ -251,11 +251,330 @@ pub fn read_only_notice() -> Option<String> {
     .flatten()
 }
 
+pub fn data_clone() -> Option<DataFile> {
+    with_store(|store| store.data().clone())
+}
+
 pub fn record_use(id: &str, status: &str) {
     match with_store(|store| store.record_use(id, status)) {
         Some(Ok(())) => {}
         Some(Err(err)) => logging::warn(&format!("storage: record_use failed: {err}")),
         None => logging::warn("storage: record_use before init"),
+    }
+}
+
+const TITLE_MAX_UNITS: usize = 80;
+const CONTENT_MAX_UNITS: usize = 10_000;
+const CATEGORY_NAME_MAX_UNITS: usize = 40;
+
+fn validate_text(title: &str, content: &str) -> Result<(String, String), String> {
+    let title = title.trim().to_string();
+    let content = content.trim_end().to_string();
+    if title.is_empty() {
+        return Err("title_empty".to_string());
+    }
+    if title.encode_utf16().count() > TITLE_MAX_UNITS {
+        return Err("title_too_long".to_string());
+    }
+    if content.trim().is_empty() {
+        return Err("content_empty".to_string());
+    }
+    if content.encode_utf16().count() > CONTENT_MAX_UNITS {
+        return Err("content_too_long".to_string());
+    }
+    Ok((title, content))
+}
+
+impl Store {
+    #[allow(dead_code)] // used by tests and the M1-4 editor when reloading by id
+    pub fn get(&self, id: &str) -> Option<&Snippet> {
+        self.data.snippets.iter().find(|item| item.id == id)
+    }
+
+    #[allow(dead_code)] // recycle count UI lands with M1-4 polish
+    pub fn deleted_snippets(&self) -> Vec<&Snippet> {
+        self.data
+            .snippets
+            .iter()
+            .filter(|item| item.deleted_at.is_some())
+            .collect()
+    }
+
+    pub fn add_snippet(
+        &mut self,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+    ) -> Result<String, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let (title, content) = validate_text(title, content)?;
+        self.check_category(category_id)?;
+        self.check_duplicate(&title, None)?;
+
+        let now = now_iso();
+        let id = new_id();
+        let mut snippet = Snippet {
+            id: id.clone(),
+            title,
+            content,
+            category_id: category_id.map(|value| value.to_string()),
+            pinned,
+            sort_order: self.next_sort_order(),
+            created_at: now.clone(),
+            updated_at: now,
+            use_count: 0,
+            last_used_at: None,
+            last_insert_status: None,
+            deleted_at: None,
+            search_blob: String::new(),
+        };
+        snippet.rebuild_blob();
+        self.data.snippets.push(snippet);
+        match self.save_data() {
+            Ok(()) => Ok(id),
+            Err(err) => {
+                self.data.snippets.retain(|item| item.id != id);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn update_snippet(
+        &mut self,
+        id: &str,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let (title, content) = validate_text(title, content)?;
+        self.check_category(category_id)?;
+        self.check_duplicate(&title, Some(id))?;
+
+        let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
+            return Err("snippet_missing".to_string());
+        };
+        let previous = self.data.snippets[position].clone();
+        let now = now_iso();
+        {
+            let snippet = &mut self.data.snippets[position];
+            snippet.title = title;
+            snippet.content = content;
+            snippet.category_id = category_id.map(|value| value.to_string());
+            snippet.pinned = pinned;
+            snippet.updated_at = now;
+            snippet.rebuild_blob();
+        }
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn soft_delete(&mut self, id: &str) -> Result<(), String> {
+        self.mutate_snippet(id, |snippet, now| {
+            snippet.deleted_at = Some(now.to_string());
+            snippet.updated_at = now.to_string();
+        })
+    }
+
+    pub fn restore(&mut self, id: &str) -> Result<(), String> {
+        self.mutate_snippet(id, |snippet, now| {
+            snippet.deleted_at = None;
+            snippet.updated_at = now.to_string();
+        })
+    }
+
+    pub fn purge(&mut self, id: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
+            return Err("snippet_missing".to_string());
+        };
+        let removed = self.data.snippets.remove(position);
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.snippets.insert(position, removed);
+                Err(err)
+            }
+        }
+    }
+
+    pub fn add_category(&mut self, name: &str) -> Result<String, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let name = self.validate_category_name(name)?;
+        let now = now_iso();
+        let id = new_id();
+        let category = Category {
+            id: id.clone(),
+            name,
+            sort_order: self
+                .data
+                .categories
+                .iter()
+                .map(|category| category.sort_order + 1)
+                .max()
+                .unwrap_or(0),
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        self.data.categories.push(category);
+        match self.save_data() {
+            Ok(()) => Ok(id),
+            Err(err) => {
+                self.data.categories.retain(|item| item.id != id);
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(dead_code)] // rename UI lands with M1-4 polish
+    pub fn rename_category(&mut self, id: &str, name: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let name = self.validate_category_name(name)?;
+        let Some(position) = self
+            .data
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+        else {
+            return Err("category_missing".to_string());
+        };
+        let previous = self.data.categories[position].clone();
+        self.data.categories[position].name = name;
+        self.data.categories[position].updated_at = now_iso();
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.categories[position] = previous;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn delete_category(&mut self, id: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let Some(position) = self
+            .data
+            .categories
+            .iter()
+            .position(|category| category.id == id)
+        else {
+            return Err("category_missing".to_string());
+        };
+        let previous = self.data.categories.remove(position);
+        let now = now_iso();
+        let mut moved: Vec<(usize, Option<String>)> = Vec::new();
+        for (index, snippet) in self.data.snippets.iter_mut().enumerate() {
+            if snippet.category_id.as_deref() == Some(id) {
+                moved.push((index, snippet.category_id.take()));
+                snippet.updated_at = now.clone();
+            }
+        }
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.categories.insert(position, previous);
+                for (index, category_id) in moved {
+                    self.data.snippets[index].category_id = category_id;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    fn mutate_snippet(
+        &mut self,
+        id: &str,
+        mutate: impl FnOnce(&mut Snippet, &str),
+    ) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
+            return Err("snippet_missing".to_string());
+        };
+        let previous = self.data.snippets[position].clone();
+        let now = now_iso();
+        mutate(&mut self.data.snippets[position], &now);
+        match self.save_data() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
+    }
+
+    fn check_category(&self, category_id: Option<&str>) -> Result<(), String> {
+        if let Some(id) = category_id {
+            if !self
+                .data
+                .categories
+                .iter()
+                .any(|category| category.id == id)
+            {
+                return Err("category_missing".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn check_duplicate(&self, title: &str, skip: Option<&str>) -> Result<(), String> {
+        let needle = title.to_lowercase();
+        if self.data.snippets.iter().any(|snippet| {
+            snippet.deleted_at.is_none()
+                && Some(snippet.id.as_str()) != skip
+                && snippet.title.to_lowercase() == needle
+        }) {
+            return Err("duplicate_title".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_category_name(&self, name: &str) -> Result<String, String> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err("category_empty".to_string());
+        }
+        if name.encode_utf16().count() > CATEGORY_NAME_MAX_UNITS {
+            return Err("category_too_long".to_string());
+        }
+        if self
+            .data
+            .categories
+            .iter()
+            .any(|category| category.name.to_lowercase() == name.to_lowercase())
+        {
+            return Err("category_duplicate".to_string());
+        }
+        Ok(name)
+    }
+
+    fn next_sort_order(&self) -> i32 {
+        self.data
+            .snippets
+            .iter()
+            .map(|snippet| snippet.sort_order + 1)
+            .max()
+            .unwrap_or(0)
     }
 }
 
@@ -961,6 +1280,110 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qp-store-{tag}-{}", new_id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn snippet_crud_roundtrip() {
+        let dir = temp_dir("crud");
+        let mut store = Store::load_from(&dir);
+        let id = store
+            .add_snippet("  新短语  ", "正文", None, true)
+            .expect("add");
+        let added = store.get(&id).unwrap();
+        assert_eq!(added.title, "新短语");
+        assert!(added.pinned);
+
+        store
+            .update_snippet(&id, "改名", "新正文", None, false)
+            .expect("update");
+        let updated = store.get(&id).unwrap();
+        assert_eq!(updated.title, "改名");
+        assert_eq!(updated.content, "新正文");
+        assert!(!updated.pinned);
+
+        store.soft_delete(&id).expect("delete");
+        assert!(store.get(&id).unwrap().deleted_at.is_some());
+        assert!(!store.snippets().iter().any(|item| item.id == id));
+        assert!(store.deleted_snippets().iter().any(|item| item.id == id));
+
+        store.restore(&id).expect("restore");
+        assert!(store.snippets().iter().any(|item| item.id == id));
+
+        store.purge(&id).expect("purge");
+        assert!(store.get(&id).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snippet_validation_rejects_bad_input() {
+        let dir = temp_dir("validate");
+        let mut store = Store::load_from(&dir);
+        assert_eq!(
+            store.add_snippet("   ", "正文", None, false),
+            Err("title_empty".to_string())
+        );
+        assert_eq!(
+            store.add_snippet("标题", "   ", None, false),
+            Err("content_empty".to_string())
+        );
+        assert_eq!(
+            store.add_snippet(&"长".repeat(TITLE_MAX_UNITS + 1), "正文", None, false),
+            Err("title_too_long".to_string())
+        );
+
+        let _ = store.add_snippet("标题", "正文", None, false);
+        assert_eq!(
+            store.add_snippet("标题", "另一段正文", None, false),
+            Err("duplicate_title".to_string())
+        );
+        assert_eq!(
+            store.add_snippet("新标题", "正文", Some("missing-category"), false),
+            Err("category_missing".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn category_crud_moves_snippets_to_uncategorized() {
+        let dir = temp_dir("categories");
+        let mut store = Store::load_from(&dir);
+        let category = store.add_category("新分类").expect("add category");
+        let id = store
+            .add_snippet("分类短语", "正文", Some(&category), false)
+            .expect("add snippet");
+        assert_eq!(
+            store.get(&id).unwrap().category_id.as_deref(),
+            Some(category.as_str())
+        );
+
+        store
+            .rename_category(&category, "改名分类")
+            .expect("rename");
+        assert_eq!(store.category_name(Some(&category)), "改名分类");
+
+        store.delete_category(&category).expect("delete category");
+        assert_eq!(store.get(&id).unwrap().category_id, None);
+        assert!(store
+            .data()
+            .categories
+            .iter()
+            .all(|item| item.id != category));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crud_rejected_when_read_only() {
+        let dir = temp_dir("crudreadonly");
+        let mut store = Store::load_from(&dir);
+        store.read_only = true;
+        assert_eq!(
+            store.add_snippet("标题", "正文", None, false),
+            Err("read_only".to_string())
+        );
+        let id = store.data().snippets[0].id.clone();
+        assert_eq!(store.soft_delete(&id), Err("read_only".to_string()));
+        assert_eq!(store.add_category("分类"), Err("read_only".to_string()));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

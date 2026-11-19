@@ -8,7 +8,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{
-    capture, foreground, hotkey, logging, panel, platform, single_instance, storage, tray, uia,
+    capture, foreground, hotkey, logging, manage, panel, platform, single_instance, storage, tray,
+    uia,
 };
 
 const ID_OPEN: u32 = 1001;
@@ -263,7 +264,10 @@ unsafe extern "system" fn window_proc(
             let event = (lparam.0 & 0xffff) as u32;
             match event {
                 WM_RBUTTONUP | WM_CONTEXTMENU => show_menu(hwnd),
-                WM_LBUTTONDBLCLK => activate_panel(),
+                WM_LBUTTONDBLCLK => {
+                    let hwnd = STATE.with(|state| state.borrow().hwnd);
+                    manage::show(hwnd);
+                }
                 _ => {}
             }
             LRESULT(0)
@@ -281,6 +285,7 @@ unsafe extern "system" fn window_proc(
         }
         WM_DESTROY => {
             panel::shutdown();
+            manage::shutdown();
             let (tray_ok, hotkey_ok) = STATE.with(|state| {
                 let state = state.borrow();
                 (state.tray_ok, state.hotkey_ok)
@@ -347,7 +352,10 @@ unsafe fn show_menu(hwnd: HWND) {
 fn handle_command(id: u32) {
     match id {
         ID_OPEN => activate_panel(),
-        ID_MANAGE => platform::info_box("QuickPhrase", "短语管理将在 M1 实现。"),
+        ID_MANAGE => {
+            let hwnd = STATE.with(|state| state.borrow().hwnd);
+            manage::show(hwnd);
+        }
         ID_PAUSE => toggle_hotkey(),
         ID_SETTINGS => platform::info_box("QuickPhrase", "设置将在 M1 实现。"),
         ID_ABOUT => about(),
