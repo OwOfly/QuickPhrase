@@ -103,22 +103,30 @@ fn cmp_last_used(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering 
 }
 
 /// Case-insensitive substring range mapped back to byte offsets in `haystack`.
-/// Lowercasing must not change the character count for this mapping; for the
-/// CJK/Latin text this product stores that holds.
+/// Lowercasing can expand one character into several (`İ` -> `i` + combining
+/// dot); each lowercase char keeps a link to the original character it came
+/// from, so the returned range always covers whole original characters.
 fn find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
     if needle_lower.is_empty() {
         return None;
     }
-    let lower = haystack.to_lowercase();
+
+    let mut lower = String::with_capacity(haystack.len());
+    let mut origin: Vec<(usize, usize)> = Vec::with_capacity(haystack.len());
+    for (offset, character) in haystack.char_indices() {
+        let start = offset;
+        let end = offset + character.len_utf8();
+        for lowered in character.to_lowercase() {
+            lower.push(lowered);
+            origin.push((start, end));
+        }
+    }
+
     let position = lower.find(needle_lower)?;
     let char_start = lower[..position].chars().count();
     let char_len = needle_lower.chars().count();
-    let start = haystack.char_indices().nth(char_start)?.0;
-    let end = haystack
-        .char_indices()
-        .nth(char_start + char_len)
-        .map(|(offset, _)| offset)
-        .unwrap_or(haystack.len());
+    let (start, _) = *origin.get(char_start)?;
+    let (_, end) = *origin.get(char_start + char_len - 1)?;
     Some((start, end))
 }
 
@@ -252,9 +260,9 @@ mod tests {
     fn empty_query_returns_all_in_d16_order() {
         let docs = corpus();
         let hits = rank(&docs, "", 50);
-        assert_eq!(hits.len(), 4);
-        // Pinned first.
-        assert_eq!(hits[0].index, 3);
+        let order: Vec<usize> = hits.iter().map(|hit| hit.index).collect();
+        // pinned 3, then updatedAt desc: 2 (01-03), 0 (01-02), 1 (01-01).
+        assert_eq!(order, vec![3, 2, 0, 1]);
     }
 
     #[test]
@@ -446,6 +454,113 @@ mod tests {
     fn unmatched_query_returns_nothing() {
         let docs = corpus();
         assert!(rank(&docs, "完全不存在", 50).is_empty());
+    }
+
+    #[test]
+    fn query_is_trimmed() {
+        let blobs = vec!["项目".to_string()];
+        let docs = vec![Doc {
+            id: "1",
+            title: "项目",
+            content: "",
+            blob: &blobs[0],
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        assert_eq!(rank(&docs, " 项目 ", 50).len(), 1);
+    }
+
+    #[test]
+    fn cjk_highlight_covers_whole_characters() {
+        let titles = ["项目进度"];
+        let blobs = vec!["项目进度".to_string()];
+        let docs = vec![Doc {
+            id: "1",
+            title: titles[0],
+            content: "",
+            blob: &blobs[0],
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        let hits = rank(&docs, "进度", 50);
+        let (start, end) = hits[0].title_highlight.unwrap();
+        assert_eq!(&titles[0][start..end], "进度");
+    }
+
+    #[test]
+    fn expanding_lowercase_maps_back_to_the_original_character() {
+        // U+0130 lowercases to "i" plus a combining dot.
+        let title = "İab";
+        let blobs = vec!["i\u{307}ab".to_string()];
+        let docs = vec![Doc {
+            id: "1",
+            title,
+            content: "",
+            blob: &blobs[0],
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        let hits = rank(&docs, "a", 50);
+        assert_eq!(hits.len(), 1, "query must match through the lowered blob");
+        let (start, end) = hits[0].title_highlight.unwrap();
+        assert_eq!(&title[start..end], "a");
+    }
+
+    #[test]
+    fn sort_order_then_id_breaks_ties() {
+        let titles = ["同名", "同名", "同名", "同名"];
+        let blobs: Vec<String> = titles.iter().map(|title| title.to_string()).collect();
+        let docs: Vec<Doc> = vec![
+            Doc {
+                id: "b",
+                title: titles[0],
+                content: "",
+                blob: &blobs[0],
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 1,
+            },
+            Doc {
+                id: "c",
+                title: titles[1],
+                content: "",
+                blob: &blobs[1],
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 0,
+            },
+            Doc {
+                id: "a",
+                title: titles[2],
+                content: "",
+                blob: &blobs[2],
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 0,
+            },
+            Doc {
+                id: "d",
+                title: titles[3],
+                content: "",
+                blob: &blobs[3],
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 0,
+            },
+        ];
+        let hits = rank(&docs, "同名", 50);
+        let ids: Vec<&str> = hits.iter().map(|hit| docs[hit.index].id).collect();
+        assert_eq!(ids, vec!["a", "c", "d", "b"]);
     }
 
     #[test]
