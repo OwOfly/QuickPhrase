@@ -1,4 +1,4 @@
-# Builds the release zip with the executable, README and LICENSE.
+﻿# Builds the release zip with the executable, README and LICENSE.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\package.ps1 [-SkipBuild]
 
 param([switch]$SkipBuild)
@@ -33,16 +33,34 @@ if ($versionInfo.ProductVersion -ne $version) {
 
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "QuickPhrase-$version-win-x64"
-Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+if (Test-Path $stage) {
+    Remove-Item $stage -Recurse -Force -ErrorAction Stop
+}
+if (Test-Path $stage) { throw "staging directory could not be cleared: $stage" }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
 Copy-Item $exe (Join-Path $stage "QuickPhrase.exe")
 Copy-Item (Join-Path $root "README.md") $stage
 Copy-Item (Join-Path $root "LICENSE") $stage
 
+$expectedNames = @("LICENSE", "QuickPhrase.exe", "README.md")
+$stagedNames = @(Get-ChildItem $stage -File | Select-Object -ExpandProperty Name | Sort-Object)
+$diff = Compare-Object -ReferenceObject ($expectedNames | Sort-Object) -DifferenceObject $stagedNames
+if ($diff) { throw "unexpected staged files: $($diff | Out-String)" }
+
 $zip = Join-Path $dist "QuickPhrase-$version-win-x64.zip"
 Remove-Item $zip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::OpenRead($zip)
+try {
+    $zipNames = @($archive.Entries | Select-Object -ExpandProperty FullName | Sort-Object)
+} finally {
+    $archive.Dispose()
+}
+$diff = Compare-Object -ReferenceObject ($expectedNames | Sort-Object) -DifferenceObject $zipNames
+if ($diff) { throw "unexpected zip contents: $($diff | Out-String)" }
 
 $zipSize = (Get-Item $zip).Length
 if ($zipSize -gt 15MB) {
