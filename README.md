@@ -1,6 +1,6 @@
 # QuickPhrase 快语
 
-Windows 桌面全局快捷短语输入器。当前进度：**M1-9 打包**。
+Windows 桌面全局快捷短语输入器。当前版本：**0.1.0（V1）**。
 
 完整技术方案见 `docs/_ref/final-plan.md`（v4.1），需求见 `docs/_ref/prd-v1.1.md`。
 

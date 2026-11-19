@@ -1,8 +1,8 @@
 # M1-9 打包验收记录（2026-11-19）
 
 - 范围：应用图标、版本资源、发布 zip、SHA256、安装/卸载说明、许可证
-- 依据：`docs/_ref/final-plan.md` §8 M1-9、PRD §15
-- 复核：待独立复核
+- 依据：`docs/_ref/final-plan.md` §8 M1-9、PRD §14.8
+- 复核：r1 glm PASS、kimi/qwen INCOMPLETE（仅因哈希工具缺失）→ r2 **三家 PASS**，T1–T8 全 CLOSED
 
 ## 已实现
 
@@ -52,4 +52,6 @@ zip contents: LICENSE, QuickPhrase.exe, README.md
 
 ## 结论
 
-图标、版本资源、发布 zip、哈希与安装说明已落地；待独立复核后结束 M1。
+图标、版本资源、发布 zip、哈希与安装说明已落地。r1/r2 发现全部闭环，**r2 三家 PASS，M1-9 过门，M1 全部里程碑完成。**
+
+残留：无代码签名、无安装器、干净环境与锁屏截图未验证。`v0.1.0` 标签命令由 `scripts/package.ps1` 打印，待人工执行。
