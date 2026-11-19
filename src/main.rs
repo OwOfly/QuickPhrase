@@ -88,6 +88,9 @@ fn main() {
         let mut message = MSG::default();
         while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
             unsafe {
+                if settings_ui::is_dialog_message(&message) {
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }

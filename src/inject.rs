@@ -69,7 +69,7 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
     }
 
     if !monitor_ok {
-        let copied = clipboard::set_text(raw);
+        let (copied, _) = clipboard::set_text_with_snapshot(raw);
         logging::warn("inject rejected: foreground monitor unavailable");
         return Outcome::Rejected {
             reason: "monitor_unavailable",
@@ -89,20 +89,20 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
     let text = match plan {
         Plan::Insert(text) => text,
         Plan::CopyOnly(reason) => {
-            let copied = clipboard::set_text(raw);
+            let (copied, _) = clipboard::set_text_with_snapshot(raw);
             logging::info(&format!("inject copy-only: {reason} copied={copied}"));
             return Outcome::Rejected { reason, copied };
         }
     };
 
     if let Err(reason) = guard(report) {
-        let copied = clipboard::set_text(raw);
+        let (copied, _) = clipboard::set_text_with_snapshot(raw);
         logging::warn(&format!("inject rejected: {reason} copied={copied}"));
         return Outcome::Rejected { reason, copied };
     }
 
     if !final_check(report, target) {
-        let copied = clipboard::set_text(raw);
+        let (copied, _) = clipboard::set_text_with_snapshot(raw);
         logging::warn("inject rejected: foreground_changed_at_send");
         return Outcome::Rejected {
             reason: "foreground_changed_at_send",

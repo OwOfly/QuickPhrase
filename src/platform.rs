@@ -41,6 +41,14 @@ pub fn win32_code(hresult: u32) -> u32 {
 }
 
 pub fn set_startup(enabled: bool) -> Result<(), String> {
+    // Resolve the executable before opening the key so failures cannot leak it.
+    let value = if enabled {
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        Some(format!("\"{}\"", exe.display()))
+    } else {
+        None
+    };
+
     let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     let mut key = HKEY::default();
     let status = unsafe {
@@ -61,16 +69,15 @@ pub fn set_startup(enabled: bool) -> Result<(), String> {
     }
 
     let name = wide("QuickPhrase");
-    let result = if enabled {
-        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
-        let value = format!("\"{}\"", exe.display());
-        let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
-        for unit in value.encode_utf16().chain(std::iter::once(0)) {
-            bytes.extend_from_slice(&unit.to_le_bytes());
+    let result = match value {
+        Some(value) => {
+            let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
+            for unit in value.encode_utf16().chain(std::iter::once(0)) {
+                bytes.extend_from_slice(&unit.to_le_bytes());
+            }
+            unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(&bytes)) }
         }
-        unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(&bytes)) }
-    } else {
-        unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) }
+        None => unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) },
     };
     unsafe {
         let _ = RegCloseKey(key);

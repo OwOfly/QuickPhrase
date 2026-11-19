@@ -36,9 +36,15 @@ const ID_RESTORE_CLIP: i32 = 306;
 const ID_SAVE: i32 = 307;
 const ID_CANCEL: i32 = 308;
 const ID_STATUS: i32 = 309;
+const ID_LBL_HOTKEY: i32 = 310;
+const ID_LBL_TAB: i32 = 311;
+const ID_LBL_THEME: i32 = 312;
+const ID_LBL_DATA: i32 = 313;
 
 const WIDTH: i32 = 560;
 const HEIGHT: i32 = 430;
+const MIN_WIDTH: i32 = 480;
+const MIN_HEIGHT: i32 = 380;
 const MARGIN: i32 = 16;
 const ROW: i32 = 30;
 const GAP: i32 = 10;
@@ -47,6 +53,10 @@ const SS_LEFT: u32 = 0;
 struct SettingsUi {
     hwnd: HWND,
     hotkey_text: HWND,
+    lbl_hotkey: HWND,
+    lbl_tab: HWND,
+    lbl_theme: HWND,
+    lbl_data: HWND,
     hotkey_record: HWND,
     tab_policy: HWND,
     theme: HWND,
@@ -157,11 +167,12 @@ fn layout(ui: &SettingsUi, width: i32, height: i32) {
     let mut y = margin;
 
     unsafe {
+        let _ = MoveWindow(ui.lbl_hotkey, margin, y, label_width - gap, row, true);
         let _ = MoveWindow(
             ui.hotkey_text,
             field_x,
             y,
-            field_width - scaled(90, ui.dpi),
+            (field_width - scaled(90, ui.dpi)).max(1),
             row,
             true,
         );
@@ -174,15 +185,17 @@ fn layout(ui: &SettingsUi, width: i32, height: i32) {
             true,
         );
         y += row + gap;
+        let _ = MoveWindow(ui.lbl_tab, margin, y, label_width - gap, row, true);
         let _ = MoveWindow(
             ui.tab_policy,
             field_x,
             y,
-            scaled(200, ui.dpi),
+            scaled(260, ui.dpi),
             scaled(180, ui.dpi),
             true,
         );
         y += row + gap;
+        let _ = MoveWindow(ui.lbl_theme, margin, y, label_width - gap, row, true);
         let _ = MoveWindow(
             ui.theme,
             field_x,
@@ -194,6 +207,7 @@ fn layout(ui: &SettingsUi, width: i32, height: i32) {
         y += row + gap;
         let _ = MoveWindow(ui.startup, field_x, y, field_width, row, true);
         y += row + gap;
+        let _ = MoveWindow(ui.lbl_data, margin, y, label_width - gap, row, true);
         let _ = MoveWindow(ui.data_dir, field_x, y, field_width, row, true);
         y += row + gap;
         let _ = MoveWindow(ui.restore_clip, field_x, y, field_width, row, true);
@@ -306,6 +320,38 @@ fn create() -> Option<SettingsUi> {
         ID_HOTKEY_TEXT,
         instance,
     );
+    let lbl_hotkey = create_control(
+        w!("STATIC"),
+        "全局快捷键",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_HOTKEY,
+        instance,
+    );
+    let lbl_tab = create_control(
+        w!("STATIC"),
+        "Tab 键",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_TAB,
+        instance,
+    );
+    let lbl_theme = create_control(
+        w!("STATIC"),
+        "主题",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_THEME,
+        instance,
+    );
+    let lbl_data = create_control(
+        w!("STATIC"),
+        "数据目录",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_DATA,
+        instance,
+    );
     let hotkey_record = create_control(
         w!("BUTTON"),
         "录制",
@@ -382,6 +428,10 @@ fn create() -> Option<SettingsUi> {
     let mut ui = SettingsUi {
         hwnd,
         hotkey_text,
+        lbl_hotkey,
+        lbl_tab,
+        lbl_theme,
+        lbl_data,
         hotkey_record,
         tab_policy,
         theme,
@@ -424,7 +474,21 @@ fn create() -> Option<SettingsUi> {
         }
     }
 
-    add_combo_items(tab_policy, &["Tab 转 4 空格", "保留制表符"]);
+    for label in [lbl_hotkey, lbl_tab, lbl_theme, lbl_data] {
+        unsafe {
+            let _ = SendMessageW(
+                label,
+                WM_SETFONT,
+                Some(WPARAM(ui.font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
+    }
+
+    add_combo_items(
+        tab_policy,
+        &["Tab 转 4 空格（兼容粘贴模式在 M1-7 提供更多选项）"],
+    );
     add_combo_items(theme, &["跟随系统", "浅色", "深色"]);
 
     let mut rect = RECT::default();
@@ -439,14 +503,12 @@ fn create() -> Option<SettingsUi> {
 
 fn load(ui: &mut SettingsUi) {
     let settings = storage::settings_clone().unwrap_or_default();
+    ui.capturing = false;
     ui.original_hotkey = settings.hotkey.clone();
     ui.hotkey_candidate = settings.hotkey.clone();
     ui.loading = true;
     set_text(ui.hotkey_text, &settings.hotkey);
-    set_combo(
-        ui.tab_policy,
-        if settings.tab_policy == "tab" { 1 } else { 0 },
-    );
+    set_combo(ui.tab_policy, 0);
     set_combo(
         ui.theme,
         match settings.theme.as_str() {
@@ -513,7 +575,25 @@ pub fn shutdown() {
     }
 }
 
+/// Let Tab/Enter traverse the settings controls like a dialog.
+pub fn is_dialog_message(message: &MSG) -> bool {
+    let hwnd = UI.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|ui| ui.hwnd))
+    });
+    match hwnd {
+        Some(hwnd) if !hwnd.0.is_null() => unsafe { IsDialogMessageW(hwnd, message).as_bool() },
+        _ => false,
+    }
+}
+
 fn capture_key(ui: &mut SettingsUi, vk: u32) {
+    if vk == 0x1B {
+        ui.capturing = false;
+        status(ui, "已取消录制");
+        return;
+    }
     if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0x5D) {
         return;
     }
@@ -534,11 +614,15 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
     }
     let spec = hotkey::Spec { modifiers, vk };
     let text = spec.text();
-    if text.is_empty() || text == format!("{}", vk as u8 as char) {
-        status(ui, "请同时按下修饰键（Ctrl/Alt/Shift/Win）");
+    if hotkey::parse(&text).is_none() {
+        status(
+            ui,
+            "无效组合：请同时按下 Ctrl/Alt/Shift/Win 与字母、数字或 F1–F24",
+        );
         return;
     }
-    if text != ui.original_hotkey && !hotkey::is_available(ui.hwnd, &text) {
+    let same_as_current = hotkey::parse(&ui.original_hotkey) == Some(spec);
+    if !same_as_current && !hotkey::is_available(ui.hwnd, &text) {
         status(ui, "该快捷键已被其他程序占用");
         return;
     }
@@ -549,17 +633,14 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
 }
 
 fn save(ui: &mut SettingsUi) {
-    let mut settings = storage::settings_clone().unwrap_or_default();
+    let original = storage::settings_clone().unwrap_or_default();
+    let mut settings = original.clone();
     let candidate = if ui.hotkey_candidate.is_empty() {
         ui.original_hotkey.clone()
     } else {
         ui.hotkey_candidate.clone()
     };
-    let tab_policy = if combo_index(ui.tab_policy) == 1 {
-        "tab"
-    } else {
-        "spaces4"
-    };
+    // Tab is always converted to spaces until the paste mode lands in M1-7.
     let theme = match combo_index(ui.theme) {
         1 => "light",
         2 => "dark",
@@ -569,7 +650,7 @@ fn save(ui: &mut SettingsUi) {
         unsafe { SendMessageW(ui.startup, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1 };
 
     settings.hotkey = candidate.clone();
-    settings.tab_policy = tab_policy.to_string();
+    settings.tab_policy = "spaces4".to_string();
     settings.theme = theme.to_string();
     settings.startup = startup;
 
@@ -580,17 +661,30 @@ fn save(ui: &mut SettingsUi) {
 
     // Apply the hotkey on the main window; revert if the system refuses it.
     if let Err(code) = crate::app::apply_hotkey(&candidate) {
-        let _ = crate::app::apply_hotkey(&ui.original_hotkey);
-        status(ui, &format!("快捷键注册失败（{code}），已恢复原设置"));
-        let mut revert = storage::settings_clone().unwrap_or_default();
-        revert.hotkey = ui.original_hotkey.clone();
-        let _ = storage::save_settings(revert);
+        let reapply = crate::app::apply_hotkey(&original.hotkey).is_ok();
+        let rewrite = match storage::save_settings(original.clone()) {
+            Ok(()) => true,
+            Err(err) => {
+                logging::error(&format!("settings: rollback write failed ({err})"));
+                false
+            }
+        };
+        ui.hotkey_candidate = original.hotkey.clone();
+        set_text(ui.hotkey_text, &original.hotkey);
+        if reapply && rewrite {
+            status(ui, &format!("快捷键注册失败（{code}），已恢复原设置"));
+        } else {
+            status(ui, "回滚失败：请重启程序并检查热键设置");
+        }
         return;
     }
     ui.original_hotkey = candidate;
 
     if let Err(code) = platform::set_startup(startup) {
         logging::warn(&format!("settings: startup change failed ({code})"));
+        let mut revert = settings.clone();
+        revert.startup = original.startup;
+        let _ = storage::save_settings(revert);
         status(ui, "设置已保存；开机启动未生效");
         return;
     }
@@ -616,7 +710,84 @@ unsafe extern "system" fn window_proc(
             });
             LRESULT(0)
         }
-        WM_KEYDOWN
+        WM_GETMINMAXINFO => {
+            let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            UI.with(|slot| {
+                let guard = match slot.try_borrow() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let dpi = guard
+                    .as_ref()
+                    .map(|ui| ui.dpi)
+                    .unwrap_or_else(|| unsafe { GetDpiForSystem() });
+                info.ptMinTrackSize.x = scaled(MIN_WIDTH, dpi);
+                info.ptMinTrackSize.y = scaled(MIN_HEIGHT, dpi);
+            });
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            let dpi = (wparam.0 & 0xffff) as u32;
+            let suggested = &*(lparam.0 as *const RECT);
+            let (left, top) = (suggested.left, suggested.top);
+            let (width, height) = (
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+            );
+            UI.with(|slot| {
+                let mut guard = match slot.try_borrow_mut() {
+                    Ok(guard) => guard,
+                    Err(_) => return,
+                };
+                let Some(ui) = guard.as_mut() else {
+                    return;
+                };
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(ui.font.0));
+                }
+                ui.font = make_font(dpi);
+                ui.dpi = dpi;
+                for control in [
+                    ui.hotkey_text,
+                    ui.lbl_hotkey,
+                    ui.lbl_tab,
+                    ui.lbl_theme,
+                    ui.lbl_data,
+                    ui.hotkey_record,
+                    ui.tab_policy,
+                    ui.theme,
+                    ui.startup,
+                    ui.data_dir,
+                    ui.restore_clip,
+                    ui.save,
+                    ui.cancel,
+                    ui.status,
+                ] {
+                    unsafe {
+                        let _ = SendMessageW(
+                            control,
+                            WM_SETFONT,
+                            Some(WPARAM(ui.font.0 as usize)),
+                            Some(LPARAM(1)),
+                        );
+                    }
+                }
+                layout(ui, width, height);
+            });
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    left,
+                    top,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            LRESULT(0)
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN
             if UI.with(|slot| {
                 slot.borrow()
                     .as_ref()
@@ -663,7 +834,7 @@ unsafe extern "system" fn window_proc(
                                 if crate::clipboard::restore(&snapshot) {
                                     status(ui, "已恢复上次剪贴板内容");
                                 } else {
-                                    status(ui, "恢复失败");
+                                    status(ui, "无法恢复：剪贴板已被其他程序修改或快照已失效");
                                 }
                             }
                             _ => status(ui, "没有可恢复的剪贴板内容"),

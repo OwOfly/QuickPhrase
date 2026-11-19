@@ -77,7 +77,12 @@ pub fn parse(text: &str) -> Option<Spec> {
             "alt" => modifiers |= MOD_ALT.0,
             "shift" => modifiers |= MOD_SHIFT.0,
             "win" | "super" => modifiers |= MOD_WIN.0,
-            other => key = key_from_name(other),
+            other => {
+                let parsed = key_from_name(other)?;
+                if key.replace(parsed).is_some() {
+                    return None;
+                }
+            }
         }
     }
     let vk = key?;
@@ -130,7 +135,7 @@ pub fn is_available(hwnd: HWND, text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse, Spec};
+    use super::parse;
 
     #[test]
     fn parses_default_combo() {
@@ -151,9 +156,11 @@ mod tests {
         let spec = parse("Shift+Ctrl+F5").expect("parse");
         assert_eq!(spec.vk, 0x74);
         assert!(spec.text().contains("Shift"));
-        let _ = Spec {
-            modifiers: 0,
-            vk: 0,
-        };
+    }
+
+    #[test]
+    fn rejects_multiple_keys() {
+        assert!(parse("Ctrl+A+B").is_none());
+        assert!(parse("Ctrl+Nope+Q").is_none());
     }
 }

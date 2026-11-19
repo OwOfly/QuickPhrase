@@ -194,7 +194,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             break;
         }
         unsafe {
-            if manage::is_dialog_message(&message) {
+            if manage::is_dialog_message(&message) || settings_ui::is_dialog_message(&message) {
                 continue;
             }
             let _ = TranslateMessage(&message);
@@ -389,11 +389,20 @@ pub fn current_hotkey() -> String {
 
 /// Re-register the global hotkey on the main window.
 pub fn apply_hotkey(text: &str) -> Result<(), String> {
-    let hwnd = STATE.with(|state| state.borrow().hwnd);
+    let (hwnd, paused) = STATE.with(|state| {
+        let state = state.borrow();
+        (state.hwnd, state.paused)
+    });
     if hwnd.0.is_null() {
         return Err("no_main_window".to_string());
     }
     hotkey::unregister(hwnd);
+    if paused {
+        // Stay paused: the new combo is used when the user resumes.
+        STATE.with(|state| state.borrow_mut().hotkey_ok = false);
+        logging::info(&format!("hotkey updated while paused: {text}"));
+        return Ok(());
+    }
     match hotkey::register_text(hwnd, text) {
         Ok(_) => {
             STATE.with(|state| state.borrow_mut().hotkey_ok = true);
@@ -533,7 +542,7 @@ fn toggle_hotkey() {
                 logging::error(&format!("resume hotkey failed: {code}"));
                 platform::error_box(
                     "快捷键冲突",
-                    &format!("无法恢复 Ctrl+Alt+Q（错误码 {code}）。"),
+                    &format!("无法恢复 {}（错误码 {code}）。", current_hotkey()),
                 );
             }
         }
@@ -555,7 +564,7 @@ fn about() {
         "关于 QuickPhrase",
         &format!(
             "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器（M1-4 管理窗口）\n\
+             全局快捷短语输入器（M1-5 设置）\n\
              数据目录：{}",
             env!("CARGO_PKG_VERSION"),
             platform::data_dir().display()

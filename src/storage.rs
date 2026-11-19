@@ -805,7 +805,6 @@ impl Store {
         }
     }
 
-    #[allow(dead_code)] // consumed by M1-5 settings UI
     pub fn settings(&self) -> &Settings {
         &self.settings
     }
