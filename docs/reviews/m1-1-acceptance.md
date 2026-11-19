@@ -20,7 +20,7 @@
 | 种子 | 首次启动写入 3 条短语 + 2 个分类，内容与 M0 硬编码一致 |
 | 面板接线 | 面板列表改为读取 `storage::panel_items()`，不再有硬编码 `ITEMS` |
 | 使用计数 | 注入 worker 结束后 `record_use(id, status)`；`useCount`/`lastUsedAt` 只在 `accepted` 时更新，`lastInsertStatus` 记录全部三态 |
-| 单元测试 | 19 个：种子、revision、record_use（含 rejected 不计数）、备份裁剪、损坏恢复、主文件缺失恢复、恢复不污染备份、全损坏只读、schema 新旧、只读拒绝写入、写失败不泄漏 revision、无临时文件、revision 不复用、未来 schema 不被覆盖、settings 全坏、100 轮模拟故障 |
+| 单元测试 | 22 个：种子、revision、record_use（含 rejected 不计数）、备份裁剪、损坏恢复、主文件缺失恢复、恢复不污染备份、全损坏只读、缺失+备份全坏只读、settings 缺失+备份坏只读、schema 新旧、只读拒绝写入、写失败不泄漏 revision（含 HWM 领先）、无临时文件、revision 不复用、未来 schema 不被覆盖、100 轮模拟故障 |
 
 ## 实测
 

@@ -1137,6 +1137,54 @@ mod tests {
     }
 
     #[test]
+    fn failed_write_after_hwm_advance_keeps_revision() {
+        let dir = temp_dir("hwmahead");
+        let mut store = Store::load_from(&dir);
+        let before = store.data().revision;
+        fs::write(dir.join(HWM_FILE), "100").unwrap();
+        fs::create_dir_all(dir.join(format!("{DATA_FILE}.tmp"))).unwrap();
+        assert!(store.save_data().is_err());
+        // The old `next_revision - 1` rollback would have left 100 here.
+        assert_eq!(store.data().revision, before);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_main_with_all_backups_corrupt_is_read_only() {
+        let dir = temp_dir("missingbad");
+        let mut store = Store::load_from(&dir);
+        store.save_data().unwrap();
+        fs::remove_file(dir.join(DATA_FILE)).unwrap();
+        for backup in backups(&dir, DATA_FILE) {
+            fs::write(backup, b"broken").unwrap();
+        }
+        let broken = Store::load_from(&dir);
+        assert!(broken.is_read_only());
+        assert_eq!(broken.notice(), Some("data_recovery_failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_settings_with_corrupt_backup_is_read_only() {
+        let dir = temp_dir("settingsmissing");
+        let store = Store::load_from(&dir);
+        assert!(!store.is_read_only());
+        fs::create_dir_all(dir.join("backups")).unwrap();
+        fs::write(
+            dir.join("backups")
+                .join("settings-20260101T000000000Z-0001.json"),
+            b"broken",
+        )
+        .unwrap();
+        fs::remove_file(dir.join(SETTINGS_FILE)).unwrap();
+
+        let broken = Store::load_from(&dir);
+        assert!(broken.is_read_only());
+        assert_eq!(broken.notice(), Some("settings_recovery_failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn read_only_record_use_is_rejected_without_mutation() {
         let dir = temp_dir("readonlyuse");
         let mut store = Store::load_from(&dir);
