@@ -60,6 +60,11 @@ pub struct Item {
     pub title: String,
     pub content: String,
     pub category: String,
+    pub blob: String,
+    pub pinned: bool,
+    pub last_used_at: Option<String>,
+    pub updated_at: String,
+    pub sort_order: i32,
 }
 
 struct Fonts {
@@ -956,16 +961,22 @@ fn apply_rounding(hwnd: HWND) {
 }
 
 fn filter_items(items: &[Item], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    items
+    let docs: Vec<crate::search::Doc> = items
         .iter()
-        .enumerate()
-        .filter(|(_, item)| {
-            query.is_empty()
-                || item.title.to_lowercase().contains(&query)
-                || item.content.to_lowercase().contains(&query)
+        .map(|item| crate::search::Doc {
+            id: &item.id,
+            title: &item.title,
+            content: &item.content,
+            blob: &item.blob,
+            pinned: item.pinned,
+            last_used_at: item.last_used_at.as_deref(),
+            updated_at: &item.updated_at,
+            sort_order: item.sort_order,
         })
-        .map(|(index, _)| index)
+        .collect();
+    crate::search::rank(&docs, query, crate::search::DEFAULT_LIMIT)
+        .into_iter()
+        .map(|hit| hit.index)
         .collect()
 }
 
@@ -1422,25 +1433,29 @@ mod tests {
     use super::{filter_items, scaled, Item};
 
     fn items() -> Vec<Item> {
+        fn item(id: &str, title: &str, content: &str, category: &str, sort_order: i32) -> Item {
+            Item {
+                id: id.to_string(),
+                title: title.to_string(),
+                content: content.to_string(),
+                category: category.to_string(),
+                blob: format!("{}\n{}", title.to_lowercase(), content.to_lowercase()),
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                sort_order,
+            }
+        }
         vec![
-            Item {
-                id: "1".to_string(),
-                title: "项目进度回复".to_string(),
-                content: "您好，目前该功能已完成开发。".to_string(),
-                category: "工作沟通".to_string(),
-            },
-            Item {
-                id: "2".to_string(),
-                title: "收到回复".to_string(),
-                content: "好的，已收到。".to_string(),
-                category: "工作沟通".to_string(),
-            },
-            Item {
-                id: "3".to_string(),
-                title: "接口开发说明".to_string(),
-                content: "返回格式为 JSON。".to_string(),
-                category: "开发相关".to_string(),
-            },
+            item(
+                "1",
+                "项目进度回复",
+                "您好，目前该功能已完成开发。",
+                "工作沟通",
+                0,
+            ),
+            item("2", "收到回复", "好的，已收到。", "工作沟通", 1),
+            item("3", "接口开发说明", "返回格式为 JSON。", "开发相关", 2),
         ]
     }
 

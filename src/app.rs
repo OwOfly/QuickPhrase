@@ -390,11 +390,16 @@ fn activate_panel() {
             let capture_total = report.timings_ms.total;
             let items: Vec<panel::Item> = storage::panel_items()
                 .into_iter()
-                .map(|(id, title, content, category)| panel::Item {
-                    id,
-                    title,
-                    content,
-                    category,
+                .map(|row| panel::Item {
+                    id: row.id,
+                    title: row.title,
+                    content: row.content,
+                    category: row.category,
+                    blob: row.blob,
+                    pinned: row.pinned,
+                    last_used_at: row.last_used_at,
+                    updated_at: row.updated_at,
+                    sort_order: row.sort_order,
                 })
                 .collect();
             let micros = panel::show(report, monitor, main, items);

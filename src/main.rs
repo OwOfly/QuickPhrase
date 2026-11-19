@@ -10,6 +10,7 @@ mod inject;
 mod logging;
 mod panel;
 mod platform;
+mod search;
 mod single_instance;
 mod storage;
 mod tray;
@@ -30,6 +31,7 @@ fn main() {
     let panel_bench = has(&args, "--panel-bench");
     let panel_test = has(&args, "--panel-test");
     let inject_test = has(&args, "--inject-test");
+    let search_bench = has(&args, "--search-bench");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -52,6 +54,14 @@ fn main() {
         "QuickPhrase {} starting (selftest={selftest}, bench={bench}, capture_test={capture_test})",
         env!("CARGO_PKG_VERSION")
     ));
+
+    if search_bench {
+        let (p50, p95, max) = search::bench(1_000, 100);
+        logging::info(&format!(
+            "search bench: n=1000 queries=100 p50={p50}us p95={p95}us max={max}us"
+        ));
+        return;
+    }
 
     if capture_test {
         run_capture_test(delay);

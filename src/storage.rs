@@ -176,18 +176,34 @@ pub fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
 }
 
 /// Snapshot for the panel: id, title, content, category name.
-pub fn panel_items() -> Vec<(String, String, String, String)> {
+#[derive(Debug, Clone)]
+pub struct PanelRow {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub category: String,
+    pub blob: String,
+    pub pinned: bool,
+    pub sort_order: i32,
+    pub last_used_at: Option<String>,
+    pub updated_at: String,
+}
+
+pub fn panel_items() -> Vec<PanelRow> {
     with_store(|store| {
         store
             .snippets()
             .into_iter()
-            .map(|snippet| {
-                (
-                    snippet.id.clone(),
-                    snippet.title.clone(),
-                    snippet.content.clone(),
-                    store.category_name(snippet.category_id.as_deref()),
-                )
+            .map(|snippet| PanelRow {
+                id: snippet.id.clone(),
+                title: snippet.title.clone(),
+                content: snippet.content.clone(),
+                category: store.category_name(snippet.category_id.as_deref()),
+                blob: snippet.search_blob.clone(),
+                pinned: snippet.pinned,
+                sort_order: snippet.sort_order,
+                last_used_at: snippet.last_used_at.clone(),
+                updated_at: snippet.updated_at.clone(),
             })
             .collect()
     })
