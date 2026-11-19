@@ -20,7 +20,7 @@
 | 种子 | 首次启动写入 3 条短语 + 2 个分类，内容与 M0 硬编码一致 |
 | 面板接线 | 面板列表改为读取 `storage::panel_items()`，不再有硬编码 `ITEMS` |
 | 使用计数 | 注入 worker 结束后 `record_use(id, status)`；`useCount`/`lastUsedAt` 只在 `accepted` 时更新，`lastInsertStatus` 记录全部三态 |
-| 单元测试 | 13 个：种子、revision、record_use（含 rejected 不计数）、备份裁剪、损坏恢复、主文件缺失恢复、恢复不污染备份、全损坏只读、schema 新旧、只读拒绝写入、无临时文件、100 轮模拟故障 |
+| 单元测试 | 18 个：种子、revision、record_use（含 rejected 不计数）、备份裁剪、损坏恢复、主文件缺失恢复、恢复不污染备份、全损坏只读、schema 新旧、只读拒绝写入、无临时文件、revision 不复用、未来 schema 不被覆盖、settings 全坏、100 轮模拟故障 |
 
 ## 实测
 
@@ -48,6 +48,8 @@ storage: dir=C:\Users\Administrator\AppData\Local\QuickPhrase revision=1 snippet
 | settings/rules 全坏静默重置 | 置 `notice` 并进入只读 |
 | 首写/设置/规则写失败无提示 | 置 `initial_save_failed` / `settings_write_failed` / `rules_write_failed` |
 | `ReplaceFileW` 失败后的回退 | 回退前检查目标仍存在，否则不降级 |
+| 主文件缺失且备份全坏仍 seed | 有备份但全部不可用 → 只读，不覆盖 |
+| 备份复制未刷盘 | 备份 `.tmp` 改名前后 `sync_all` |
 | 备份测试 `<= 5` 恒真 | 收紧为 `== 5` |
 | 陈旧 `.tmp` 残留 | 启动时清理 |
 

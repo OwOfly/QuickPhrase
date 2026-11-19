@@ -581,14 +581,15 @@ fn read_with_recovery<T: DeserializeOwned>(
     if !path.exists() {
         // A missing main file with surviving backups means the user deleted or
         // lost it; recover rather than silently seeding over the old data.
-        for backup in backups(dir, name) {
-            match read_json::<T>(&backup) {
+        let candidates = backups(dir, name);
+        for backup in &candidates {
+            match read_json::<T>(backup) {
                 Ok(value) => {
                     logging::warn(&format!(
                         "storage: {name} missing; recovered from {}",
                         backup.display()
                     ));
-                    return Ok((Some(value), Some(backup)));
+                    return Ok((Some(value), Some(backup.clone())));
                 }
                 Err(err) => logging::warn(&format!(
                     "storage: backup {} unusable ({err})",
@@ -596,7 +597,10 @@ fn read_with_recovery<T: DeserializeOwned>(
                 )),
             }
         }
-        return Ok((None, None));
+        if candidates.is_empty() {
+            return Ok((None, None));
+        }
+        return Err("all_backups_failed".to_string());
     }
 
     match read_json::<T>(&path) {
@@ -683,6 +687,9 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
     let target = directory.join(format!("{stem}-{}-{:04}.json", now_stamp(), backup_seq()));
     let temp = directory.join(format!("{stem}.tmp"));
     fs::copy(&source, &temp).map_err(|err| err.to_string())?;
+    if let Ok(file) = fs::File::open(&temp) {
+        let _ = file.sync_all();
+    }
     if let Err(err) = move_file(&temp, &target, true) {
         let _ = fs::remove_file(&temp);
         return Err(err);
@@ -1136,11 +1143,17 @@ mod tests {
         fs::write(dir.join(DATA_FILE), b"{ not json").unwrap();
         let recovered = Store::load_from(&dir);
         assert!(!recovered.is_read_only());
+        // The newest backup is the state before the last save.
         assert!(recovered
             .data()
             .snippets
             .iter()
-            .any(|item| item.title == "第一版" || item.title == "第二版"));
+            .any(|item| item.title == "第一版"));
+        assert!(!recovered
+            .data()
+            .snippets
+            .iter()
+            .any(|item| item.title == "第二版"));
         let _ = fs::remove_dir_all(&dir);
     }
 
