@@ -104,20 +104,20 @@ fn cmp_last_used(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering 
 
 /// Case-insensitive substring range mapped back to byte offsets in `haystack`.
 /// Lowercasing can expand one character into several (`İ` -> `i` + combining
-/// dot); each lowercase char keeps a link to the original character it came
-/// from, so the returned range always covers whole original characters.
+/// dot). The lowered text comes from `str::to_lowercase` (same rules as the
+/// blob), while each lowered character keeps a link to the original character,
+/// so the returned range always covers whole original characters.
 fn find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
     if needle_lower.is_empty() {
         return None;
     }
 
-    let mut lower = String::with_capacity(haystack.len());
-    let mut origin: Vec<(usize, usize)> = Vec::with_capacity(haystack.len());
+    let lower = haystack.to_lowercase();
+    let mut origin: Vec<(usize, usize)> = Vec::with_capacity(lower.len());
     for (offset, character) in haystack.char_indices() {
         let start = offset;
         let end = offset + character.len_utf8();
-        for lowered in character.to_lowercase() {
-            lower.push(lowered);
+        for _ in character.to_lowercase() {
             origin.push((start, end));
         }
     }
@@ -510,6 +510,26 @@ mod tests {
         assert_eq!(hits.len(), 1, "query must match through the lowered blob");
         let (start, end) = hits[0].title_highlight.unwrap();
         assert_eq!(&title[start..end], "a");
+    }
+
+    #[test]
+    fn final_sigma_matches_through_whole_string_lowercase() {
+        let title = "λόγος";
+        let blobs = vec![title.to_lowercase()];
+        let docs = vec![Doc {
+            id: "1",
+            title,
+            content: "",
+            blob: &blobs[0],
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        let hits = rank(&docs, title, 50);
+        assert_eq!(hits.len(), 1);
+        let (start, end) = hits[0].title_highlight.expect("final sigma highlight");
+        assert_eq!(&title[start..end], title);
     }
 
     #[test]

@@ -1403,7 +1403,9 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
-    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    // Nearest-rank p95: ceil(0.95 * n) -> zero-based index.
+    let p95_rank = (samples.len() * 95 + 99) / 100;
+    let p95 = samples[p95_rank.saturating_sub(1).min(samples.len() - 1)];
     let max = *samples.last().unwrap_or(&0);
     (p50, p95, max)
 }
