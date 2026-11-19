@@ -40,11 +40,13 @@ const ID_LBL_HOTKEY: i32 = 310;
 const ID_LBL_TAB: i32 = 311;
 const ID_LBL_THEME: i32 = 312;
 const ID_LBL_DATA: i32 = 313;
+const ID_INSERTION: i32 = 314;
+const ID_LBL_INSERTION: i32 = 315;
 
-const WIDTH: i32 = 560;
-const HEIGHT: i32 = 430;
-const MIN_WIDTH: i32 = 480;
-const MIN_HEIGHT: i32 = 380;
+const WIDTH: i32 = 580;
+const HEIGHT: i32 = 470;
+const MIN_WIDTH: i32 = 500;
+const MIN_HEIGHT: i32 = 420;
 const MARGIN: i32 = 16;
 const ROW: i32 = 30;
 const GAP: i32 = 10;
@@ -58,6 +60,8 @@ struct SettingsUi {
     lbl_theme: HWND,
     lbl_data: HWND,
     hotkey_record: HWND,
+    insertion: HWND,
+    lbl_insertion: HWND,
     tab_policy: HWND,
     theme: HWND,
     startup: HWND,
@@ -182,6 +186,16 @@ fn layout(ui: &SettingsUi, width: i32, height: i32) {
             y,
             scaled(84, ui.dpi),
             row,
+            true,
+        );
+        y += row + gap;
+        let _ = MoveWindow(ui.lbl_insertion, margin, y, label_width - gap, row, true);
+        let _ = MoveWindow(
+            ui.insertion,
+            field_x,
+            y,
+            scaled(320, ui.dpi),
+            scaled(180, ui.dpi),
             true,
         );
         y += row + gap;
@@ -352,6 +366,22 @@ fn create() -> Option<SettingsUi> {
         ID_LBL_DATA,
         instance,
     );
+    let lbl_insertion = create_control(
+        w!("STATIC"),
+        "输入方式",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
+        hwnd,
+        ID_LBL_INSERTION,
+        instance,
+    );
+    let insertion = create_control(
+        w!("COMBOBOX"),
+        "",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(CBS_DROPDOWNLIST as u32),
+        hwnd,
+        ID_INSERTION,
+        instance,
+    );
     let hotkey_record = create_control(
         w!("BUTTON"),
         "录制",
@@ -433,6 +463,8 @@ fn create() -> Option<SettingsUi> {
         lbl_theme,
         lbl_data,
         hotkey_record,
+        insertion,
+        lbl_insertion,
         tab_policy,
         theme,
         startup,
@@ -453,6 +485,7 @@ fn create() -> Option<SettingsUi> {
     for control in [
         hotkey_text,
         hotkey_record,
+        insertion,
         tab_policy,
         theme,
         startup,
@@ -474,7 +507,7 @@ fn create() -> Option<SettingsUi> {
         }
     }
 
-    for label in [lbl_hotkey, lbl_tab, lbl_theme, lbl_data] {
+    for label in [lbl_hotkey, lbl_insertion, lbl_tab, lbl_theme, lbl_data] {
         unsafe {
             let _ = SendMessageW(
                 label,
@@ -485,10 +518,6 @@ fn create() -> Option<SettingsUi> {
         }
     }
 
-    add_combo_items(
-        tab_policy,
-        &["Tab 转 4 空格（兼容粘贴模式在 M1-7 提供更多选项）"],
-    );
     add_combo_items(theme, &["跟随系统", "浅色", "深色"]);
 
     let mut rect = RECT::default();
@@ -501,14 +530,39 @@ fn create() -> Option<SettingsUi> {
     Some(ui)
 }
 
+fn fill_tab_items(ui: &SettingsUi, paste_mode: bool) {
+    if paste_mode {
+        add_combo_items(
+            ui.tab_policy,
+            &["Tab 转 4 空格", "保留制表符（仅粘贴模式）"],
+        );
+    } else {
+        add_combo_items(ui.tab_policy, &["Tab 转 4 空格（Unicode 模式固定）"]);
+    }
+}
+
 fn load(ui: &mut SettingsUi) {
     let settings = storage::settings_clone().unwrap_or_default();
     ui.capturing = false;
     ui.original_hotkey = settings.hotkey.clone();
     ui.hotkey_candidate = settings.hotkey.clone();
+    let paste_mode = settings.insertion_mode == "paste";
     ui.loading = true;
     set_text(ui.hotkey_text, &settings.hotkey);
-    set_combo(ui.tab_policy, 0);
+    add_combo_items(
+        ui.insertion,
+        &["Unicode 直接输入（默认）", "粘贴模式（Ctrl+V）"],
+    );
+    set_combo(ui.insertion, if paste_mode { 1 } else { 0 });
+    fill_tab_items(ui, paste_mode);
+    set_combo(
+        ui.tab_policy,
+        if paste_mode && settings.tab_policy == "tab" {
+            1
+        } else {
+            0
+        },
+    );
     set_combo(
         ui.theme,
         match settings.theme.as_str() {
@@ -640,7 +694,17 @@ fn save(ui: &mut SettingsUi) {
     } else {
         ui.hotkey_candidate.clone()
     };
-    // Tab is always converted to spaces until the paste mode lands in M1-7.
+    // Tab stays as spaces unless the user opted into paste mode.
+    let insertion = if combo_index(ui.insertion) == 1 {
+        "paste"
+    } else {
+        "unicode"
+    };
+    let tab_policy = if insertion == "paste" && combo_index(ui.tab_policy) == 1 {
+        "tab"
+    } else {
+        "spaces4"
+    };
     let theme = match combo_index(ui.theme) {
         1 => "light",
         2 => "dark",
@@ -650,7 +714,8 @@ fn save(ui: &mut SettingsUi) {
         unsafe { SendMessageW(ui.startup, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1 };
 
     settings.hotkey = candidate.clone();
-    settings.tab_policy = "spaces4".to_string();
+    settings.insertion_mode = insertion.to_string();
+    settings.tab_policy = tab_policy.to_string();
     settings.theme = theme.to_string();
     settings.startup = startup;
 
@@ -765,10 +830,12 @@ unsafe extern "system" fn window_proc(
                 for control in [
                     ui.hotkey_text,
                     ui.lbl_hotkey,
+                    ui.lbl_insertion,
                     ui.lbl_tab,
                     ui.lbl_theme,
                     ui.lbl_data,
                     ui.hotkey_record,
+                    ui.insertion,
                     ui.tab_policy,
                     ui.theme,
                     ui.startup,
@@ -854,6 +921,41 @@ unsafe extern "system" fn window_proc(
                             }
                             _ => status(ui, "没有可恢复的剪贴板内容"),
                         }
+                    }
+                    ID_INSERTION if notification == CBN_SELCHANGE => {
+                        if ui.loading {
+                            return;
+                        }
+                        if combo_index(ui.insertion) == 1 {
+                            let text = platform::wide(
+                                "粘贴模式会用 Ctrl+V 插入，并替换当前剪贴板。\n\
+                                 原纯文本内容可在托盘恢复；非文本内容无法恢复。\n\
+                                 终端、未知区域与多行文本仍只会复制，不会粘贴。\n\n\
+                                 启用粘贴模式吗？",
+                            );
+                            let caption = platform::wide("QuickPhrase 粘贴模式");
+                            let answer = unsafe {
+                                MessageBoxW(
+                                    Some(ui.hwnd),
+                                    PCWSTR(text.as_ptr()),
+                                    PCWSTR(caption.as_ptr()),
+                                    MB_YESNO | MB_ICONWARNING,
+                                )
+                            };
+                            if answer != IDYES {
+                                set_combo(ui.insertion, 0);
+                                fill_tab_items(ui, false);
+                                set_combo(ui.tab_policy, 0);
+                                status(ui, "未启用粘贴模式");
+                                return;
+                            }
+                            fill_tab_items(ui, true);
+                            set_combo(ui.tab_policy, 0);
+                        } else {
+                            fill_tab_items(ui, false);
+                            set_combo(ui.tab_policy, 0);
+                        }
+                        status(ui, "未保存：粘贴模式会替换剪贴板");
                     }
                     ID_TAB_POLICY | ID_THEME if notification == CBN_SELCHANGE => {
                         if !ui.loading {

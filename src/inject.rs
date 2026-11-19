@@ -21,9 +21,45 @@ use crate::capture::{Report, Target, Timings};
 use crate::{clipboard, context, foreground, logging, uia};
 
 const MAX_UNICODE_UNITS: usize = 2_000;
+const MAX_PASTE_UNITS: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertionMode {
+    Unicode,
+    Paste,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub mode: InsertionMode,
+    pub keep_tabs: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            mode: InsertionMode::Unicode,
+            keep_tabs: false,
+        }
+    }
+}
+
+impl Options {
+    pub fn from_settings() -> Self {
+        let settings = crate::storage::settings_clone().unwrap_or_default();
+        Self {
+            mode: if settings.insertion_mode == "paste" {
+                InsertionMode::Paste
+            } else {
+                InsertionMode::Unicode
+            },
+            keep_tabs: settings.tab_policy == "tab",
+        }
+    }
+}
 
 enum Plan {
-    Insert(String),
+    Insert { text: String, paste: bool },
     CopyOnly(&'static str),
 }
 
@@ -62,7 +98,7 @@ impl Outcome {
     }
 }
 
-pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
+pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Outcome {
     let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
     unsafe {
         let _ = SetForegroundWindow(target);
@@ -84,10 +120,11 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
         report.target.target_higher,
         report.target.integrity == "unknown" || report.target.own_integrity == "unknown",
         raw,
+        options,
     );
 
-    let text = match plan {
-        Plan::Insert(text) => text,
+    let (text, paste) = match plan {
+        Plan::Insert { text, paste } => (text, paste),
         Plan::CopyOnly(reason) => {
             let (copied, _) = clipboard::set_text_with_snapshot(raw);
             logging::info(&format!("inject copy-only: {reason} copied={copied}"));
@@ -108,6 +145,10 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool) -> Outcome {
             reason: "foreground_changed_at_send",
             copied,
         };
+    }
+
+    if paste {
+        return run_paste(&text);
     }
 
     let inputs = build_inputs(&text);
@@ -145,6 +186,7 @@ fn plan_text(
     target_higher: bool,
     integrity_unknown: bool,
     raw: &str,
+    options: Options,
 ) -> Plan {
     if raw.is_empty() {
         return Plan::CopyOnly("empty");
@@ -166,6 +208,27 @@ fn plan_text(
     }
 
     let mut text = raw.replace("\r\n", "\n").replace('\r', "\n");
+
+    if options.mode == InsertionMode::Paste {
+        // No clipboard bypass for terminals, unverified regions or multiline
+        // text (§6.5); paste mode is only for a verified single-line editor.
+        if region != "text_editor" {
+            return Plan::CopyOnly("paste_region");
+        }
+        if text.contains('\n') {
+            return Plan::CopyOnly("paste_multiline");
+        }
+        if options.keep_tabs {
+            // keep tabs as-is for visible cursor control
+        } else if text.contains('\t') {
+            text = text.replace('\t', "    ");
+        }
+        if text.encode_utf16().count() > MAX_PASTE_UNITS {
+            return Plan::CopyOnly("too_long");
+        }
+        return Plan::Insert { text, paste: true };
+    }
+
     if text.contains('\t') {
         text = text.replace('\t', "    ");
     }
@@ -179,7 +242,7 @@ fn plan_text(
         return Plan::CopyOnly("too_long");
     }
 
-    Plan::Insert(text)
+    Plan::Insert { text, paste: false }
 }
 
 fn has_forbidden_control(text: &str) -> bool {
@@ -322,6 +385,78 @@ fn modifier_down(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) 
     unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
 }
 
+fn run_paste(text: &str) -> Outcome {
+    // Writing the clipboard is the compatibility mode's core cost; the snapshot
+    // keeps the previous plain text restorable from tray/settings.
+    let (stored, snapshot) = clipboard::set_text_with_snapshot(text);
+    if !stored {
+        logging::warn("paste mode: clipboard write failed");
+        return Outcome::Rejected {
+            reason: "clipboard_write_failed",
+            copied: false,
+        };
+    }
+    let written_sequence = clipboard::sequence();
+
+    let inputs = build_paste_inputs();
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+
+    if sent == 0 {
+        logging::warn("paste mode: SendInput accepted 0 events (blocked)");
+        return Outcome::Partial {
+            reason: "sendinput_blocked",
+        };
+    }
+    if sent as usize != inputs.len() {
+        logging::warn(&format!(
+            "paste mode: SendInput accepted {sent} of {} events",
+            inputs.len()
+        ));
+        return Outcome::Partial {
+            reason: "sendinput_short",
+        };
+    }
+
+    // Another program may have replaced the clipboard after our write; never
+    // overwrite that, only report it.
+    let now_sequence = clipboard::sequence();
+    logging::info(&format!(
+        "paste mode accepted: {} UTF-16 units, clipboard_seq {written_sequence} -> {now_sequence}, non_text={}",
+        text.encode_utf16().count(),
+        snapshot.had_non_text
+    ));
+    Outcome::Accepted
+}
+
+fn build_paste_inputs() -> Vec<INPUT> {
+    const VK_V: u16 = 0x56;
+    vec![
+        make_vk_input(VK_CONTROL.0, false),
+        make_vk_input(VK_V, false),
+        make_vk_input(VK_V, true),
+        make_vk_input(VK_CONTROL.0, true),
+    ]
+}
+
+fn make_vk_input(vk: u16, key_up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: 0,
+                dwFlags: if key_up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    Default::default()
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
 fn build_inputs(text: &str) -> Vec<INPUT> {
     let mut inputs = Vec::new();
     for unit in text.encode_utf16() {
@@ -462,7 +597,7 @@ pub fn selftest() -> bool {
             foreground_events: Vec::new(),
         };
 
-        let outcome = run(&report, "Injected 测试\r\n第二行", true);
+        let outcome = run(&report, "Injected 测试\r\n第二行", true, Options::default());
         pump(Duration::from_millis(400));
 
         let mut buffer = [0u16; 512];
@@ -520,23 +655,54 @@ fn pump(duration: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_text, Plan};
+    use super::{plan_text, InsertionMode, Options, Plan};
 
     fn plan(raw: &str) -> Plan {
-        plan_text("verified", "text", "text_editor", false, false, raw)
+        plan_text(
+            "verified",
+            "text",
+            "text_editor",
+            false,
+            false,
+            raw,
+            Options::default(),
+        )
+    }
+
+    fn paste_plan(region: &str, raw: &str, keep_tabs: bool) -> Plan {
+        plan_text(
+            "verified",
+            "text",
+            region,
+            false,
+            false,
+            raw,
+            Options {
+                mode: InsertionMode::Paste,
+                keep_tabs,
+            },
+        )
     }
 
     #[test]
     fn multiline_text_editor_uses_cr() {
         match plan("a\nb") {
-            Plan::Insert(text) => assert_eq!(text, "a\rb"),
+            Plan::Insert { text, .. } => assert_eq!(text, "a\rb"),
             _ => panic!("expected insert"),
         }
     }
 
     #[test]
     fn multiline_unknown_region_is_copy_only() {
-        match plan_text("verified", "text", "unknown", false, false, "a\nb") {
+        match plan_text(
+            "verified",
+            "text",
+            "unknown",
+            false,
+            false,
+            "a\nb",
+            Options::default(),
+        ) {
             Plan::CopyOnly(reason) => assert_eq!(reason, "multiline_region"),
             _ => panic!("expected copy-only"),
         }
@@ -545,7 +711,7 @@ mod tests {
     #[test]
     fn tabs_become_four_spaces() {
         match plan("a\tb") {
-            Plan::Insert(text) => assert_eq!(text, "a    b"),
+            Plan::Insert { text, .. } => assert_eq!(text, "a    b"),
             _ => panic!("expected insert"),
         }
     }
@@ -569,7 +735,15 @@ mod tests {
 
     #[test]
     fn non_text_capability_is_copy_only() {
-        match plan_text("verified", "readonly", "text_editor", false, false, "a") {
+        match plan_text(
+            "verified",
+            "readonly",
+            "text_editor",
+            false,
+            false,
+            "a",
+            Options::default(),
+        ) {
             Plan::CopyOnly(reason) => assert_eq!(reason, "capability"),
             _ => panic!("expected copy-only"),
         }
@@ -578,7 +752,7 @@ mod tests {
     #[test]
     fn exactly_two_thousand_units_is_allowed() {
         match plan(&"a".repeat(2_000)) {
-            Plan::Insert(text) => assert_eq!(text.encode_utf16().count(), 2_000),
+            Plan::Insert { text, .. } => assert_eq!(text.encode_utf16().count(), 2_000),
             _ => panic!("expected insert"),
         }
     }
@@ -587,7 +761,7 @@ mod tests {
     fn emoji_counts_as_two_units() {
         let thousand = "\u{1F600}".repeat(1_000);
         match plan(&thousand) {
-            Plan::Insert(text) => assert_eq!(text.encode_utf16().count(), 2_000),
+            Plan::Insert { text, .. } => assert_eq!(text.encode_utf16().count(), 2_000),
             _ => panic!("expected insert"),
         }
         match plan(&"\u{1F600}".repeat(1_001)) {
@@ -600,7 +774,7 @@ mod tests {
     fn crlf_and_lone_cr_become_cr() {
         for raw in ["a\r\nb", "a\rb"] {
             match plan(raw) {
-                Plan::Insert(text) => assert_eq!(text, "a\rb"),
+                Plan::Insert { text, .. } => assert_eq!(text, "a\rb"),
                 _ => panic!("expected insert"),
             }
         }
@@ -618,8 +792,16 @@ mod tests {
 
     #[test]
     fn terminal_single_line_is_allowed() {
-        match plan_text("verified", "text", "terminal", false, false, "Get-Process") {
-            Plan::Insert(text) => assert_eq!(text, "Get-Process"),
+        match plan_text(
+            "verified",
+            "text",
+            "terminal",
+            false,
+            false,
+            "Get-Process",
+            Options::default(),
+        ) {
+            Plan::Insert { text, .. } => assert_eq!(text, "Get-Process"),
             _ => panic!("expected insert"),
         }
     }
@@ -627,15 +809,39 @@ mod tests {
     #[test]
     fn identity_elevation_and_integrity_are_copy_only() {
         assert!(matches!(
-            plan_text("unknown", "text", "text_editor", false, false, "a"),
+            plan_text(
+                "unknown",
+                "text",
+                "text_editor",
+                false,
+                false,
+                "a",
+                Options::default()
+            ),
             Plan::CopyOnly("identity_unknown")
         ));
         assert!(matches!(
-            plan_text("verified", "text", "text_editor", true, false, "a"),
+            plan_text(
+                "verified",
+                "text",
+                "text_editor",
+                true,
+                false,
+                "a",
+                Options::default()
+            ),
             Plan::CopyOnly("elevated")
         ));
         assert!(matches!(
-            plan_text("verified", "text", "text_editor", false, true, "a"),
+            plan_text(
+                "verified",
+                "text",
+                "text_editor",
+                false,
+                true,
+                "a",
+                Options::default()
+            ),
             Plan::CopyOnly("integrity_unknown")
         ));
     }
@@ -643,5 +849,90 @@ mod tests {
     #[test]
     fn empty_text_is_copy_only() {
         assert!(matches!(plan(""), Plan::CopyOnly("empty")));
+    }
+
+    #[test]
+    fn paste_mode_allows_long_single_line() {
+        let long = "a".repeat(5_000);
+        match paste_plan("text_editor", &long, false) {
+            Plan::Insert { text, paste } => {
+                assert!(paste);
+                assert_eq!(text.len(), 5_000);
+            }
+            _ => panic!("expected paste insert"),
+        }
+    }
+
+    #[test]
+    fn paste_mode_rejects_other_regions_and_multiline() {
+        for region in ["terminal", "unknown"] {
+            assert!(matches!(
+                paste_plan(region, "a", false),
+                Plan::CopyOnly("paste_region")
+            ));
+        }
+        assert!(matches!(
+            paste_plan("text_editor", "a\nb", false),
+            Plan::CopyOnly("paste_multiline")
+        ));
+    }
+
+    #[test]
+    fn paste_mode_tab_policy() {
+        match paste_plan("text_editor", "a\tb", true) {
+            Plan::Insert { text, paste } => {
+                assert!(paste);
+                assert_eq!(text, "a\tb");
+            }
+            _ => panic!("expected paste insert"),
+        }
+        match paste_plan("text_editor", "a\tb", false) {
+            Plan::Insert { text, .. } => assert_eq!(text, "a    b"),
+            _ => panic!("expected paste insert"),
+        }
+    }
+
+    #[test]
+    fn unicode_mode_ignores_keep_tabs() {
+        let options = Options {
+            mode: InsertionMode::Unicode,
+            keep_tabs: true,
+        };
+        match plan_text(
+            "verified",
+            "text",
+            "text_editor",
+            false,
+            false,
+            "a\tb",
+            options,
+        ) {
+            Plan::Insert { text, .. } => assert_eq!(text, "a    b"),
+            _ => panic!("expected insert"),
+        }
+    }
+
+    #[test]
+    fn paste_mode_still_requires_verified_text_target() {
+        let options = Options {
+            mode: InsertionMode::Paste,
+            keep_tabs: false,
+        };
+        assert!(matches!(
+            plan_text("unknown", "text", "text_editor", false, false, "a", options),
+            Plan::CopyOnly("identity_unknown")
+        ));
+        assert!(matches!(
+            plan_text(
+                "verified",
+                "readonly",
+                "text_editor",
+                false,
+                false,
+                "a",
+                options
+            ),
+            Plan::CopyOnly("capability")
+        ));
     }
 }

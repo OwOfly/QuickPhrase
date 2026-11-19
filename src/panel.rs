@@ -80,6 +80,7 @@ pub struct PanelData {
     pub categories: Vec<(String, String)>,
     pub notice: Option<String>,
     pub copy_only: Option<String>,
+    pub paste_mode: bool,
 }
 
 struct Fonts {
@@ -108,6 +109,7 @@ struct Panel {
     active_category: Option<String>,
     copy_only: Option<String>,
     notice: Option<String>,
+    paste_mode: bool,
     title_highlights: Vec<Option<(usize, usize)>>,
     content_highlights: Vec<Option<(usize, usize)>>,
     last_query: String,
@@ -281,6 +283,7 @@ pub fn show_test() -> u128 {
             categories: Vec::new(),
             notice: None,
             copy_only: None,
+            paste_mode: false,
         },
         true,
         true,
@@ -317,6 +320,7 @@ fn present(
         panel.categories = data.categories;
         panel.notice = data.notice;
         panel.copy_only = data.copy_only;
+        panel.paste_mode = data.paste_mode;
         panel.active_category = None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
@@ -653,6 +657,7 @@ fn create() -> Option<Panel> {
         active_category: None,
         copy_only: None,
         notice: None,
+        paste_mode: false,
         title_highlights: Vec::new(),
         content_highlights: Vec::new(),
         last_query: String::new(),
@@ -782,10 +787,13 @@ fn commit() {
     let session = SESSION.load(Ordering::Relaxed);
     INJECTING.store(true, Ordering::Relaxed);
     let notify_raw = notify.0 as isize;
+    // Read the insertion mode once on the UI thread; the worker never touches
+    // the store beyond the standard use-count update.
+    let options = inject::Options::from_settings();
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
         .spawn(move || {
-            let outcome = inject::run(&report, &content, monitor_ok);
+            let outcome = inject::run(&report, &content, monitor_ok, options);
             let message = outcome.describe();
             logging::info(&format!("inject outcome: {message}"));
             crate::storage::record_use(&item_id, outcome.status());
@@ -1330,7 +1338,15 @@ fn notice_label(token: &str) -> &str {
     }
 }
 
-fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>) -> String {
+fn enter_verb(paste_mode: bool) -> &'static str {
+    if paste_mode {
+        "Enter 粘贴（Ctrl+V）"
+    } else {
+        "Enter 输入"
+    }
+}
+
+fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, paste_mode: bool) -> String {
     match (copy_only, notice) {
         (Some(reason), Some(token)) => format!(
             "存储只读（{}） · 仅复制（{reason}） · Enter 复制 · Esc 关闭",
@@ -1338,15 +1354,20 @@ fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>) -> String {
         ),
         (Some(reason), None) => format!("仅复制（{reason}） · Enter 复制 · Esc 关闭"),
         (None, Some(token)) => format!(
-            "存储只读（{}） · ↑↓ 选择 · Enter 输入 · Esc 关闭",
-            notice_label(token)
+            "存储只读（{}） · ↑↓ 选择 · {} · Esc 关闭",
+            notice_label(token),
+            enter_verb(paste_mode)
         ),
-        (None, None) => "↑↓ 选择 · Enter 输入 · Esc 关闭".to_string(),
+        (None, None) => format!("↑↓ 选择 · {} · Esc 关闭", enter_verb(paste_mode)),
     }
 }
 
 fn footer_text(panel: &Panel) -> String {
-    footer_text_for(panel.copy_only.as_deref(), panel.notice.as_deref())
+    footer_text_for(
+        panel.copy_only.as_deref(),
+        panel.notice.as_deref(),
+        panel.paste_mode,
+    )
 }
 
 fn empty_message_for(
@@ -1930,6 +1951,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
                 categories: Vec::new(),
                 notice: None,
                 copy_only: None,
+                paste_mode: false,
             },
             false,
             false,
@@ -2097,18 +2119,34 @@ mod tests {
     #[test]
     fn footer_priority_and_notice_mapping() {
         assert_eq!(
-            super::footer_text_for(Some("未捕获到目标窗口"), None),
+            super::footer_text_for(Some("未捕获到目标窗口"), None, false),
             "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"
         );
         assert_eq!(
-            super::footer_text_for(Some("身份未知"), Some("schema_newer")),
+            super::footer_text_for(Some("身份未知"), Some("schema_newer"), false),
             "存储只读（数据由更新版本写入） · 仅复制（身份未知） · Enter 复制 · Esc 关闭"
         );
-        assert!(super::footer_text_for(None, Some("schema_newer")).contains("数据由更新版本写入"));
-        assert!(super::footer_text_for(None, Some("unknown_token")).contains("unknown_token"));
+        assert!(super::footer_text_for(None, Some("schema_newer"), false)
+            .contains("数据由更新版本写入"));
+        assert!(
+            super::footer_text_for(None, Some("unknown_token"), false).contains("unknown_token")
+        );
         assert_eq!(
-            super::footer_text_for(None, None),
+            super::footer_text_for(None, None, false),
             "↑↓ 选择 · Enter 输入 · Esc 关闭"
+        );
+    }
+
+    #[test]
+    fn footer_switches_to_paste_verb_in_paste_mode() {
+        assert_eq!(
+            super::footer_text_for(None, None, true),
+            "↑↓ 选择 · Enter 粘贴（Ctrl+V） · Esc 关闭"
+        );
+        // Copy-only still wins over the configured insertion mode.
+        assert_eq!(
+            super::footer_text_for(Some("未捕获到目标窗口"), None, true),
+            "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"
         );
     }
 

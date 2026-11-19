@@ -1334,6 +1334,21 @@ mod tests {
     }
 
     #[test]
+    fn insertion_mode_roundtrips_and_defaults_to_unicode() {
+        let dir = temp_dir("mode");
+        let mut store = Store::load_from(&dir);
+        assert_eq!(store.settings().insertion_mode, "unicode");
+        let mut settings = store.settings().clone();
+        settings.insertion_mode = "paste".to_string();
+        settings.tab_policy = "tab".to_string();
+        store.save_settings(settings).expect("save settings");
+        let reloaded = Store::load_from(&dir);
+        assert_eq!(reloaded.settings().insertion_mode, "paste");
+        assert_eq!(reloaded.settings().tab_policy, "tab");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn content_keeps_trailing_whitespace() {
         let dir = temp_dir("trailing");
         let mut store = Store::load_from(&dir);

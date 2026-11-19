@@ -618,6 +618,9 @@ fn panel_data(copy_only: Option<String>) -> panel::PanelData {
         categories: storage::categories(),
         notice: storage::read_only_notice(),
         copy_only,
+        paste_mode: storage::settings_clone()
+            .map(|settings| settings.insertion_mode == "paste")
+            .unwrap_or(false),
     }
 }
 

@@ -212,13 +212,18 @@ impl UiaClient {
     fn note_timeout(&self) {
         let count = self.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
         crate::logging::warn(&format!("UIA request timed out ({count})"));
-        if count >= 2 {
+        if should_degrade(count) {
             self.unavailable.store(true, Ordering::Relaxed);
             crate::logging::error(
                 "UIA marked unavailable for this session; insertions degrade to copy-only",
             );
         }
     }
+}
+
+/// Two consecutive timeouts are enough to stop asking UIA for the session.
+fn should_degrade(consecutive_timeouts: u32) -> bool {
+    consecutive_timeouts >= 2
 }
 
 impl Drop for UiaClient {
@@ -569,7 +574,15 @@ mod tests {
     use std::sync::mpsc::{self, TryRecvError};
     use std::time::{Duration, Instant};
 
-    use super::{combine_read_only, is_stale_at, Mailbox, Request};
+    use super::{combine_read_only, is_stale_at, should_degrade, Mailbox, Request};
+
+    #[test]
+    fn degrades_after_two_consecutive_uia_timeouts() {
+        assert!(!should_degrade(0));
+        assert!(!should_degrade(1));
+        assert!(should_degrade(2));
+        assert!(should_degrade(3));
+    }
 
     #[test]
     fn mailbox_replaces_pending_request_and_drops_old_reply() {
