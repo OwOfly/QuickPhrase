@@ -27,6 +27,7 @@ pub const BACKUP_KEEP: usize = 5;
 const DATA_FILE: &str = "data.json";
 const SETTINGS_FILE: &str = "settings.json";
 const RULES_FILE: &str = "rules-user.json";
+const HWM_FILE: &str = "revision.hwm";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -224,17 +225,41 @@ impl Store {
 
         clean_stale_temp(dir);
 
-        let (mut data, recovered) = match read_with_recovery::<DataFile>(dir, DATA_FILE) {
-            Ok((Some(data), source)) => (data, source),
-            Ok((None, _)) => (seed(), None),
-            Err(err) => {
-                logging::error(&format!("storage: data.json unusable: {err}"));
-                notice = Some("data_recovery_failed".to_string());
-                read_only = true;
-                (DataFile::default(), None)
+        // Peek the version before any recovery: a file written by a newer
+        // program must never be replaced by an older backup.
+        let future_data = peek_version(&dir.join(DATA_FILE), "schemaVersion")
+            .map(|version| version > u64::from(SCHEMA_VERSION))
+            .unwrap_or(false);
+        let future_settings = peek_version(&dir.join(SETTINGS_FILE), "schemaVersion")
+            .map(|version| version > u64::from(SCHEMA_VERSION))
+            .unwrap_or(false);
+        let future_rules = peek_version(&dir.join(RULES_FILE), "version")
+            .map(|version| version > 1)
+            .unwrap_or(false);
+
+        let (mut data, recovered) = if future_data {
+            logging::warn("storage: data.json schema is newer; skipping recovery");
+            (
+                read_json::<DataFile>(&dir.join(DATA_FILE)).unwrap_or_default(),
+                None,
+            )
+        } else {
+            match read_with_recovery::<DataFile>(dir, DATA_FILE) {
+                Ok((Some(data), source)) => (data, source),
+                Ok((None, _)) => (seed(), None),
+                Err(err) => {
+                    logging::error(&format!("storage: data.json unusable: {err}"));
+                    notice = Some("data_recovery_failed".to_string());
+                    read_only = true;
+                    (DataFile::default(), None)
+                }
             }
         };
 
+        if future_data {
+            notice = Some("schema_newer".to_string());
+            read_only = true;
+        }
         if data.schema_version > SCHEMA_VERSION {
             logging::warn(&format!(
                 "storage: schema {} is newer than {SCHEMA_VERSION}; read-only",
@@ -251,29 +276,56 @@ impl Store {
             read_only = true;
         }
 
-        let (settings, settings_recovered) =
+        let (settings, settings_recovered) = if future_settings {
+            logging::warn("storage: settings schema is newer; skipping recovery");
+            (
+                read_json::<Settings>(&dir.join(SETTINGS_FILE)).unwrap_or_default(),
+                None,
+            )
+        } else {
             match read_with_recovery::<Settings>(dir, SETTINGS_FILE) {
                 Ok((Some(settings), source)) => (settings, source),
                 Ok((None, _)) => (Settings::default(), None),
                 Err(err) => {
                     logging::warn(&format!("storage: settings.json unusable: {err}"));
+                    notice = Some("settings_recovery_failed".to_string());
+                    read_only = true;
                     (Settings::default(), None)
                 }
-            };
+            }
+        };
+        if future_settings {
+            notice = Some("settings_schema_newer".to_string());
+            read_only = true;
+        }
         if settings.schema_version > SCHEMA_VERSION {
             logging::warn("storage: settings schema is newer; read-only");
             notice = Some("settings_schema_newer".to_string());
             read_only = true;
         }
 
-        let (rules, rules_recovered) = match read_with_recovery::<RulesFile>(dir, RULES_FILE) {
-            Ok((Some(rules), source)) => (rules, source),
-            Ok((None, _)) => (RulesFile::default(), None),
-            Err(err) => {
-                logging::warn(&format!("storage: rules-user.json unusable: {err}"));
-                (RulesFile::default(), None)
+        let (rules, rules_recovered) = if future_rules {
+            logging::warn("storage: rules version is newer; skipping recovery");
+            (
+                read_json::<RulesFile>(&dir.join(RULES_FILE)).unwrap_or_default(),
+                None,
+            )
+        } else {
+            match read_with_recovery::<RulesFile>(dir, RULES_FILE) {
+                Ok((Some(rules), source)) => (rules, source),
+                Ok((None, _)) => (RulesFile::default(), None),
+                Err(err) => {
+                    logging::warn(&format!("storage: rules-user.json unusable: {err}"));
+                    notice = Some("rules_recovery_failed".to_string());
+                    read_only = true;
+                    (RulesFile::default(), None)
+                }
             }
         };
+        if future_rules {
+            notice = Some("rules_version_newer".to_string());
+            read_only = true;
+        }
         if rules.version > 1 {
             logging::warn("storage: rules version is newer; read-only");
             notice = Some("rules_version_newer".to_string());
@@ -292,6 +344,7 @@ impl Store {
             read_only,
             notice,
         };
+        store.data.revision = store.data.revision.max(read_hwm(dir));
 
         // Persist a fresh seed, a recovered backup, or default settings so the
         // next start is stable. A recovery rewrite must not rotate the known
@@ -299,15 +352,22 @@ impl Store {
         if !read_only && (recovered.is_some() || !store.path(DATA_FILE).exists()) {
             if let Err(err) = store.save_data_with(false) {
                 logging::error(&format!("storage: initial save failed: {err}"));
+                store.notice = Some("initial_save_failed".to_string());
             }
         }
         if !read_only && (settings_recovered.is_some() || !store.path(SETTINGS_FILE).exists()) {
             let settings = store.settings.clone();
-            let _ = store.write_typed(SETTINGS_FILE, &settings, false);
+            if let Err(err) = store.write_typed(SETTINGS_FILE, &settings, false) {
+                logging::warn(&format!("storage: settings save failed: {err}"));
+                store.notice = Some("settings_write_failed".to_string());
+            }
         }
         if !read_only && (rules_recovered.is_some() || !store.path(RULES_FILE).exists()) {
             let rules = store.rules.clone();
-            let _ = store.write_typed(RULES_FILE, &rules, false);
+            if let Err(err) = store.write_typed(RULES_FILE, &rules, false) {
+                logging::warn(&format!("storage: rules save failed: {err}"));
+                store.notice = Some("rules_write_failed".to_string());
+            }
         }
 
         store
@@ -380,7 +440,8 @@ impl Store {
         for snippet in &mut self.data.snippets {
             snippet.rebuild_blob();
         }
-        let next_revision = self.data.revision + 1;
+        let next_revision = self.data.revision.max(read_hwm(&self.dir)) + 1;
+        write_hwm(&self.dir, next_revision)?;
         self.data.revision = next_revision;
         match self.write_typed(DATA_FILE, &self.data, rotate_backup) {
             Ok(()) => Ok(()),
@@ -394,6 +455,9 @@ impl Store {
     /// `useCount` counts attempts that reached `API_EVENTS_ACCEPTED` (§7).
     /// Rejections still update `lastInsertStatus` for diagnostics.
     pub fn record_use(&mut self, id: &str, status: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
         let now = now_iso();
         let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
             return Err("snippet_missing".to_string());
@@ -566,6 +630,27 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
     serde_json::from_slice(&bytes).map_err(|err| err.to_string())
 }
 
+/// Read only the version field so a file from a newer program is never treated
+/// as corrupt and replaced by an older backup.
+fn peek_version(path: &Path, key: &str) -> Option<u64> {
+    let bytes = fs::read(path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value.get(key)?.as_u64()
+}
+
+fn read_hwm(dir: &Path) -> u64 {
+    fs::read_to_string(dir.join(HWM_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Reserve a revision before writing the data file. An interrupted write
+/// leaves a gap, never a duplicate.
+fn write_hwm(dir: &Path, value: u64) -> Result<(), String> {
+    write_atomic(dir, HWM_FILE, value.to_string().as_bytes(), false)
+}
+
 fn backups(dir: &Path, name: &str) -> Vec<PathBuf> {
     let stem = name.trim_end_matches(".json");
     let directory = dir.join("backups");
@@ -664,6 +749,11 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Re
                 backup_file(dir, name)?;
             }
             if replace_file(&target, &temp).is_err() {
+                // Never fall back if the replace consumed the target: that
+                // would turn a recoverable failure into data loss.
+                if !target.exists() {
+                    return Err("replace_lost_target".to_string());
+                }
                 move_file(&temp, &target, true)?;
             }
         } else {
@@ -951,6 +1041,86 @@ mod tests {
         let older = Store::load_from(&dir);
         assert!(older.is_read_only());
         assert_eq!(older.notice(), Some("schema_older"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recovery_does_not_reuse_a_revision() {
+        let dir = temp_dir("revision");
+        let mut store = Store::load_from(&dir);
+        store.data.snippets[0].title = "第一版".to_string();
+        store.save_data().unwrap();
+        store.data.snippets[0].title = "第二版".to_string();
+        store.save_data().unwrap();
+        let lost_revision = store.data().revision;
+        assert!(lost_revision >= 3);
+
+        fs::write(dir.join(DATA_FILE), b"broken").unwrap();
+        let recovered = Store::load_from(&dir);
+        assert!(!recovered.is_read_only());
+        assert!(
+            recovered.data().revision > lost_revision,
+            "recovered revision {} must exceed lost {}",
+            recovered.data().revision,
+            lost_revision
+        );
+        assert!(recovered
+            .data()
+            .snippets
+            .iter()
+            .any(|item| item.title == "第一版"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newer_schema_with_incompatible_body_is_not_overwritten() {
+        let dir = temp_dir("future");
+        let mut store = Store::load_from(&dir);
+        store.save_data().unwrap();
+
+        // A v2 file whose body would not parse as v1 must not trigger recovery.
+        fs::write(
+            dir.join(DATA_FILE),
+            br#"{ "schemaVersion": 2, "unknownShape": true }"#,
+        )
+        .unwrap();
+        let future = Store::load_from(&dir);
+        assert!(future.is_read_only());
+        assert_eq!(future.notice(), Some("schema_newer"));
+        let bytes = fs::read(dir.join(DATA_FILE)).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("\"schemaVersion\": 2"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_all_corrupt_enters_read_only() {
+        let dir = temp_dir("settingsbad");
+        let mut store = Store::load_from(&dir);
+        store.save_data().unwrap();
+        fs::write(dir.join(SETTINGS_FILE), b"broken").unwrap();
+        let broken = Store::load_from(&dir);
+        assert!(broken.is_read_only());
+        assert_eq!(broken.notice(), Some("settings_recovery_failed"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_record_use_is_rejected_without_mutation() {
+        let dir = temp_dir("readonlyuse");
+        let mut store = Store::load_from(&dir);
+        let id = store.snippets()[0].id.clone();
+        store.read_only = true;
+        assert_eq!(
+            store.record_use(&id, "accepted"),
+            Err("read_only".to_string())
+        );
+        let snippet = store
+            .data()
+            .snippets
+            .iter()
+            .find(|item| item.id == id)
+            .unwrap();
+        assert_eq!(snippet.use_count, 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

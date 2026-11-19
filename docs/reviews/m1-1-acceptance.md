@@ -8,10 +8,10 @@
 
 | 项 | 实现 |
 | --- | --- |
-| 文件 | `%LocalAppData%\QuickPhrase\{data,settings,rules-user}.json` + `backups\` |
+| 文件 | `%LocalAppData%\QuickPhrase\{data,settings,rules-user}.json` + `revision.hwm` + `backups\` |
 | schema | `schemaVersion=1`，camelCase 字段与 §6.2 一致 |
 | 数据模型 | Category / Snippet（含 pinned、sortOrder、useCount、lastUsedAt、lastInsertStatus、deletedAt、searchBlob） |
-| revision | 每次 `save_data` 递增，写失败回滚计数 |
+| revision | 每次 `save_data` 递增，写失败回滚计数；`revision.hwm` 预留高水位，恢复后不复用旧号 |
 | 原子写 | 临时文件 → `sync_all` → 重读比对 → 轮转备份 → `ReplaceFileW`；失败回退 `MoveFileExW(REPLACE_EXISTING)` |
 | 首写 | 目标不存在时 `MoveFileExW` + `MOVEFILE_WRITE_THROUGH` |
 | 备份 | 写入前复制当前文件到 `backups\<name>-<UTC 时间戳>.json`，保留最新 5 份 |
@@ -43,6 +43,11 @@ storage: dir=C:\Users\Administrator\AppData\Local\QuickPhrase revision=1 snippet
 | `useCount` 对 rejected 也 +1 | 仅 `accepted` 递增；三态都记 `lastInsertStatus`；保存失败回滚内存字段 |
 | 备份同毫秒同名覆盖 | 文件名追加单调序号 |
 | 备份复制崩在半途 | 先写 `.tmp` 再改名 |
+| 恢复后 revision 与已丢版本重号 | 新增 `revision.hwm` 高水位：写前预留，恢复取 max+1 |
+| 未来 schema 被恢复流程覆盖 | 解析前先 peek 版本字段，高版本直接只读，不走恢复 |
+| settings/rules 全坏静默重置 | 置 `notice` 并进入只读 |
+| 首写/设置/规则写失败无提示 | 置 `initial_save_failed` / `settings_write_failed` / `rules_write_failed` |
+| `ReplaceFileW` 失败后的回退 | 回退前检查目标仍存在，否则不降级 |
 | 备份测试 `<= 5` 恒真 | 收紧为 `== 5` |
 | 陈旧 `.tmp` 残留 | 启动时清理 |
 
