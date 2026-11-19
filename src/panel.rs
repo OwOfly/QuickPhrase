@@ -81,6 +81,7 @@ pub struct PanelData {
     pub notice: Option<String>,
     pub copy_only: Option<String>,
     pub paste_mode: bool,
+    pub keep_tabs: bool,
 }
 
 struct Fonts {
@@ -110,6 +111,7 @@ struct Panel {
     copy_only: Option<String>,
     notice: Option<String>,
     paste_mode: bool,
+    keep_tabs: bool,
     title_highlights: Vec<Option<(usize, usize)>>,
     content_highlights: Vec<Option<(usize, usize)>>,
     last_query: String,
@@ -284,6 +286,7 @@ pub fn show_test() -> u128 {
             notice: None,
             copy_only: None,
             paste_mode: false,
+            keep_tabs: false,
         },
         true,
         true,
@@ -321,6 +324,7 @@ fn present(
         panel.notice = data.notice;
         panel.copy_only = data.copy_only;
         panel.paste_mode = data.paste_mode;
+        panel.keep_tabs = data.keep_tabs;
         panel.active_category = None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
@@ -658,6 +662,7 @@ fn create() -> Option<Panel> {
         copy_only: None,
         notice: None,
         paste_mode: false,
+        keep_tabs: false,
         title_highlights: Vec::new(),
         content_highlights: Vec::new(),
         last_query: String::new(),
@@ -1389,7 +1394,10 @@ fn selected_paste_ok(panel: &Panel) -> Option<bool> {
     let index = panel.selected_index()?;
     let item_index = *panel.filtered.get(index)?;
     let item = panel.items.get(item_index)?;
-    Some(crate::inject::paste_preview_ok(&item.content))
+    Some(crate::inject::paste_preview_ok(
+        &item.content,
+        panel.keep_tabs,
+    ))
 }
 
 fn footer_text(panel: &Panel) -> String {
@@ -1974,6 +1982,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
                 notice: None,
                 copy_only: None,
                 paste_mode: false,
+                keep_tabs: false,
             },
             false,
             false,

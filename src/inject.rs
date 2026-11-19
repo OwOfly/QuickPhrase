@@ -69,6 +69,7 @@ pub enum Outcome {
         reason: &'static str,
         copied: bool,
         restorable: bool,
+        read_ok: bool,
     },
     Accepted,
     Partial {
@@ -91,8 +92,11 @@ impl Outcome {
                 reason,
                 copied: true,
                 restorable,
+                read_ok,
             } => {
-                if *restorable {
+                if !*read_ok {
+                    format!("未输入，已复制（{reason}；原剪贴板内容无法确认）")
+                } else if *restorable {
                     format!("未输入，已复制（{reason}；原剪贴板内容可在托盘恢复）")
                 } else {
                     format!("未输入，已复制（{reason}；原剪贴板无可恢复的纯文本）")
@@ -124,6 +128,7 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
             reason: "monitor_unavailable",
             copied,
             restorable: snapshot.text.is_some(),
+            read_ok: snapshot.read_ok,
         };
     }
 
@@ -146,6 +151,7 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
                 reason,
                 copied,
                 restorable: snapshot.text.is_some(),
+                read_ok: snapshot.read_ok,
             };
         }
     };
@@ -157,6 +163,7 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
             reason,
             copied,
             restorable: snapshot.text.is_some(),
+            read_ok: snapshot.read_ok,
         };
     }
 
@@ -167,6 +174,7 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
             reason: "foreground_changed_at_send",
             copied,
             restorable: snapshot.text.is_some(),
+            read_ok: snapshot.read_ok,
         };
     }
 
@@ -204,11 +212,17 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
 
 /// Whether a snippet could use paste mode at all, ignoring the target region.
 /// The panel uses this for the Enter hint; the injection guard re-checks.
-pub fn paste_preview_ok(text: &str) -> bool {
+/// Length must match the plan: tabs expand unless `keep_tabs` is set.
+pub fn paste_preview_ok(text: &str, keep_tabs: bool) -> bool {
     if text.contains('\n') || text.contains('\r') || has_forbidden_control(text) {
         return false;
     }
-    text.encode_utf16().count() <= MAX_PASTE_UNITS
+    let units = if keep_tabs {
+        text.encode_utf16().count()
+    } else {
+        text.replace('\t', "    ").encode_utf16().count()
+    };
+    units <= MAX_PASTE_UNITS
 }
 
 fn plan_text(
@@ -425,6 +439,7 @@ fn run_paste(text: &str, target: HWND) -> Outcome {
             reason: "clipboard_write_failed",
             copied: false,
             restorable: false,
+            read_ok: false,
         };
     }
     let written_sequence = snapshot.sequence;
@@ -437,6 +452,7 @@ fn run_paste(text: &str, target: HWND) -> Outcome {
             reason: "foreground_changed_before_paste",
             copied: true,
             restorable: snapshot.text.is_some(),
+            read_ok: snapshot.read_ok,
         };
     }
 
@@ -448,6 +464,7 @@ fn run_paste(text: &str, target: HWND) -> Outcome {
             reason: "clipboard_changed_before_paste",
             copied: false,
             restorable: false,
+            read_ok: false,
         };
     }
 
@@ -967,6 +984,14 @@ mod tests {
             Plan::Insert { text, .. } => assert_eq!(text, "a    b"),
             _ => panic!("expected insert"),
         }
+    }
+
+    #[test]
+    fn paste_preview_accounts_for_tab_expansion() {
+        // 2,501 raw units but 10,001 after the default 4-space expansion.
+        let text = format!("a{}", "\t".repeat(2_500));
+        assert!(!super::paste_preview_ok(&text, false));
+        assert!(super::paste_preview_ok(&text, true));
     }
 
     #[test]

@@ -631,6 +631,9 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
         notice: storage::read_only_notice(),
         copy_only,
         paste_mode,
+        keep_tabs: storage::settings_clone()
+            .map(|settings| settings.tab_policy == "tab")
+            .unwrap_or(false),
     }
 }
 

@@ -116,8 +116,17 @@ fn read_snapshot() -> Snapshot {
             format = EnumClipboardFormats(format);
         }
 
+        let mut read_ok = true;
         let text = if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok() {
-            read_unicode_text()
+            match read_unicode_text() {
+                Some(text) => Some(text),
+                None => {
+                    // The format was advertised but the handle could not be
+                    // read; distinguish that from "no text at all".
+                    read_ok = false;
+                    None
+                }
+            }
         } else {
             None
         };
@@ -128,7 +137,7 @@ fn read_snapshot() -> Snapshot {
             had_non_text,
             // Filled only after *our* write; 0 means "no restore target".
             sequence: 0,
-            read_ok: true,
+            read_ok,
         }
     }
 }

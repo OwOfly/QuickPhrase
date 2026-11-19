@@ -1025,6 +1025,9 @@ unsafe extern "system" fn window_proc(
                             },
                         );
                     } else {
+                        // Re-assert the accepted mode: a modal-time reopen may
+                        // have reloaded the persisted (Unicode) value.
+                        set_combo(ui.insertion, 1);
                         fill_tab_items(ui, true);
                         set_combo(ui.tab_policy, 0);
                         status(ui, "未保存：粘贴模式会替换剪贴板");
