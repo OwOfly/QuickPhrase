@@ -39,6 +39,8 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
         if !doc.blob.contains(&needle) {
             continue;
         }
+        // The blob joins title and content with a newline. A match spanning that
+        // boundary must not count: require a real hit in one of the two fields.
         let title_lower = doc.title.to_lowercase();
         let score = if title_lower == needle {
             400
@@ -46,8 +48,10 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
             300
         } else if title_lower.contains(&needle) {
             200
-        } else {
+        } else if doc.content.to_lowercase().contains(&needle) {
             100
+        } else {
+            continue;
         };
         scored.push((score, index));
     }
@@ -118,8 +122,11 @@ fn find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// 1,000 documents, 100 queries; returns (p50, p95, max) in milliseconds.
+/// 1,000 documents, 100 queries; returns (p50, p95, max) in microseconds.
 pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
+    if queries == 0 {
+        return (0, 0, 0);
+    }
     let titles: Vec<String> = (0..documents)
         .map(|index| format!("项目更新说明 {index} alpha"))
         .collect();
@@ -168,7 +175,9 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
-    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    // Nearest-rank p95: ceil(0.95 * n) -> zero-based index.
+    let p95_rank = (samples.len() * 95 + 99) / 100;
+    let p95 = samples[p95_rank.saturating_sub(1).min(samples.len() - 1)];
     let max = *samples.last().unwrap_or(&0);
     (p50, p95, max)
 }
@@ -343,6 +352,8 @@ mod tests {
 
     #[test]
     fn limit_is_applied_after_ordering() {
+        // Input order is the reverse of sortOrder, so pre-sort truncation would
+        // keep a different set than post-sort truncation.
         let titles: Vec<String> = (0..80).map(|index| format!("条目 {index}")).collect();
         let blobs: Vec<String> = titles.iter().map(|title| title.to_lowercase()).collect();
         let docs: Vec<Doc> = (0..80)
@@ -354,10 +365,87 @@ mod tests {
                 pinned: false,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
-                sort_order: index as i32,
+                sort_order: 79 - index as i32,
             })
             .collect();
-        assert_eq!(rank(&docs, "条目", 50).len(), 50);
+        let hits = rank(&docs, "条目", 50);
+        assert_eq!(hits.len(), 50);
+        assert_eq!(hits[0].index, 79);
+        assert_eq!(hits[49].index, 30);
+    }
+
+    #[test]
+    fn empty_last_used_sorts_last() {
+        let titles = ["同名", "同名"];
+        let blobs = vec!["同名".to_string(), "同名".to_string()];
+        let docs: Vec<Doc> = vec![
+            Doc {
+                id: "never",
+                title: titles[0],
+                content: "",
+                blob: &blobs[0],
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-09-01T00:00:00Z",
+                sort_order: 0,
+            },
+            Doc {
+                id: "used",
+                title: titles[1],
+                content: "",
+                blob: &blobs[1],
+                pinned: false,
+                last_used_at: Some("2026-01-01T00:00:00Z"),
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 1,
+            },
+        ];
+        let hits = rank(&docs, "同名", 50);
+        assert_eq!(docs[hits[0].index].id, "used");
+    }
+
+    #[test]
+    fn newline_spanning_blob_boundary_does_not_match() {
+        let title = "说明";
+        let content = "返回";
+        let blob = "说明\n返回".to_string();
+        let docs = vec![Doc {
+            id: "1",
+            title,
+            content,
+            blob: &blob,
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        assert!(rank(&docs, "说明\n返回", 50).is_empty());
+    }
+
+    #[test]
+    fn empty_title_matches_body_without_title_highlight() {
+        let blobs = vec!["\n返回格式为 json".to_string()];
+        let docs = vec![Doc {
+            id: "1",
+            title: "",
+            content: "返回格式为 JSON",
+            blob: &blobs[0],
+            pinned: false,
+            last_used_at: None,
+            updated_at: "2026-01-01T00:00:00Z",
+            sort_order: 0,
+        }];
+        let hits = rank(&docs, "json", 50);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 100);
+        assert!(hits[0].title_highlight.is_none());
+        assert!(hits[0].content_highlight.is_some());
+    }
+
+    #[test]
+    fn unmatched_query_returns_nothing() {
+        let docs = corpus();
+        assert!(rank(&docs, "完全不存在", 50).is_empty());
     }
 
     #[test]
