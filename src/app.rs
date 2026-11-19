@@ -8,8 +8,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{
-    capture, foreground, hotkey, logging, manage, panel, platform, settings_ui, single_instance,
-    storage, tray, uia,
+    capture, clipboard, foreground, hotkey, logging, manage, panel, platform, settings_ui,
+    single_instance, storage, tray, uia,
 };
 
 const ID_OPEN: u32 = 1001;
@@ -18,6 +18,7 @@ const ID_PAUSE: u32 = 1003;
 const ID_SETTINGS: u32 = 1004;
 const ID_ABOUT: u32 = 1005;
 const ID_EXIT: u32 = 1006;
+const ID_RESTORE_CLIP: u32 = 1007;
 
 const SELFTEST_TIMER: usize = 1;
 
@@ -231,9 +232,7 @@ unsafe extern "system" fn window_proc(
 
     if activate_message != 0 && message == activate_message {
         logging::info("second instance activation requested");
-        if STATE.with(|state| state.borrow().tray_ok) {
-            tray::balloon(hwnd, "QuickPhrase", "QuickPhrase 已在运行。");
-        }
+        activate_panel();
         return LRESULT(0);
     }
 
@@ -337,6 +336,12 @@ unsafe fn show_menu(hwnd: HWND) {
         },
     );
     let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS as usize, w!("设置"));
+    let _ = AppendMenuW(
+        menu,
+        MF_STRING,
+        ID_RESTORE_CLIP as usize,
+        w!("恢复上次剪贴板内容"),
+    );
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, ID_ABOUT as usize, w!("关于 QuickPhrase"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -367,6 +372,29 @@ fn handle_command(id: u32) {
         }
         ID_PAUSE => toggle_hotkey(),
         ID_SETTINGS => settings_ui::show(),
+        ID_RESTORE_CLIP => {
+            let hwnd = STATE.with(|state| state.borrow().hwnd);
+            match clipboard::last_snapshot() {
+                Some(snapshot) if snapshot.text.is_some() => {
+                    if clipboard::restore(&snapshot) {
+                        if !hwnd.0.is_null() {
+                            tray::balloon(hwnd, "QuickPhrase", "已恢复上次剪贴板内容");
+                        }
+                    } else if !hwnd.0.is_null() {
+                        tray::balloon(
+                            hwnd,
+                            "QuickPhrase",
+                            "无法恢复：剪贴板已被其他程序修改或快照已失效",
+                        );
+                    }
+                }
+                _ => {
+                    if !hwnd.0.is_null() {
+                        tray::balloon(hwnd, "QuickPhrase", "没有可恢复的剪贴板内容");
+                    }
+                }
+            }
+        }
         ID_ABOUT => about(),
         ID_EXIT => {
             if !manage::confirm_exit() {

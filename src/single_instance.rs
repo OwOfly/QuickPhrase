@@ -27,8 +27,14 @@ pub fn acquire() -> Acquire {
     }
 }
 
+const ACTIVATION_MESSAGE: PCWSTR = w!("QuickPhrase.Activate");
+
+pub fn activation_message() -> u32 {
+    unsafe { RegisterWindowMessageW(ACTIVATION_MESSAGE) }
+}
+
 pub fn signal_existing() {
-    let message = unsafe { RegisterWindowMessageW(w!("QuickPhrase.Activate")) };
+    let message = activation_message();
     if message == 0 {
         return;
     }
