@@ -3,6 +3,11 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+    KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -32,6 +37,49 @@ pub fn win32_code(hresult: u32) -> u32 {
         hresult & 0xFFFF
     } else {
         hresult
+    }
+}
+
+pub fn set_startup(enabled: bool) -> Result<(), String> {
+    let subkey = wide("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
+    let mut key = HKEY::default();
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            None,
+            PCWSTR::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            None,
+            &mut key,
+            None,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return Err(format!("registry_open:{}", status.0));
+    }
+
+    let name = wide("QuickPhrase");
+    let result = if enabled {
+        let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+        let value = format!("\"{}\"", exe.display());
+        let mut bytes = Vec::with_capacity(value.len() * 2 + 2);
+        for unit in value.encode_utf16().chain(std::iter::once(0)) {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        unsafe { RegSetValueExW(key, PCWSTR(name.as_ptr()), None, REG_SZ, Some(&bytes)) }
+    } else {
+        unsafe { RegDeleteValueW(key, PCWSTR(name.as_ptr())) }
+    };
+    unsafe {
+        let _ = RegCloseKey(key);
+    }
+
+    if result == ERROR_SUCCESS || (!enabled && result == ERROR_FILE_NOT_FOUND) {
+        Ok(())
+    } else {
+        Err(format!("registry_write:{}", result.0))
     }
 }
 

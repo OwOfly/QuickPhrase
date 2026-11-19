@@ -8,8 +8,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{
-    capture, foreground, hotkey, logging, manage, panel, platform, single_instance, storage, tray,
-    uia,
+    capture, foreground, hotkey, logging, manage, panel, platform, settings_ui, single_instance,
+    storage, tray, uia,
 };
 
 const ID_OPEN: u32 = 1001;
@@ -131,26 +131,32 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     }
 
     let mut hotkey_registered = false;
-    match hotkey::register(hwnd) {
-        Ok(()) => {
+    storage::init();
+    let hotkey_text = current_hotkey();
+    match hotkey::register_text(hwnd, &hotkey_text) {
+        Ok(_) => {
             hotkey_registered = true;
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
                 state.hotkey_ok = true;
                 state.paused = false;
             });
-            logging::info("hotkey registered: Ctrl+Alt+Q");
+            logging::info(&format!("hotkey registered: {hotkey_text}"));
         }
         Err(code) => {
             logging::error(&format!("RegisterHotKey failed: {code}"));
             if tray_ok {
-                tray::balloon(hwnd, "快捷键注册失败", "Ctrl+Alt+Q 已被其他程序占用。");
+                tray::balloon(
+                    hwnd,
+                    "快捷键注册失败",
+                    &format!("{hotkey_text} 已被其他程序占用。"),
+                );
             }
             platform::error_box(
                 "快捷键冲突",
                 &format!(
-                    "无法注册 Ctrl+Alt+Q（错误码 {code}）。\n\
-                     请关闭占用该快捷键的程序，或在后续版本的设置中修改。"
+                    "无法注册 {hotkey_text}（错误码 {code}）。\n\
+                     请关闭占用该快捷键的程序，或在设置中修改。"
                 ),
             );
         }
@@ -162,7 +168,6 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         logging::warn("uia warmup failed; captures will be copy-only");
     }
 
-    storage::init();
     panel::precreate();
 
     logging::info(&format!(
@@ -289,6 +294,7 @@ unsafe extern "system" fn window_proc(
         WM_DESTROY => {
             panel::shutdown();
             manage::shutdown();
+            settings_ui::shutdown();
             let (tray_ok, hotkey_ok) = STATE.with(|state| {
                 let state = state.borrow();
                 (state.tray_ok, state.hotkey_ok)
@@ -360,7 +366,7 @@ fn handle_command(id: u32) {
             manage::show(hwnd);
         }
         ID_PAUSE => toggle_hotkey(),
-        ID_SETTINGS => platform::info_box("QuickPhrase", "设置将在 M1 实现。"),
+        ID_SETTINGS => settings_ui::show(),
         ID_ABOUT => about(),
         ID_EXIT => {
             if !manage::confirm_exit() {
@@ -372,6 +378,32 @@ fn handle_command(id: u32) {
             }
         }
         _ => {}
+    }
+}
+
+pub fn current_hotkey() -> String {
+    storage::settings_clone()
+        .map(|settings| settings.hotkey)
+        .unwrap_or_else(|| hotkey::DEFAULT_HOTKEY.to_string())
+}
+
+/// Re-register the global hotkey on the main window.
+pub fn apply_hotkey(text: &str) -> Result<(), String> {
+    let hwnd = STATE.with(|state| state.borrow().hwnd);
+    if hwnd.0.is_null() {
+        return Err("no_main_window".to_string());
+    }
+    hotkey::unregister(hwnd);
+    match hotkey::register_text(hwnd, text) {
+        Ok(_) => {
+            STATE.with(|state| state.borrow_mut().hotkey_ok = true);
+            logging::info(&format!("hotkey changed: {text}"));
+            Ok(())
+        }
+        Err(code) => {
+            STATE.with(|state| state.borrow_mut().hotkey_ok = false);
+            Err(code)
+        }
     }
 }
 
@@ -487,8 +519,8 @@ fn toggle_hotkey() {
     });
 
     if paused {
-        match hotkey::register(hwnd) {
-            Ok(()) => {
+        match hotkey::register_text(hwnd, &current_hotkey()) {
+            Ok(_) => {
                 STATE.with(|state| {
                     let mut state = state.borrow_mut();
                     state.paused = false;

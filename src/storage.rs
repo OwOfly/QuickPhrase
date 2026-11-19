@@ -255,6 +255,17 @@ pub fn data_clone() -> Option<DataFile> {
     with_store(|store| store.data().clone())
 }
 
+pub fn settings_clone() -> Option<Settings> {
+    with_store(|store| store.settings().clone())
+}
+
+pub fn save_settings(next: Settings) -> Result<(), String> {
+    match with_store(|store| store.save_settings(next)) {
+        Some(result) => result,
+        None => Err("storage_unavailable".to_string()),
+    }
+}
+
 pub fn record_use(id: &str, status: &str) {
     match with_store(|store| store.record_use(id, status)) {
         Some(Ok(())) => {}
@@ -777,6 +788,21 @@ impl Store {
 
     pub fn data(&self) -> &DataFile {
         &self.data
+    }
+
+    pub fn save_settings(&mut self, next: Settings) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let previous = self.settings.clone();
+        self.settings = next;
+        match self.write_typed(SETTINGS_FILE, &self.settings, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.settings = previous;
+                Err(err)
+            }
+        }
     }
 
     #[allow(dead_code)] // consumed by M1-5 settings UI

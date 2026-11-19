@@ -12,6 +12,7 @@ mod manage;
 mod panel;
 mod platform;
 mod search;
+mod settings_ui;
 mod single_instance;
 mod storage;
 mod tray;
@@ -35,6 +36,7 @@ fn main() {
     let inject_test = has(&args, "--inject-test");
     let search_bench = has(&args, "--search-bench");
     let manage_test = has(&args, "--manage-test");
+    let settings_test = has(&args, "--settings-test");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -63,6 +65,35 @@ fn main() {
         logging::info(&format!(
             "search bench: n=1000 queries=100 p50={p50}us p95={p95}us max={max}us"
         ));
+        return;
+    }
+
+    if settings_test {
+        let _guard = match single_instance::acquire() {
+            single_instance::Acquire::First(handle) => handle,
+            single_instance::Acquire::AlreadyRunning => {
+                logging::error("settings-test: another QuickPhrase instance is running");
+                std::process::exit(4);
+            }
+            single_instance::Acquire::Failed(code) => {
+                logging::error(&format!("settings-test: mutex failed ({code})"));
+                std::process::exit(4);
+            }
+        };
+        storage::init();
+        if !settings_ui::show_test() {
+            logging::error("settings-test: window creation failed");
+            std::process::exit(4);
+        }
+        let mut message = MSG::default();
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        settings_ui::shutdown();
+        logging::info("settings-test done");
         return;
     }
 
