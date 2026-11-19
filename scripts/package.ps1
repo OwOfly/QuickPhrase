@@ -7,20 +7,29 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
 
-$version = (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' |
-    Select-Object -First 1).Matches[0].Groups[1].Value
-if (-not $version) { throw "cannot read version from Cargo.toml" }
+Push-Location $root
+try {
+    $metadata = & cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or -not $metadata.packages) { throw "cannot read package metadata" }
+    $version = $metadata.packages[0].version
+    if (-not $version) { throw "cannot read version" }
 
-if (-not $SkipBuild) {
-    Push-Location $root
-    try {
+    if (-not $SkipBuild) {
         & cargo build --release
         if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
-    } finally {
-        Pop-Location
     }
+} finally {
+    Pop-Location
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
+
+$versionInfo = (Get-Item $exe).VersionInfo
+if ($versionInfo.FileVersion -ne $version) {
+    throw "resource version '$($versionInfo.FileVersion)' does not match Cargo version '$version'"
+}
+if ($versionInfo.ProductVersion -ne $version) {
+    throw "resource product version '$($versionInfo.ProductVersion)' does not match Cargo version '$version'"
+}
 
 $dist = Join-Path $root "dist"
 $stage = Join-Path $dist "QuickPhrase-$version-win-x64"
@@ -35,14 +44,16 @@ $zip = Join-Path $dist "QuickPhrase-$version-win-x64.zip"
 Remove-Item $zip -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -CompressionLevel Optimal
 
+$zipSize = (Get-Item $zip).Length
+if ($zipSize -gt 15MB) {
+    Remove-Item $zip -Force -ErrorAction SilentlyContinue
+    throw "package exceeds the 15 MB budget: $zipSize bytes"
+}
+
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
 "$hash *QuickPhrase-$version-win-x64.zip" | Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ASCII
 
-$zipSize = (Get-Item $zip).Length
 $exeSize = (Get-Item $exe).Length
-$versionInfo = (Get-Item $exe).VersionInfo
-if ($zipSize -gt 15MB) { throw "package exceeds the 15 MB budget: $zipSize bytes" }
-
 "exe=$exe bytes=$exeSize"
 "zip=$zip bytes=$zipSize"
 "sha256=$hash"

@@ -11,7 +11,7 @@
 | 图标 | `scripts/make-icon.ps1` 用 GDI+ 生成 16/24/32/48/64/128/256 多尺寸 `assets/quickphrase.ico`（紫底白色气泡 + 三行文本） |
 | 图标接线 | `app.rc` 资源 `1 ICON`；主窗口与托盘用 `LoadIconW(instance, 1)`，缺失时回退系统图标 |
 | 版本资源 | `1 VERSIONINFO`：文件/产品版本 0.1.0、产品名「QuickPhrase 快语」、公司、原始文件名 `QuickPhrase.exe`、MIT |
-| 打包脚本 | `scripts/package.ps1`：读 Cargo 版本 → 构建 → 暂存 EXE/README/LICENSE → zip → SHA256SUMS → 校验 ≤15 MB |
+| 打包脚本 | `scripts/package.ps1`：`cargo metadata` 读版本 → 构建 → 资源版本与 Cargo 版本不一致即失败 → 暂存 EXE/README/LICENSE → zip → 校验 ≤15 MB（超限删除产物）→ SHA256SUMS |
 | 许可 | 新增 MIT `LICENSE`；Cargo 元数据一致 |
 | README | 构建、打包、安装/卸载、开机启动清理、数据目录、当前限制 |
 | 发布物 | `dist/QuickPhrase-0.1.0-win-x64.zip` + `dist/SHA256SUMS.txt` |
@@ -20,8 +20,8 @@
 
 ```
 exe bytes=498176
-zip bytes=261800
-sha256=d45f4b246dfd263f8acbfcf7386db3d5ec8e7ab9437a246f87f67f085b43c9cc
+zip bytes=261771
+sha256=0649994224f1835f15b0b52bcdc1627777602a5a134e47c6098c3cfecd540279
 fileVersion=0.1.0 product=QuickPhrase 快语
 zip contents: LICENSE, QuickPhrase.exe, README.md
 ```
