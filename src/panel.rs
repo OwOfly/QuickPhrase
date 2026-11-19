@@ -401,21 +401,21 @@ fn present(
         }
     }
 
-    let (hwnd, edit) = PANEL.with(|slot| {
+    let (hwnd, edit, retheme) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
-            return (HWND::default(), HWND::default());
+            return (HWND::default(), HWND::default(), None);
         };
+        let mut retheme = None;
         if activate {
             let palette = crate::theme::current();
             if palette != panel.palette {
                 destroy_brushes(&panel.brushes);
                 panel.brushes = make_brushes(palette);
                 panel.palette = palette;
-                // Native edit/list chrome is not driven by brushes.
-                ui::set_dark_mode(palette.dark);
-                ui::theme_control(panel.edit, palette.dark);
-                ui::theme_control(panel.list, palette.dark);
+                // Applying a control theme can synchronously touch child
+                // windows, so do it after this RefCell borrow is released.
+                retheme = Some((panel.edit, panel.list, palette.dark));
             }
         }
         panel.report = report;
@@ -439,11 +439,16 @@ fn present(
             panel.copy_only.is_some(),
             panel.notice
         ));
-        (panel.hwnd, panel.edit)
+        (panel.hwnd, panel.edit, retheme)
     });
 
     if hwnd.0.is_null() {
         return 0;
+    }
+    if let Some((edit, list, dark)) = retheme {
+        ui::set_dark_mode(dark);
+        ui::theme_control(edit, dark);
+        ui::theme_control(list, dark);
     }
 
     place();

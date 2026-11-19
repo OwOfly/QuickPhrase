@@ -245,8 +245,9 @@ unsafe extern "system" fn combo_proc(
         std::mem::transmute(old);
     let result = CallWindowProcW(Some(proc), hwnd, message, wparam, lparam);
     if message == WM_PAINT {
-        paint_combo_arrow(hwnd);
-        paint_combo_focus(hwnd);
+        let palette = crate::theme::current();
+        paint_combo_arrow(hwnd, palette);
+        paint_combo_focus(hwnd, palette);
     }
     if message == WM_SETFOCUS || message == WM_KILLFOCUS {
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -260,12 +261,11 @@ unsafe extern "system" fn combo_proc(
     result
 }
 
-fn paint_combo_focus(hwnd: HWND) {
+fn paint_combo_focus(hwnd: HWND, palette: Palette) {
     // The closed display's WM_DRAWITEM has no ODS_FOCUS, so detect focus here.
     if unsafe { GetFocus() } != hwnd {
         return;
     }
-    let palette = crate::theme::current();
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
     let mut rect = RECT::default();
@@ -288,8 +288,7 @@ fn paint_combo_focus(hwnd: HWND) {
     }
 }
 
-fn paint_combo_arrow(hwnd: HWND) {
-    let palette = crate::theme::current();
+fn paint_combo_arrow(hwnd: HWND, palette: Palette) {
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
     let arrow = scaled(22, dpi);
@@ -502,7 +501,7 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, font: 
             let _ = DeleteObject(HGDIOBJ(brush.0));
         }
     }
-    if focused {
+    if focused && !closed {
         let mut inset = rect;
         inset.left += scaled(2, dpi);
         inset.top += scaled(2, dpi);
@@ -611,12 +610,14 @@ pub fn theme_control(hwnd: HWND, dark: bool) {
     let dark = dark && dark_ordinals_supported();
     type AllowDarkModeForWindow =
         unsafe extern "system" fn(HWND, windows::core::BOOL) -> windows::core::BOOL;
-    let module = uxtheme();
-    unsafe {
-        if !module.0.is_null() {
-            if let Some(proc) = GetProcAddress(module, windows::core::PCSTR(133 as *const u8)) {
-                let allow: AllowDarkModeForWindow = std::mem::transmute(proc);
-                let _ = allow(hwnd, windows::core::BOOL::from(dark));
+    if dark_ordinals_supported() {
+        let module = uxtheme();
+        unsafe {
+            if !module.0.is_null() {
+                if let Some(proc) = GetProcAddress(module, windows::core::PCSTR(133 as *const u8)) {
+                    let allow: AllowDarkModeForWindow = std::mem::transmute(proc);
+                    let _ = allow(hwnd, windows::core::BOOL::from(dark));
+                }
             }
         }
     }
