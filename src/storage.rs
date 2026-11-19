@@ -214,14 +214,28 @@ pub fn panel_items() -> Vec<PanelRow> {
 
 pub fn categories() -> Vec<(String, String)> {
     with_store(|store| {
-        let mut categories: Vec<(String, String)> = store
+        let mut categories: Vec<(i32, String, String)> = store
             .data()
             .categories
             .iter()
-            .map(|category| (category.id.clone(), category.name.clone()))
+            .map(|category| {
+                (
+                    category.sort_order,
+                    category.name.clone(),
+                    category.id.clone(),
+                )
+            })
             .collect();
-        categories.sort_by(|left, right| left.1.cmp(&right.1));
+        categories.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
         categories
+            .into_iter()
+            .map(|(_, name, id)| (id, name))
+            .collect()
     })
     .unwrap_or_default()
 }

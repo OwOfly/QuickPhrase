@@ -388,7 +388,11 @@ fn activate_panel() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
-            let data = panel_data();
+            let copy_only = copy_only_reason(&report);
+            if let Some(reason) = &copy_only {
+                logging::info(&format!("panel opens copy-only: {reason}"));
+            }
+            let data = panel_data(copy_only);
             let micros = panel::show(report, monitor, main, data);
 
             if micros == 0 {
@@ -405,11 +409,7 @@ fn activate_panel() {
         None => {
             logging::warn("capture returned no usable foreground window");
             // Per PRD 14.3 the panel still opens; Enter copies instead of typing.
-            let mut data = panel_data();
-            if data.notice.is_none() {
-                data.notice = Some("未捕获到目标窗口".to_string());
-            }
-            data.copy_only = Some("未捕获到目标窗口".to_string());
+            let data = panel_data(Some("未捕获到目标窗口".to_string()));
             let micros = panel::show_copy_only(main, data);
             if micros == 0 {
                 logging::warn("copy-only panel show failed");
@@ -426,7 +426,23 @@ fn activate_panel() {
     ));
 }
 
-fn panel_data() -> panel::PanelData {
+fn copy_only_reason(report: &capture::Report) -> Option<String> {
+    if report.identity != "verified" {
+        return Some("无法验证目标身份".to_string());
+    }
+    if report.capability != "text" {
+        return Some(format!("目标不可输入（{}）", report.capability));
+    }
+    if report.target.target_higher {
+        return Some("目标权限更高".to_string());
+    }
+    if report.target.integrity == "unknown" || report.target.own_integrity == "unknown" {
+        return Some("无法确认完整性".to_string());
+    }
+    None
+}
+
+fn panel_data(copy_only: Option<String>) -> panel::PanelData {
     let items = storage::panel_items()
         .into_iter()
         .map(|row| panel::Item {
@@ -446,7 +462,7 @@ fn panel_data() -> panel::PanelData {
         items,
         categories: storage::categories(),
         notice: storage::read_only_notice(),
-        copy_only: None,
+        copy_only,
     }
 }
 

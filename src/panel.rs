@@ -47,6 +47,7 @@ const CATEGORY_TOP: i32 = 54;
 const CATEGORY_HEIGHT: i32 = 46;
 const LIST_TOP: i32 = 104;
 const FOOTER_HEIGHT: i32 = 42;
+const SS_CENTERIMAGE: i32 = 0x0200;
 const ITEM_HEIGHT: i32 = 64;
 
 const LB_ADDSTRING: u32 = 0x0180;
@@ -93,6 +94,7 @@ struct Brushes {
     search: HBRUSH,
     border: HBRUSH,
     highlight: HBRUSH,
+    accent: HBRUSH,
 }
 
 struct Panel {
@@ -199,6 +201,7 @@ fn make_brushes() -> Brushes {
         search: unsafe { CreateSolidBrush(rgb(248, 248, 253)) },
         border: unsafe { CreateSolidBrush(rgb(233, 235, 243)) },
         highlight: unsafe { CreateSolidBrush(rgb(255, 241, 184)) },
+        accent: unsafe { CreateSolidBrush(rgb(0x76, 0x55, 0xE9)) },
     }
 }
 
@@ -209,6 +212,7 @@ fn destroy_brushes(brushes: &Brushes) {
         let _ = DeleteObject(HGDIOBJ(brushes.search.0));
         let _ = DeleteObject(HGDIOBJ(brushes.border.0));
         let _ = DeleteObject(HGDIOBJ(brushes.highlight.0));
+        let _ = DeleteObject(HGDIOBJ(brushes.accent.0));
     }
 }
 
@@ -566,7 +570,7 @@ fn create() -> Option<Panel> {
             WINDOW_EX_STYLE::default(),
             w!("STATIC"),
             w!("↑↓ 选择 · Enter 输入 · Esc 关闭"),
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_CENTERIMAGE as u32),
             0,
             0,
             10,
@@ -695,20 +699,24 @@ fn commit() {
         (panel.report.take(), panel.notify, panel.hwnd, copy_only)
     });
 
-    if report.is_none() {
+    if copy_only.is_some() || report.is_none() {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         let reason = copy_only.as_deref().unwrap_or("no_target");
-        let copied = crate::clipboard::set_text(&content);
+        let (copied, snapshot) = crate::clipboard::set_text_with_snapshot(&content);
+        crate::storage::record_use(&item_id, "rejected");
         logging::info(&format!(
-            "panel copy-only commit: index={item_index} category={category_id} copied={copied}"
+            "panel copy-only commit: index={item_index} category={category_id} copied={copied} non_text={}",
+            snapshot.had_non_text
         ));
         if !notify.0.is_null() {
-            let message = if copied {
-                format!("已复制（{reason}）")
-            } else {
+            let message = if !copied {
                 format!("复制失败（{reason}）")
+            } else if snapshot.had_non_text {
+                format!("已复制（{reason}；原剪贴板含非文本内容，不可恢复）")
+            } else {
+                format!("已复制（{reason}；原剪贴板内容已被替换）")
             };
             crate::tray::balloon(notify, "QuickPhrase", &message);
         }
@@ -716,9 +724,12 @@ fn commit() {
         return;
     }
 
-    let Some(report) = report else {
-        finish_insert(SESSION.load(Ordering::Relaxed));
-        return;
+    let report = match report {
+        Some(report) => report,
+        None => {
+            finish_insert(SESSION.load(Ordering::Relaxed));
+            return;
+        }
     };
 
     logging::info(&format!(
@@ -1045,10 +1056,10 @@ fn category_chips(
     panel: &Panel,
     right_limit: i32,
     dpi: u32,
-) -> Vec<(Option<String>, RECT)> {
+) -> Vec<(Option<String>, String, RECT)> {
     let mut chips = Vec::new();
-    let top = scaled(CATEGORY_TOP, dpi) + scaled((CATEGORY_HEIGHT - 30) / 2, dpi);
-    let height = scaled(30, dpi);
+    let top = scaled(CATEGORY_TOP, dpi) + scaled((CATEGORY_HEIGHT - 32) / 2, dpi);
+    let height = scaled(32, dpi);
     let mut x = scaled(16, dpi);
     let mut entries: Vec<(Option<String>, String)> = vec![(None, "全部".to_string())];
     entries.extend(
@@ -1075,7 +1086,7 @@ fn category_chips(
                 right: x + width,
                 bottom: top + height,
             };
-            chips.push((id, chip));
+            chips.push((id, name, chip));
             x += width + scaled(8, dpi);
         }
     }
@@ -1087,29 +1098,22 @@ fn draw_categories(hdc: HDC, panel: &Panel, right_limit: i32, dpi: u32) {
     unsafe {
         let previous = SelectObject(hdc, HGDIOBJ(font.0));
         SetBkMode(hdc, TRANSPARENT);
-        for (id, mut rect) in category_chips(hdc, panel, right_limit, dpi) {
+        for (id, name, mut rect) in category_chips(hdc, panel, right_limit, dpi) {
             let selected = match (&id, &panel.active_category) {
                 (None, None) => true,
                 (Some(left), Some(right)) => left == right,
                 _ => false,
             };
-            let mut label = platform::wide(
-                id.as_ref()
-                    .and_then(|id| {
-                        panel
-                            .categories
-                            .iter()
-                            .find(|(value, _)| value == id)
-                            .map(|(_, name)| name.as_str())
-                    })
-                    .unwrap_or("全部"),
-            );
+            let mut label = platform::wide(&name);
             let brush = if selected {
                 panel.brushes.selected
             } else {
                 panel.brushes.search
             };
             FillRect(hdc, &rect, brush);
+            if selected {
+                let _ = FrameRect(hdc, &rect, panel.brushes.accent);
+            }
             SetTextColor(
                 hdc,
                 if selected {
@@ -1206,7 +1210,7 @@ fn draw_match(
         bottom: rect.bottom,
     };
     let mut suffix_rect = RECT {
-        left: rect.left + prefix_size.cx + matched_size.cx,
+        left: match_rect.right,
         top: rect.top,
         right: rect.right,
         bottom: rect.bottom,
@@ -1218,7 +1222,7 @@ fn draw_match(
             hdc,
             &mut prefix_wide,
             &mut prefix_rect,
-            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX,
+            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
         if match_rect.right > match_rect.left {
             FillRect(hdc, &match_rect, panel.brushes.highlight);
@@ -1285,30 +1289,79 @@ fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterRe
     (filtered, title_highlights, content_highlights)
 }
 
-fn footer_text(panel: &Panel) -> String {
-    if let Some(reason) = &panel.copy_only {
-        return format!("仅复制（{reason}） · Enter 复制 · Esc 关闭");
+fn notice_label(token: &str) -> &str {
+    match token {
+        "schema_newer" => "数据由更新版本写入",
+        "schema_older" => "数据版本过旧",
+        "settings_schema_newer" => "设置由更新版本写入",
+        "rules_version_newer" => "规则由更新版本写入",
+        "data_recovery_failed" => "数据恢复失败",
+        "settings_recovery_failed" => "设置恢复失败",
+        "rules_recovery_failed" => "规则恢复失败",
+        "initial_save_failed" => "首次保存失败",
+        "settings_write_failed" => "设置保存失败",
+        "rules_write_failed" => "规则保存失败",
+        "data_dir_unavailable" => "数据目录不可用",
+        other => other,
     }
-    if let Some(notice) = &panel.notice {
-        return format!("存储只读（{notice}） · ↑↓ 选择 · Enter 输入 · Esc 关闭");
-    }
-    "↑↓ 选择 · Enter 输入 · Esc 关闭".to_string()
 }
 
-fn empty_message(panel: &Panel) -> Option<&'static str> {
-    if !panel.filtered.is_empty() {
+fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>) -> String {
+    match (copy_only, notice) {
+        (Some(reason), Some(token)) => format!(
+            "存储只读（{}） · 仅复制（{reason}） · Enter 复制 · Esc 关闭",
+            notice_label(token)
+        ),
+        (Some(reason), None) => format!("仅复制（{reason}） · Enter 复制 · Esc 关闭"),
+        (None, Some(token)) => format!(
+            "存储只读（{}） · ↑↓ 选择 · Enter 输入 · Esc 关闭",
+            notice_label(token)
+        ),
+        (None, None) => "↑↓ 选择 · Enter 输入 · Esc 关闭".to_string(),
+    }
+}
+
+fn footer_text(panel: &Panel) -> String {
+    footer_text_for(panel.copy_only.as_deref(), panel.notice.as_deref())
+}
+
+fn empty_message_for(
+    items: usize,
+    filtered: usize,
+    query: &str,
+    has_category: bool,
+    load_failed: bool,
+) -> Option<&'static str> {
+    if filtered != 0 {
         return None;
     }
-    if panel.items.is_empty() {
+    if items == 0 {
+        if load_failed {
+            return Some("加载失败，已进入只读");
+        }
         return Some("还没有短语");
     }
-    if !panel.last_query.is_empty() {
+    if !query.is_empty() {
         return Some("没有匹配的短语");
     }
-    if panel.active_category.is_some() {
+    if has_category {
         return Some("该分类下还没有短语");
     }
     None
+}
+
+fn empty_message(panel: &Panel) -> Option<&'static str> {
+    let load_failed = matches!(
+        panel.notice.as_deref(),
+        Some("data_recovery_failed" | "schema_newer" | "schema_older")
+    );
+    empty_message_for(
+        panel.items.len(),
+        panel.filtered.len(),
+        &panel.last_query,
+        panel.active_category.is_some(),
+        load_failed,
+    )
 }
 
 fn populate(query: &str) {
@@ -1360,6 +1413,7 @@ fn populate(query: &str) {
             panel.title_highlights = title_highlights;
             panel.content_highlights = content_highlights;
             panel.last_query = query.trim().to_string();
+            logging::info(&format!("panel filter: matches={}", panel.filtered.len()));
         }
     });
 
@@ -1371,6 +1425,8 @@ fn populate(query: &str) {
         if !titles.is_empty() {
             let _ = send(list, LB_SETCURSEL, 0, 0);
         }
+        // The list is a child window and would paint over the empty-state text.
+        let _ = ShowWindow(list, if titles.is_empty() { SW_HIDE } else { SW_SHOW });
         let label = platform::wide(&footer_label);
         let _ = SetWindowTextW(footer, PCWSTR(label.as_ptr()));
         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1616,6 +1672,7 @@ unsafe extern "system" fn window_proc(
                 let guard = slot.borrow();
                 let panel = guard.as_ref()?;
                 let hdc = unsafe { GetDC(Some(hwnd)) };
+                let previous = unsafe { SelectObject(hdc, HGDIOBJ(panel.fonts.body.0)) };
                 let chips = category_chips(
                     hdc,
                     panel,
@@ -1629,14 +1686,15 @@ unsafe extern "system" fn window_proc(
                     panel.dpi,
                 );
                 unsafe {
+                    let _ = SelectObject(hdc, previous);
                     let _ = ReleaseDC(Some(hwnd), hdc);
                 }
                 chips
                     .into_iter()
-                    .find(|(_, rect)| {
+                    .find(|(_, _, rect)| {
                         x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
                     })
-                    .map(|(id, _)| id)
+                    .map(|(id, _, _)| id)
             });
 
             if let Some(id) = chosen {
@@ -1652,16 +1710,21 @@ unsafe extern "system" fn window_proc(
                     panel.active_category = id;
                     true
                 });
-                if changed {
-                    let edit = PANEL.with(|slot| {
-                        slot.borrow()
-                            .as_ref()
-                            .map(|panel| panel.edit)
-                            .unwrap_or_default()
-                    });
-                    if !edit.0.is_null() {
-                        let query = read_text(edit);
-                        populate(&query);
+                let edit = PANEL.with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|panel| panel.edit)
+                        .unwrap_or_default()
+                });
+                if changed && !edit.0.is_null() {
+                    let query = read_text(edit);
+                    populate(&query);
+                }
+                // A click on the parent window moves keyboard focus away from
+                // the search box; the panel is keyboard-first.
+                if !edit.0.is_null() {
+                    unsafe {
+                        let _ = SetFocus(Some(edit));
                     }
                 }
             }
@@ -1954,6 +2017,55 @@ mod tests {
         assert_eq!(filtered, vec![2]);
         assert!(titles[0].is_none());
         assert!(contents[0].is_some());
+    }
+
+    #[test]
+    fn category_and_query_highlights_align() {
+        let items = items();
+        let (filtered, titles, contents) = filter_items(&items, Some("c2"), "JSON");
+        assert_eq!(filtered, vec![2]);
+        assert!(titles[0].is_none());
+        assert!(contents[0].is_some());
+    }
+
+    #[test]
+    fn empty_message_priority() {
+        assert_eq!(
+            super::empty_message_for(0, 0, "", false, false),
+            Some("还没有短语")
+        );
+        assert_eq!(
+            super::empty_message_for(0, 0, "", false, true),
+            Some("加载失败，已进入只读")
+        );
+        assert_eq!(
+            super::empty_message_for(3, 0, "abc", false, false),
+            Some("没有匹配的短语")
+        );
+        assert_eq!(
+            super::empty_message_for(3, 0, "", true, false),
+            Some("该分类下还没有短语")
+        );
+        assert_eq!(super::empty_message_for(3, 0, "", false, false), None);
+        assert_eq!(super::empty_message_for(3, 1, "abc", true, false), None);
+    }
+
+    #[test]
+    fn footer_priority_and_notice_mapping() {
+        assert_eq!(
+            super::footer_text_for(Some("未捕获到目标窗口"), None),
+            "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"
+        );
+        assert_eq!(
+            super::footer_text_for(Some("身份未知"), Some("schema_newer")),
+            "存储只读（数据由更新版本写入） · 仅复制（身份未知） · Enter 复制 · Esc 关闭"
+        );
+        assert!(super::footer_text_for(None, Some("schema_newer")).contains("数据由更新版本写入"));
+        assert!(super::footer_text_for(None, Some("unknown_token")).contains("unknown_token"));
+        assert_eq!(
+            super::footer_text_for(None, None),
+            "↑↓ 选择 · Enter 输入 · Esc 关闭"
+        );
     }
 
     #[test]
