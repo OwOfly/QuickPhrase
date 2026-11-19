@@ -690,13 +690,15 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
     let target = directory.join(format!("{stem}-{}-{:04}.json", now_stamp(), backup_seq()));
     let temp = directory.join(format!("{stem}.tmp"));
     fs::copy(&source, &temp).map_err(|err| err.to_string())?;
-    if let Ok(file) = fs::File::open(&temp) {
-        let _ = file.sync_all();
+    if let Err(err) = sync_file(&temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
     }
     if let Err(err) = move_file(&temp, &target, true) {
         let _ = fs::remove_file(&temp);
         return Err(err);
     }
+    sync_file(&target)?;
 
     // Keep the newest BACKUP_KEEP files. A failed delete must not loop: the
     // list would not change and the write path holds the store lock.
@@ -720,6 +722,14 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
 fn backup_seq() -> u64 {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn sync_file(path: &Path) -> Result<(), String> {
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    file.sync_all().map_err(|err| err.to_string())
 }
 
 fn clean_stale_temp(dir: &Path) {
