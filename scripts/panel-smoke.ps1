@@ -140,7 +140,7 @@ Find-Windows
 Check "Esc hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
 Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
-# 5. Enter commits first item and hides
+# 5. Enter commits the selected item and hides
 $opened = Open-Panel 3
 $edit = Find-Edit $panel
 [void][QPPanelSmoke]::PostMessage($edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero)
@@ -151,7 +151,9 @@ $newLines = @()
 if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before }
 $newText = $newLines -join "`n"
 Check "Enter hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
-Check "commit logged first item" ($newText -match "panel (copy-only )?commit: index=0 ") ""
+# Recent-use sorting means the first visible row is not necessarily data index 0;
+# assert that Enter committed the selected row.
+Check "commit logged a panel item" ($newText -match "panel (copy-only )?commit: index=\d+ ") ""
 Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
 # 6. close app

@@ -81,6 +81,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代 UI v2 的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 123/123，panel-smoke 10/10，tray-smoke 19/19；smoke.ps1 仅内存项为 UI v2 既有偏差（基线复测 40.44 MB，阈值 35 MB）。
 
+## 阶段二排序增强后重打包（2026-11-20）
+
+阶段二首个模块（面板最近使用 / 最常使用排序及管理窗口编辑框防御修复，见 `docs/reviews/stage2-sort-20261120.md`）经 r1/r2 三家复核后进入发布包：
+
+```
+exe bytes=780288
+zip bytes=476304
+sha256=c1a2544fb4744b529b915cf0741e6b64914821926b3925eebe1cc36ca93ed007
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代阶段一的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 127/127，panel-smoke 10/10，tray-smoke 19/19。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

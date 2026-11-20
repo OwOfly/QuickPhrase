@@ -68,6 +68,7 @@ pub struct Item {
     pub last_used_at: Option<String>,
     pub updated_at: String,
     pub sort_order: i32,
+    pub use_count: u64,
 }
 
 pub struct PanelData {
@@ -78,6 +79,7 @@ pub struct PanelData {
     pub paste_mode: bool,
     pub keep_tabs: bool,
     pub hotkey_hint: String,
+    pub sort_mode: crate::search::SortMode,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,6 +114,7 @@ struct Panel {
     filtered: Vec<usize>,
     items: Vec<Item>,
     categories: Vec<(String, String)>,
+    sort_mode: crate::search::SortMode,
     active_category: Option<String>,
     copy_only: Option<String>,
     notice: Option<String>,
@@ -417,11 +420,11 @@ pub fn show_test() -> u128 {
             last_used_at: row.last_used_at,
             updated_at: row.updated_at,
             sort_order: row.sort_order,
+            use_count: row.use_count,
         })
         .collect();
-    let hotkey_hint = crate::storage::settings_clone()
-        .map(|s| s.hotkey)
-        .unwrap_or_else(|| "Ctrl+Alt+Q".to_string());
+    let settings = crate::storage::settings_clone().unwrap_or_default();
+    let hotkey_hint = settings.hotkey.clone();
     present(
         None,
         None,
@@ -434,6 +437,7 @@ pub fn show_test() -> u128 {
             paste_mode: false,
             keep_tabs: false,
             hotkey_hint,
+            sort_mode: crate::search::SortMode::from_setting(&settings.panel_sort),
         },
         true,
         true,
@@ -478,6 +482,7 @@ fn present(
         panel.notify = notify;
         panel.items = data.items;
         panel.categories = data.categories;
+        panel.sort_mode = data.sort_mode;
         panel.notice = data.notice;
         panel.copy_only = data.copy_only;
         panel.paste_mode = data.paste_mode;
@@ -810,6 +815,7 @@ fn create() -> Option<Panel> {
         filtered: Vec::new(),
         items: Vec::new(),
         categories: Vec::new(),
+        sort_mode: crate::search::SortMode::Recent,
         active_category: None,
         copy_only: None,
         notice: None,
@@ -1784,7 +1790,17 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
 type Highlight = Option<(usize, usize)>;
 type FilterResult = (Vec<usize>, Vec<Highlight>, Vec<Highlight>);
 
+#[cfg(test)]
 fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterResult {
+    filter_items_mode(items, category, query, crate::search::SortMode::Recent)
+}
+
+fn filter_items_mode(
+    items: &[Item],
+    category: Option<&str>,
+    query: &str,
+    sort_mode: crate::search::SortMode,
+) -> FilterResult {
     let subset: Vec<usize> = items
         .iter()
         .enumerate()
@@ -1812,12 +1828,35 @@ fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterRe
         })
         .collect();
 
-    let hits = crate::search::rank(&docs, query, crate::search::DEFAULT_LIMIT);
-    let mut filtered = Vec::with_capacity(hits.len());
-    let mut title_highlights = Vec::with_capacity(hits.len());
-    let mut content_highlights = Vec::with_capacity(hits.len());
-    for hit in hits {
-        filtered.push(subset[hit.index]);
+    let limit = if sort_mode == crate::search::SortMode::MostUsed {
+        usize::MAX
+    } else {
+        crate::search::DEFAULT_LIMIT
+    };
+    let hits = crate::search::rank(&docs, query, limit);
+    let mut ordered: Vec<(crate::search::Hit, usize)> = hits
+        .into_iter()
+        .map(|hit| {
+            let item_index = subset[hit.index];
+            (hit, item_index)
+        })
+        .collect();
+    if sort_mode == crate::search::SortMode::MostUsed {
+        ordered.sort_by(|left, right| {
+            right
+                .0
+                .score
+                .cmp(&left.0.score)
+                .then_with(|| items[right.1].pinned.cmp(&items[left.1].pinned))
+                .then_with(|| items[right.1].use_count.cmp(&items[left.1].use_count))
+        });
+        ordered.truncate(crate::search::DEFAULT_LIMIT);
+    }
+    let mut filtered = Vec::with_capacity(ordered.len());
+    let mut title_highlights = Vec::with_capacity(ordered.len());
+    let mut content_highlights = Vec::with_capacity(ordered.len());
+    for (hit, item_index) in ordered {
+        filtered.push(item_index);
         title_highlights.push(hit.title_highlight);
         content_highlights.push(hit.content_highlight);
     }
@@ -1938,8 +1977,12 @@ fn populate(query: &str) {
                 Vec::new(),
             );
         };
-        let (filtered, title_highlights, content_highlights) =
-            filter_items(&panel.items, panel.active_category.as_deref(), query);
+        let (filtered, title_highlights, content_highlights) = filter_items_mode(
+            &panel.items,
+            panel.active_category.as_deref(),
+            query,
+            panel.sort_mode,
+        );
         (
             panel.hwnd,
             panel.list,
@@ -2484,6 +2527,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             sort_order: index,
+            use_count: index as u64,
         })
         .collect();
     let mut samples = Vec::with_capacity(iterations as usize);
@@ -2500,6 +2544,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
                 paste_mode: false,
                 keep_tabs: false,
                 hotkey_hint: "Ctrl+Alt+Q".to_string(),
+                sort_mode: crate::search::SortMode::Recent,
             },
             false,
             false,
@@ -2534,7 +2579,7 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_items, scaled, Item};
+    use super::{filter_items, filter_items_mode, scaled, Item};
 
     fn rank_ids(items: &[Item], query: &str) -> Vec<usize> {
         filter_items(items, None, query).0
@@ -2560,6 +2605,7 @@ mod tests {
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z".to_string(),
                 sort_order,
+                use_count: 0,
             }
         }
         vec![
@@ -2586,6 +2632,41 @@ mod tests {
     #[test]
     fn empty_query_returns_every_item() {
         assert_eq!(rank_ids(&items(), ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn most_used_mode_orders_by_use_count_then_score() {
+        let mut items = items();
+        items[0].use_count = 1;
+        items[1].use_count = 9;
+        items[2].use_count = 4;
+        let (filtered, _, _) =
+            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+        assert_eq!(filtered, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn most_used_mode_keeps_recent_order_for_ties() {
+        let mut items = items();
+        items[0].use_count = 5;
+        items[0].last_used_at = Some("2020-01-01T00:00:00Z".to_string());
+        items[1].use_count = 5;
+        items[1].last_used_at = Some("2026-01-01T00:00:00Z".to_string());
+        let (filtered, _, _) =
+            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+        assert_eq!(filtered, vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn most_used_mode_keeps_pinned_items_first() {
+        let mut items = items();
+        items[0].pinned = true;
+        items[0].use_count = 1;
+        items[1].use_count = 9;
+        items[2].use_count = 4;
+        let (filtered, _, _) =
+            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+        assert_eq!(filtered, vec![0, 1, 2]);
     }
 
     #[test]

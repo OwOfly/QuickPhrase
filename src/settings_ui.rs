@@ -39,6 +39,7 @@ const ID_OPEN_DIR: i32 = 321;
 const ID_EXPORT_DATA: i32 = 322;
 const ID_IMPORT_DATA: i32 = 323;
 const ID_RESTORE_BACKUP: i32 = 324;
+const ID_SORT_MODE: i32 = 325;
 
 const WIDTH: i32 = 740;
 // The Input page needs 430 logical px of body plus the 52 px footer; keep
@@ -78,6 +79,7 @@ enum FocusItem {
     ExportData,
     ImportData,
     RestoreBackup,
+    SortMode,
     Save,
     Cancel,
 }
@@ -104,6 +106,7 @@ struct Rects {
     clip_card: RECT,
     // Appearance
     theme_cards: [RECT; 3],
+    sort_card: RECT,
     // Data
     data_card: RECT,
     data_path_box: RECT,
@@ -119,6 +122,7 @@ struct SettingsUi {
     export_data: HWND,
     import_data: HWND,
     restore_backup: HWND,
+    sort_mode: HWND,
     save: HWND,
     cancel: HWND,
     font: HFONT,
@@ -136,6 +140,7 @@ struct SettingsUi {
     paste_mode: bool,
     keep_tabs: bool,
     theme_pref: String,
+    panel_sort: String,
     startup: bool,
     status_text: String,
     data_dir: String,
@@ -360,6 +365,13 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
             bottom: body_top + tcard_h,
         };
     }
+    let sort_top = theme_cards[0].bottom + scaled(12, dpi);
+    let sort_card = RECT {
+        left: cl,
+        top: sort_top,
+        right: cr,
+        bottom: sort_top + scaled(74, dpi),
+    };
 
     // --- Tab 3: Data ---
     let dpad = scaled(16, dpi);
@@ -434,6 +446,16 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
             clip_btn_h,
             true,
         );
+        let sort_w = scaled(148, dpi);
+        let sort_h = scaled(32, dpi);
+        let _ = MoveWindow(
+            ui.sort_mode,
+            sort_card.right - scaled(16, dpi) - sort_w,
+            sort_card.top + ((sort_card.bottom - sort_card.top) - sort_h) / 2,
+            sort_w,
+            sort_h,
+            true,
+        );
         let _ = MoveWindow(
             ui.copy_dir,
             data_left + dpad,
@@ -491,6 +513,14 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
             },
         );
         let _ = ShowWindow(
+            ui.sort_mode,
+            if ui.tab == Tab::Appearance {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = ShowWindow(
             ui.copy_dir,
             if ui.tab == Tab::Data {
                 SW_SHOW
@@ -536,6 +566,7 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
         tab_keep,
         clip_card,
         theme_cards,
+        sort_card,
         data_card,
         data_path_box,
         stat_boxes,
@@ -1204,6 +1235,8 @@ fn paint_tab_appearance(
     r: Rects,
     dpi: u32,
 ) {
+    let rad = d2d::scaled_f(12.0, dpi);
+    let pad = scaled(16, dpi);
     let cards = [
         ("light", "浅色 Porcelain", false, false),
         ("dark", "深色 Obsidian", true, false),
@@ -1334,6 +1367,38 @@ fn paint_tab_appearance(
             );
         }
     }
+
+    c.fill_stroke_round(&r.sort_card, rad, p.card, p.border, 1.0);
+    let st = RECT {
+        left: r.sort_card.left + pad,
+        top: r.sort_card.top + scaled(14, dpi),
+        right: r.sort_card.right - scaled(184, dpi),
+        bottom: r.sort_card.top + scaled(34, dpi),
+    };
+    let sd = RECT {
+        left: st.left,
+        top: st.bottom + scaled(2, dpi),
+        right: st.right,
+        bottom: r.sort_card.bottom - scaled(10, dpi),
+    };
+    c.draw_text(
+        "面板排序",
+        &st,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.draw_text(
+        "最近使用优先，或按累计使用次数从多到少",
+        &sd,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
 }
 
 fn paint_tab_data(ui: &SettingsUi, c: &mut d2d::Canvas<'_>, p: theme::Palette, r: Rects, dpi: u32) {
@@ -1522,6 +1587,7 @@ fn create() -> Option<SettingsUi> {
     let export_data = create_button("导出…", hwnd, ID_EXPORT_DATA, instance, false);
     let import_data = create_button("导入…", hwnd, ID_IMPORT_DATA, instance, false);
     let restore_backup = create_button("恢复备份…", hwnd, ID_RESTORE_BACKUP, instance, false);
+    let sort_mode = create_button("排序：最近使用", hwnd, ID_SORT_MODE, instance, false);
     let save = create_button("保存设置", hwnd, ID_SAVE, instance, true);
     let cancel = create_button("取消", hwnd, ID_CANCEL, instance, true);
 
@@ -1533,6 +1599,7 @@ fn create() -> Option<SettingsUi> {
         export_data,
         import_data,
         restore_backup,
+        sort_mode,
         save,
         cancel,
     ] {
@@ -1555,6 +1622,7 @@ fn create() -> Option<SettingsUi> {
         export_data,
         import_data,
         restore_backup,
+        sort_mode,
         save,
         cancel,
         font,
@@ -1572,6 +1640,7 @@ fn create() -> Option<SettingsUi> {
         paste_mode: false,
         keep_tabs: false,
         theme_pref: "system".to_string(),
+        panel_sort: "recent".to_string(),
         startup: false,
         status_text: "就绪".to_string(),
         data_dir: platform::data_dir().display().to_string(),
@@ -1591,6 +1660,8 @@ fn load(ui: &mut SettingsUi) {
     ui.paste_mode = settings.insertion_mode == "paste";
     ui.keep_tabs = ui.paste_mode && settings.tab_policy == "tab";
     ui.theme_pref = settings.theme.clone();
+    ui.panel_sort = settings.panel_sort.clone();
+    set_button_text(ui.sort_mode, sort_label(&ui.panel_sort));
     ui.startup = settings.startup;
     ui.data_dir = platform::data_dir().display().to_string();
     apply_live_theme(ui, &ui.theme_pref.clone());
@@ -1807,6 +1878,14 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
     set_status(ui, "快捷键已录制，保存后生效");
 }
 
+fn sort_label(value: &str) -> &'static str {
+    if value == "most_used" {
+        "排序：最常使用"
+    } else {
+        "排序：最近使用"
+    }
+}
+
 fn save(ui: &mut SettingsUi) {
     let original = storage::settings_clone().unwrap_or_default();
     let mut settings = original.clone();
@@ -1825,6 +1904,7 @@ fn save(ui: &mut SettingsUi) {
     settings.insertion_mode = insertion.to_string();
     settings.tab_policy = tab_policy.to_string();
     settings.theme = ui.theme_pref.clone();
+    settings.panel_sort = ui.panel_sort.clone();
     settings.startup = ui.startup;
 
     if let Some(error) = storage::save_settings(settings.clone()).err() {
@@ -1893,6 +1973,7 @@ fn focus_items(ui: &SettingsUi) -> Vec<FocusItem> {
             for index in 0..3 {
                 items.push(FocusItem::Custom(Hover::ThemeCard(index)));
             }
+            items.push(FocusItem::SortMode);
         }
         Tab::Data => {
             items.push(FocusItem::CopyDir);
@@ -1916,6 +1997,7 @@ fn native_focus_hwnd(ui: &SettingsUi, item: FocusItem) -> Option<HWND> {
         FocusItem::ExportData => ui.export_data,
         FocusItem::ImportData => ui.import_data,
         FocusItem::RestoreBackup => ui.restore_backup,
+        FocusItem::SortMode => ui.sort_mode,
         FocusItem::Save => ui.save,
         FocusItem::Cancel => ui.cancel,
         FocusItem::Custom(_) => return None,
@@ -2360,6 +2442,7 @@ unsafe extern "system" fn window_proc(
                             ui.export_data,
                             ui.import_data,
                             ui.restore_backup,
+                            ui.sort_mode,
                             ui.save,
                             ui.cancel,
                         ] {
@@ -2625,6 +2708,18 @@ unsafe extern "system" fn window_proc(
                     }
                     ID_RESTORE_BACKUP if notification == BN_CLICKED => {
                         data_action = Some(DataAction::RestoreBackup)
+                    }
+                    ID_SORT_MODE if notification == BN_CLICKED => {
+                        ui.panel_sort = if ui.panel_sort == "most_used" {
+                            "recent".to_string()
+                        } else {
+                            "most_used".to_string()
+                        };
+                        set_button_text(ui.sort_mode, sort_label(&ui.panel_sort));
+                        set_status(ui, "面板排序已切换，保存后生效");
+                        unsafe {
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     }
                     _ if notification == BN_SETFOCUS || notification == BN_KILLFOCUS => unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);

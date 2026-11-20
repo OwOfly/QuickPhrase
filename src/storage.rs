@@ -115,10 +115,16 @@ pub struct Settings {
     pub startup: bool,
     pub paused: bool,
     pub data_dir: Option<String>,
+    #[serde(default = "default_panel_sort")]
+    pub panel_sort: String,
 }
 
 fn default_insertion_mode() -> String {
     "unicode".to_string()
+}
+
+fn default_panel_sort() -> String {
+    "recent".to_string()
 }
 
 impl Default for Settings {
@@ -132,6 +138,7 @@ impl Default for Settings {
             startup: false,
             paused: false,
             data_dir: None,
+            panel_sort: default_panel_sort(),
         }
     }
 }
@@ -215,6 +222,7 @@ pub struct PanelRow {
     pub sort_order: i32,
     pub last_used_at: Option<String>,
     pub updated_at: String,
+    pub use_count: u64,
 }
 
 pub fn panel_items() -> Vec<PanelRow> {
@@ -233,6 +241,7 @@ pub fn panel_items() -> Vec<PanelRow> {
                 sort_order: snippet.sort_order,
                 last_used_at: snippet.last_used_at.clone(),
                 updated_at: snippet.updated_at.clone(),
+                use_count: snippet.use_count,
             })
             .collect()
     })
@@ -1729,11 +1738,25 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         value.as_object_mut().unwrap().remove("insertionMode");
+        value.as_object_mut().unwrap().remove("panelSort");
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
 
         let reloaded = Store::load_from(&dir);
         assert!(!reloaded.is_read_only());
         assert_eq!(reloaded.settings().insertion_mode, "unicode");
+        assert_eq!(reloaded.settings().panel_sort, "recent");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn panel_sort_roundtrips() {
+        let dir = temp_dir("panelsort");
+        let mut store = Store::load_from(&dir);
+        let mut settings = store.settings().clone();
+        settings.panel_sort = "most_used".to_string();
+        store.save_settings(settings).expect("save settings");
+        let reloaded = Store::load_from(&dir);
+        assert_eq!(reloaded.settings().panel_sort, "most_used");
         let _ = fs::remove_dir_all(&dir);
     }
 

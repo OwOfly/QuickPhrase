@@ -19,6 +19,22 @@ pub struct Doc<'a> {
     pub sort_order: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    Recent,
+    MostUsed,
+}
+
+impl SortMode {
+    pub fn from_setting(value: &str) -> Self {
+        if value == "most_used" {
+            Self::MostUsed
+        } else {
+            Self::Recent
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {
     pub index: usize,

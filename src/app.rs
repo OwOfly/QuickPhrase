@@ -8,7 +8,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{
-    capture, clipboard, foreground, hotkey, logging, manage, panel, platform, settings_ui,
+    capture, clipboard, foreground, hotkey, logging, manage, panel, platform, search, settings_ui,
     single_instance, storage, tray, uia,
 };
 
@@ -587,6 +587,7 @@ fn paste_mode_setting() -> bool {
 }
 
 fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
+    let settings = storage::settings_clone().unwrap_or_default();
     let items = storage::panel_items()
         .into_iter()
         .map(|row| panel::Item {
@@ -600,6 +601,7 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
             last_used_at: row.last_used_at,
             updated_at: row.updated_at,
             sort_order: row.sort_order,
+            use_count: row.use_count,
         })
         .collect();
     panel::PanelData {
@@ -608,10 +610,9 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
         notice: storage::read_only_notice(),
         copy_only,
         paste_mode,
-        keep_tabs: storage::settings_clone()
-            .map(|settings| settings.tab_policy == "tab")
-            .unwrap_or(false),
+        keep_tabs: settings.tab_policy == "tab",
         hotkey_hint: current_hotkey(),
+        sort_mode: search::SortMode::from_setting(&settings.panel_sort),
     }
 }
 
