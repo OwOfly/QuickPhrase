@@ -32,9 +32,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowTextW, LoadIconW, LoadImageW, SendMessageW, SetWindowLongPtrW, CB_GETCOUNT,
     CB_GETLBTEXT, GWLP_WNDPROC, HICON, ICON_BIG, ICON_SMALL, IDI_APPLICATION, IMAGE_ICON,
     LR_DEFAULTCOLOR, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_CAPTURECHANGED,
-    WM_CHAR, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
-    WM_PRINTCLIENT, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_VSCROLL,
+    WM_CHAR, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_VSCROLL,
 };
 
 use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
@@ -1686,7 +1686,17 @@ unsafe extern "system" fn smooth_edit_proc(
             apply_edit_right_margin(hwnd);
             paint_edit_scrollbar_on(hwnd, None);
         }
-        WM_VSCROLL | WM_KEYUP | WM_CHAR => {
+        WM_VSCROLL | WM_CHAR => {
+            paint_edit_scrollbar_on(hwnd, None);
+        }
+        WM_KEYUP => {
+            if matches!(wparam.0 as u32, 0x23..=0x28) {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            paint_edit_scrollbar_on(hwnd, None);
+        }
+        WM_SETFOCUS | WM_KILLFOCUS | WM_ENABLE => {
+            let _ = InvalidateRect(Some(hwnd), None, false);
             paint_edit_scrollbar_on(hwnd, None);
         }
         WM_NCDESTROY => {

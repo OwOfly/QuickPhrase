@@ -7,13 +7,13 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor, SetBkMode,
-    SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
+    SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    EnableWindow, GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -408,6 +408,11 @@ fn reload_list(manage: &mut Manage) {
 
 fn load_editor(manage: &mut Manage, id: Option<&str>) {
     manage.loading = true;
+    unsafe {
+        let _ = EnableWindow(manage.title_edit, true);
+        let _ = EnableWindow(manage.content_edit, true);
+        let _ = ShowWindow(manage.content_edit, SW_SHOW);
+    }
     manage.error_field = None;
     manage.error_message = None;
 
@@ -1918,7 +1923,7 @@ fn create(owner: HWND) -> Option<Manage> {
         "",
         WS_CHILD
             | WS_VISIBLE
-            | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL) as u32),
+            | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32),
         hwnd,
         ID_CONTENT,
         instance,
@@ -2711,7 +2716,7 @@ unsafe extern "system" fn window_proc(
                 },
                 Err(_) => (COLORREF(0), COLORREF(0), HBRUSH::default()),
             });
-            SetBkMode(hdc, TRANSPARENT);
+            SetBkMode(hdc, OPAQUE);
             SetBkColor(hdc, field);
             SetTextColor(hdc, heading);
             LRESULT(brush.0 as isize)
@@ -2793,6 +2798,25 @@ unsafe extern "system" fn window_proc(
                 }
             });
             LRESULT(1)
+        }
+        WM_ACTIVATE => {
+            // A transient menu/activation loop can leave the editor looking
+            // disabled. Re-enable the text controls whenever the window is
+            // activated so the content is editable again.
+            if (wparam.0 & 0xffff) != 0 {
+                MANAGE.with(|slot| {
+                    if let Ok(guard) = slot.try_borrow() {
+                        if let Some(manage) = guard.as_ref() {
+                            unsafe {
+                                let _ = EnableWindow(manage.title_edit, true);
+                                let _ = EnableWindow(manage.content_edit, true);
+                                let _ = InvalidateRect(Some(manage.content_edit), None, true);
+                            }
+                        }
+                    }
+                });
+            }
+            LRESULT(0)
         }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
