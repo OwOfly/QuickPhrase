@@ -787,7 +787,7 @@ fn create() -> Option<Panel> {
     ui::theme_control(edit, palette.dark);
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
 
-    let cue = platform::wide("搜索短语标题或正文…");
+    let cue = platform::wide("搜索标题、正文或拼音…");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         let _ = send(edit, EM_LIMITTEXT, 200, 0);

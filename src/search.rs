@@ -1,8 +1,9 @@
 //! Snippet retrieval (M1-2): blob match, D16 scoring and ordering.
 //!
 //! Score: title exact 400, title prefix 300, title contains 200,
-//! body contains 100. Ties break by pinned, lastUsedAt, updatedAt,
-//! sortOrder, id. At most `limit` hits are returned.
+//! body contains 100, title-pinyin blob-only 90 (no highlight). Ties break
+//! by pinned, lastUsedAt, updatedAt, sortOrder, id. At most `limit` hits are
+//! returned.
 
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ pub struct Hit {
 }
 
 pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
+    let allow_pinyin = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
     let mut scored: Vec<(u32, usize)> = Vec::new();
 
@@ -66,6 +68,16 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
             200
         } else if doc.content.to_lowercase().contains(&needle) {
             100
+        } else if allow_pinyin
+            && needle.chars().count() >= 2
+            && needle
+                .chars()
+                .all(|ch| ch.is_ascii_alphabetic() || ch == ' ')
+        {
+            // Blob-only matches come from the pinyin keys; rank them below
+            // literal title/content hits and skip highlighting. A single
+            // letter would match too many initials, so keep the old behavior.
+            90
         } else {
             continue;
         };
@@ -160,7 +172,7 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
     let blobs: Vec<String> = titles
         .iter()
         .zip(&contents)
-        .map(|(title, content)| format!("{}\n{}", title.to_lowercase(), content.to_lowercase()))
+        .map(|(title, content)| crate::storage::build_search_blob(title, content))
         .collect();
 
     let patterns = [
@@ -174,6 +186,8 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
         "beta",
         "更新",
         "第 1",
+        "xiangmu",
+        "xm",
     ];
     let mut samples = Vec::with_capacity(queries);
     for index in 0..queries {
@@ -209,6 +223,7 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
 #[cfg(test)]
 mod tests {
     use super::{bench, rank, Doc};
+    use crate::storage::build_search_blob;
 
     fn doc<'a>(
         id: &'a str,
@@ -426,6 +441,42 @@ mod tests {
         ];
         let hits = rank(&docs, "同名", 50);
         assert_eq!(docs[hits[0].index].id, "used");
+    }
+
+    #[test]
+    fn pinyin_match_ranks_below_literal_content() {
+        let pinyin_title = "退款说明";
+        let literal_title = "其他";
+        let pinyin_blob = build_search_blob(pinyin_title, "");
+        let literal_blob = build_search_blob(literal_title, "tk");
+        let docs = vec![
+            Doc {
+                id: "pinyin",
+                title: pinyin_title,
+                content: "",
+                blob: &pinyin_blob,
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 0,
+            },
+            Doc {
+                id: "literal",
+                title: literal_title,
+                content: "tk",
+                blob: &literal_blob,
+                pinned: false,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 1,
+            },
+        ];
+        let hits = rank(&docs, "tk", 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].index, 1, "literal content must beat pinyin");
+        assert_eq!(hits[1].index, 0);
+        assert!(hits[1].title_highlight.is_none());
+        assert!(hits[1].content_highlight.is_none());
     }
 
     #[test]

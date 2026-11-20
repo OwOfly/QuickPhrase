@@ -35,6 +35,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Registry",
 ] }
 windows-numerics = "0.3"
+pinyin = { version = "0.11", default-features = false, features = ["plain"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

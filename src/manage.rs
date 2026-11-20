@@ -1992,7 +1992,7 @@ fn create(owner: HWND) -> Option<Manage> {
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
     ui::install_smooth_edit(content_edit);
     ui::theme_scrollbar(content_edit, palette.dark);
-    ui::cue_banner(search, "搜索标题或正文…");
+    ui::cue_banner(search, "搜索标题、正文或拼音…");
     ui::cue_banner(title_edit, "例如：项目进度回复、会议纪要模板…");
     ui::cue_banner(cat_name, "新分类名称…");
     ui::cue_banner(content_edit, "在此输入短语正文，支持多行文本…");

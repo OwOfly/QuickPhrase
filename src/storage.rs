@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use pinyin::ToPinyin;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
@@ -55,18 +56,48 @@ pub struct Snippet {
     pub last_used_at: Option<String>,
     pub last_insert_status: Option<String>,
     pub deleted_at: Option<String>,
+    #[serde(default, skip_serializing)]
     pub search_blob: String,
 }
 
 impl Snippet {
-    /// Lowercased title + newline + lowercased body, per §6.2.
+    /// Rebuilds the five-part search blob via `build_search_blob`, per §6.2.
     pub fn rebuild_blob(&mut self) {
-        self.search_blob = format!(
-            "{}\n{}",
-            self.title.to_lowercase(),
-            self.content.to_lowercase()
-        );
+        self.search_blob = build_search_blob(&self.title, &self.content);
     }
+}
+
+/// Five-part search blob: lowercased title, lowercased content, spaced full
+/// pinyin, compact full pinyin and initials. Pinyin comes from the title only.
+pub(crate) fn build_search_blob(title: &str, content: &str) -> String {
+    let (full, compact, initials) = pinyin_keys(title);
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        title.to_lowercase(),
+        content.to_lowercase(),
+        full,
+        compact,
+        initials
+    )
+}
+
+/// Full pinyin, compact full pinyin and initials for the search blob.
+/// Non-Chinese characters do not enter the pinyin keys; the original title
+/// segment still covers literal mixed English/Chinese queries.
+fn pinyin_keys(title: &str) -> (String, String, String) {
+    let mut full = String::new();
+    let mut compact = String::new();
+    let mut initials = String::new();
+    for ch in title.chars() {
+        let Some(value) = ch.to_pinyin() else {
+            continue;
+        };
+        full.push_str(value.plain());
+        full.push(' ');
+        compact.push_str(value.plain());
+        initials.push_str(value.first_letter());
+    }
+    (full, compact, initials)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1749,6 +1780,52 @@ mod tests {
     }
 
     #[test]
+    fn pinyin_keys_support_full_spelling_and_initials() {
+        let (full, compact, initials) = pinyin_keys("退款说明");
+        assert!(full.contains("tui kuan shuo ming"));
+        assert!(compact.contains("tuikuanshuoming"));
+        assert!(initials.starts_with("tksm"));
+    }
+
+    #[test]
+    fn pinyin_initials_and_full_spelling_are_searchable() {
+        let dir = temp_dir("pinyin");
+        let mut store = Store::load_from(&dir);
+        store
+            .add_snippet("退款说明", "请按流程处理", None, false)
+            .expect("snippet");
+        let snippets = store.snippets();
+        let snippet = snippets
+            .iter()
+            .find(|snippet| snippet.title == "退款说明")
+            .expect("stored snippet");
+        let docs = vec![crate::search::Doc {
+            id: &snippet.id,
+            title: &snippet.title,
+            content: &snippet.content,
+            blob: &snippet.search_blob,
+            pinned: false,
+            last_used_at: None,
+            updated_at: &snippet.updated_at,
+            sort_order: snippet.sort_order,
+        }];
+        assert!(
+            snippet.search_blob.contains("tksm"),
+            "blob={}",
+            snippet.search_blob
+        );
+        assert_eq!(crate::search::rank(&docs, "tk", 10).len(), 1);
+        assert_eq!(crate::search::rank(&docs, "tuikuan", 10).len(), 1);
+        assert_eq!(crate::search::rank(&docs, "t", 10).len(), 0);
+        assert_eq!(crate::search::rank(&docs, "tk\n", 10).len(), 0);
+        assert_eq!(crate::search::rank(&docs, "\ntk", 10).len(), 0);
+        assert_eq!(crate::search::rank(&docs, "tk\r\n", 10).len(), 0);
+        assert_eq!(crate::search::rank(&docs, "\r\ntk", 10).len(), 0);
+        assert_eq!(crate::search::rank(&docs, "退款\n", 10).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn panel_sort_roundtrips() {
         let dir = temp_dir("panelsort");
         let mut store = Store::load_from(&dir);
@@ -2321,6 +2398,10 @@ mod tests {
             .expect("snippet");
         let json = store.export_json().expect("export");
         assert!(json.contains("导入测试短语"));
+        assert!(
+            !json.contains("searchBlob"),
+            "derived search blobs must not be exported"
+        );
         let exported: DataFile = serde_json::from_str(&json).expect("parse export");
 
         let target_dir = temp_dir("importtarget");
