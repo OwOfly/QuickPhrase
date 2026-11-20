@@ -1,3 +1,5 @@
+//! QuickPhrase 2.0 floating quick-insert panel (Direct2D + DirectWrite).
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
@@ -5,59 +7,42 @@ use std::time::Instant;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GetLastError, COLORREF, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, POINT,
-    RECT, SIZE, WPARAM,
-};
-use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC,
-    GetMonitorInfoW, GetTextExtentPoint32W, InvalidateRect, MonitorFromPoint, ReleaseDC,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, CLEARTYPE_QUALITY,
-    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
-    DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, GetMonitorInfoW, InvalidateRect,
+    MonitorFromPoint, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH,
+    HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED};
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_SELECTED, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext, GCS_COMPSTR,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_MENU,
-    VK_RETURN, VK_SHIFT, VK_UP,
+    GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_MENU, VK_RETURN, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::Win32::UI::WindowsAndMessaging::{
-    SetLayeredWindowAttributes, SystemParametersInfoW, GWL_EXSTYLE, LWA_ALPHA,
-    SPI_GETCLIENTAREAANIMATION, WS_EX_LAYERED,
-};
 
 use crate::capture::Report;
-use crate::{inject, logging, platform, ui};
+use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::{inject, logging, platform, theme, ui};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
 const LIST_ID: i32 = 101;
-const FOOTER_ID: i32 = 102;
-const SETTINGS_LINK_ID: i32 = 103;
-const MANAGE_LINK_ID: i32 = 104;
 const FADE_TIMER: usize = 7;
 
 const PANEL_WIDTH: i32 = 520;
 const PANEL_HEIGHT: i32 = 420;
-const SEARCH_TOP: i32 = 14;
-const SEARCH_HEIGHT: i32 = 34;
-const CATEGORY_TOP: i32 = 54;
-const CATEGORY_HEIGHT: i32 = 46;
-const LIST_TOP: i32 = 104;
-const FOOTER_HEIGHT: i32 = 42;
-const SS_CENTER: i32 = 0x0001;
-const SS_NOTIFY: i32 = 0x0100;
-const SS_CENTERIMAGE: i32 = 0x0200;
-const ITEM_HEIGHT: i32 = 64;
+const BANNER_HEIGHT: i32 = 28;
+const SEARCH_HEIGHT: i32 = 40;
+const CATEGORY_HEIGHT: i32 = 40;
+const FOOTER_HEIGHT: i32 = 38;
+const ITEM_HEIGHT: i32 = 60;
 
 const LB_ADDSTRING: u32 = 0x0180;
 const LB_RESETCONTENT: u32 = 0x0184;
@@ -95,29 +80,35 @@ pub struct PanelData {
     pub hotkey_hint: String,
 }
 
-struct Fonts {
-    title: HFONT,
-    body: HFONT,
-    small: HFONT,
-    icon: HFONT,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoverTarget {
+    None,
+    Settings,
+    Manage,
+    Category(usize),
 }
 
 struct Brushes {
     background: HBRUSH,
-    selected: HBRUSH,
     search: HBRUSH,
-    border: HBRUSH,
-    highlight: HBRUSH,
-    accent: HBRUSH,
+}
+
+struct LayoutRects {
+    banner: Option<RECT>,
+    search_shell: RECT,
+    settings_btn: RECT,
+    hotkey_kbd: RECT,
+    category_bar_bottom: i32,
+    list: RECT,
+    footer: RECT,
+    manage_btn: RECT,
 }
 
 struct Panel {
     hwnd: HWND,
     edit: HWND,
     list: HWND,
-    footer: HWND,
-    settings_link: HWND,
-    manage_link: HWND,
+    edit_font: HFONT,
     filtered: Vec<usize>,
     items: Vec<Item>,
     categories: Vec<(String, String)>,
@@ -127,13 +118,12 @@ struct Panel {
     paste_mode: bool,
     keep_tabs: bool,
     hotkey_hint: String,
-    palette: crate::theme::Palette,
+    palette: theme::Palette,
     title_highlights: Vec<Option<(usize, usize)>>,
     content_highlights: Vec<Option<(usize, usize)>>,
     last_query: String,
     report: Option<Report>,
     notify: HWND,
-    fonts: Fonts,
     brushes: Brushes,
     dpi: u32,
     hiding: bool,
@@ -141,6 +131,8 @@ struct Panel {
     monitor: Option<crate::foreground::Monitor>,
     opening: bool,
     deferred_inactive: bool,
+    hover: HoverTarget,
+    tracking_mouse: bool,
 }
 
 thread_local! {
@@ -190,15 +182,11 @@ fn start_fade(hwnd: HWND) {
     if !animations_enabled() {
         return;
     }
-    // Create the timer first: if it cannot be created, skip the fade entirely
-    // instead of making the window transparent forever.
     let timer = unsafe { SetTimer(Some(hwnd), FADE_TIMER, 10, None) };
     if timer == 0 {
         logging::warn("panel fade timer unavailable; showing without fade");
         return;
     }
-    // The window is already visible and focused; the fade runs on a timer so
-    // keystrokes reach the panel from the first frame.
     unsafe {
         let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
         let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED.0 as i32);
@@ -207,105 +195,157 @@ fn start_fade(hwnd: HWND) {
     FADE_STEP.store(0, Ordering::Relaxed);
 }
 
-fn create_static_link(parent: HWND, instance: HINSTANCE, id: i32, text: &str) -> Option<HWND> {
-    let text = platform::wide(text);
-    unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
-            PCWSTR(text.as_ptr()),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE((SS_CENTER | SS_CENTERIMAGE | SS_NOTIFY) as u32),
-            0,
-            0,
-            10,
-            10,
-            Some(parent),
-            Some(HMENU(id as isize as *mut core::ffi::c_void)),
-            Some(instance),
-            None,
-        )
-        .ok()
-    }
-}
-
-fn create_font_face(size: i32, weight: i32, face: &str, dpi: u32) -> HFONT {
-    let face = platform::wide(face);
-    unsafe {
-        CreateFontW(
-            -scaled(size, dpi),
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            PCWSTR(face.as_ptr()),
-        )
-    }
-}
-
-fn create_font(size: i32, weight: i32, dpi: u32) -> HFONT {
-    create_font_face(size, weight, "Microsoft YaHei UI", dpi)
+fn create_edit_font(dpi: u32) -> HFONT {
+    ui::make_font(ui::FontRole::Search, dpi)
 }
 
 unsafe fn send(hwnd: HWND, message: u32, wparam: usize, lparam: isize) -> LRESULT {
     SendMessageW(hwnd, message, Some(WPARAM(wparam)), Some(LPARAM(lparam)))
 }
 
-fn make_fonts(dpi: u32) -> Fonts {
-    Fonts {
-        title: create_font(14, 700, dpi),
-        body: create_font(12, 400, dpi),
-        small: create_font(11, 400, dpi),
-        icon: create_font_face(13, 400, "Segoe MDL2 Assets", dpi),
-    }
-}
-
-fn destroy_fonts(fonts: &Fonts) {
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(fonts.title.0));
-        let _ = DeleteObject(HGDIOBJ(fonts.body.0));
-        let _ = DeleteObject(HGDIOBJ(fonts.small.0));
-        let _ = DeleteObject(HGDIOBJ(fonts.icon.0));
-    }
-}
-
-fn make_brushes(palette: crate::theme::Palette) -> Brushes {
-    use crate::theme::Palette;
-    let Palette {
-        page: _,
-        card,
-        selection,
-        field,
-        border,
-        highlight,
-        primary,
-        ..
-    } = palette;
+fn make_brushes(palette: theme::Palette) -> Brushes {
     Brushes {
-        background: unsafe { CreateSolidBrush(card) },
-        selected: unsafe { CreateSolidBrush(selection) },
-        search: unsafe { CreateSolidBrush(field) },
-        border: unsafe { CreateSolidBrush(border) },
-        highlight: unsafe { CreateSolidBrush(highlight) },
-        accent: unsafe { CreateSolidBrush(primary) },
+        background: unsafe { CreateSolidBrush(palette.card) },
+        search: unsafe { CreateSolidBrush(palette.field) },
     }
 }
 
 fn destroy_brushes(brushes: &Brushes) {
     unsafe {
         let _ = DeleteObject(HGDIOBJ(brushes.background.0));
-        let _ = DeleteObject(HGDIOBJ(brushes.selected.0));
         let _ = DeleteObject(HGDIOBJ(brushes.search.0));
-        let _ = DeleteObject(HGDIOBJ(brushes.border.0));
-        let _ = DeleteObject(HGDIOBJ(brushes.highlight.0));
-        let _ = DeleteObject(HGDIOBJ(brushes.accent.0));
+    }
+}
+
+fn has_banner(panel: &Panel) -> bool {
+    panel.copy_only.is_some() || panel.notice.is_some() || panel.paste_mode
+}
+
+fn compute_layout(panel: &Panel, width: i32, height: i32) -> LayoutRects {
+    let dpi = panel.dpi;
+    let margin = scaled(14, dpi);
+    let mut y = 0;
+
+    let banner = if has_banner(panel) {
+        let bh = scaled(BANNER_HEIGHT, dpi);
+        let r = RECT {
+            left: 1,
+            top: 1,
+            right: (width - 1).max(2),
+            bottom: 1 + bh,
+        };
+        y = r.bottom;
+        Some(r)
+    } else {
+        None
+    };
+
+    let search_top = y + scaled(12, dpi);
+    let search_h = scaled(SEARCH_HEIGHT, dpi);
+    let search_shell = RECT {
+        left: margin,
+        top: search_top,
+        right: (width - margin).max(margin + 10),
+        bottom: search_top + search_h,
+    };
+
+    let gear_size = scaled(28, dpi);
+    let settings_btn = RECT {
+        left: search_shell.right - scaled(6, dpi) - gear_size,
+        top: search_shell.top + (search_h - gear_size) / 2,
+        right: search_shell.right - scaled(6, dpi),
+        bottom: search_shell.top + (search_h + gear_size) / 2,
+    };
+
+    let hotkey_kbd = if !panel.hotkey_hint.is_empty() {
+        let (kw, _) = d2d::measure_style(&panel.hotkey_hint, TextStyle::Mono, dpi);
+        let kbd_w = (kw.ceil() as i32 + scaled(12, dpi)).min(scaled(108, dpi));
+        let kbd_h = scaled(22, dpi);
+        RECT {
+            left: settings_btn.left - scaled(6, dpi) - kbd_w,
+            top: search_shell.top + (search_h - kbd_h) / 2,
+            right: settings_btn.left - scaled(6, dpi),
+            bottom: search_shell.top + (search_h + kbd_h) / 2,
+        }
+    } else {
+        RECT {
+            left: settings_btn.left,
+            top: search_shell.top,
+            right: settings_btn.left,
+            bottom: search_shell.bottom,
+        }
+    };
+
+    let category_bar_bottom = search_shell.bottom + scaled(CATEGORY_HEIGHT, dpi);
+    let footer_h = scaled(FOOTER_HEIGHT, dpi);
+    let footer = RECT {
+        left: 1,
+        top: (height - footer_h - 1).max(category_bar_bottom),
+        right: (width - 1).max(2),
+        bottom: (height - 1).max(1),
+    };
+
+    let manage_w = scaled(88, dpi);
+    let manage_h = scaled(26, dpi);
+    let manage_btn = RECT {
+        left: (footer.right - margin - manage_w).max(footer.left + margin),
+        top: footer.top + (footer_h - manage_h) / 2,
+        right: footer.right - margin,
+        bottom: footer.top + (footer_h + manage_h) / 2,
+    };
+
+    let list_top = category_bar_bottom + scaled(6, dpi);
+    let list = RECT {
+        left: scaled(8, dpi),
+        top: list_top,
+        right: (width - scaled(8, dpi)).max(scaled(16, dpi)),
+        bottom: (footer.top - scaled(6, dpi)).max(list_top),
+    };
+
+    LayoutRects {
+        banner,
+        search_shell,
+        settings_btn,
+        hotkey_kbd,
+        category_bar_bottom,
+        list,
+        footer,
+        manage_btn,
+    }
+}
+
+fn layout_panel(panel: &Panel, width: i32, height: i32) {
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let rects = compute_layout(panel, width, height);
+    let left_pad = scaled(38, panel.dpi);
+    let right_edge = if rects.hotkey_kbd.left < rects.settings_btn.left {
+        rects.hotkey_kbd.left - scaled(8, panel.dpi)
+    } else {
+        rects.settings_btn.left - scaled(8, panel.dpi)
+    };
+    let right_pad = (rects.search_shell.right - right_edge).max(scaled(10, panel.dpi));
+    let edit_rect =
+        ui::edit_centered_rect(rects.search_shell, panel.edit_font, left_pad, right_pad);
+
+    unsafe {
+        let _ = MoveWindow(
+            panel.edit,
+            edit_rect.left,
+            edit_rect.top,
+            (edit_rect.right - edit_rect.left).max(1),
+            (edit_rect.bottom - edit_rect.top).max(1),
+            true,
+        );
+        let _ = MoveWindow(
+            panel.list,
+            rects.list.left,
+            rects.list.top,
+            (rects.list.right - rects.list.left).max(1),
+            (rects.list.bottom - rects.list.top).max(0),
+            true,
+        );
     }
 }
 
@@ -328,7 +368,6 @@ pub fn is_visible() -> bool {
     })
 }
 
-/// Bring an already open panel back to the front without re-capturing.
 pub fn focus() -> bool {
     let (hwnd, edit) = PANEL.with(|slot| {
         let guard = slot.borrow();
@@ -359,24 +398,42 @@ pub fn show(
     present(Some(report), monitor, notify, data, true, false)
 }
 
-/// Capture failed: open the panel anyway, but Enter copies instead of typing.
 pub fn show_copy_only(notify: HWND, data: PanelData) -> u128 {
     present(None, None, notify, data, true, false)
 }
 
 pub fn show_test() -> u128 {
+    crate::storage::init();
+    let items = crate::storage::panel_items()
+        .into_iter()
+        .map(|row| Item {
+            id: row.id,
+            title: row.title,
+            content: row.content,
+            category: row.category,
+            category_id: row.category_id,
+            blob: row.blob,
+            pinned: row.pinned,
+            last_used_at: row.last_used_at,
+            updated_at: row.updated_at,
+            sort_order: row.sort_order,
+        })
+        .collect();
+    let hotkey_hint = crate::storage::settings_clone()
+        .map(|s| s.hotkey)
+        .unwrap_or_else(|| "Ctrl+Alt+Q".to_string());
     present(
         None,
         None,
         HWND::default(),
         PanelData {
-            items: Vec::new(),
-            categories: Vec::new(),
-            notice: None,
+            items,
+            categories: crate::storage::categories(),
+            notice: crate::storage::read_only_notice(),
             copy_only: None,
             paste_mode: false,
             keep_tabs: false,
-            hotkey_hint: String::new(),
+            hotkey_hint,
         },
         true,
         true,
@@ -408,14 +465,12 @@ fn present(
         };
         let mut retheme = None;
         if activate {
-            let palette = crate::theme::current();
+            let palette = theme::current();
             if palette != panel.palette {
                 destroy_brushes(&panel.brushes);
                 panel.brushes = make_brushes(palette);
                 panel.palette = palette;
-                // Applying a control theme can synchronously touch child
-                // windows, so do it after this RefCell borrow is released.
-                retheme = Some((panel.edit, panel.list, palette.dark));
+                retheme = Some((panel.edit, panel.list, palette));
             }
         }
         panel.report = report;
@@ -429,6 +484,7 @@ fn present(
         panel.keep_tabs = data.keep_tabs;
         panel.hotkey_hint = data.hotkey_hint;
         panel.active_category = None;
+        panel.hover = HoverTarget::None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
         ENTER_ARMED.store(false, Ordering::Relaxed);
@@ -445,14 +501,23 @@ fn present(
     if hwnd.0.is_null() {
         return 0;
     }
-    if let Some((edit, list, dark)) = retheme {
-        ui::set_dark_mode(dark);
-        ui::theme_control(edit, dark);
-        ui::theme_control(list, dark);
+    if let Some((edit, list, palette)) = retheme {
+        ui::apply_popup_style(hwnd, palette);
+        ui::theme_control(edit, palette.dark);
+        ui::theme_control(list, palette.dark);
     }
 
     place();
-    apply_rounding(hwnd);
+    PANEL.with(|slot| {
+        if let Some(panel) = slot.borrow().as_ref() {
+            let mut client = RECT::default();
+            unsafe {
+                let _ = GetClientRect(panel.hwnd, &mut client);
+            }
+            layout_panel(panel, client.right, client.bottom);
+        }
+    });
+
     unsafe {
         let _ = SetWindowTextW(edit, w!(""));
     }
@@ -466,8 +531,6 @@ fn present(
 
     unsafe {
         if activate {
-            // Take foreground and focus *before* any animation: during a fade
-            // the user must never type into the previous window.
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             force_foreground(hwnd);
             let _ = SetFocus(Some(edit));
@@ -602,7 +665,7 @@ fn create() -> Option<Panel> {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: instance,
-        hIcon: HICON::default(),
+        hIcon: ui::load_app_icon(instance),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
         hbrBackground: HBRUSH::default(),
         lpszMenuName: PCWSTR::null(),
@@ -622,7 +685,7 @@ fn create() -> Option<Panel> {
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             PANEL_CLASS,
             w!("QuickPhrase"),
-            WS_POPUP,
+            WS_POPUP | WS_CLIPCHILDREN,
             0,
             0,
             PANEL_WIDTH,
@@ -643,9 +706,10 @@ fn create() -> Option<Panel> {
 
     let dpi = unsafe { GetDpiForWindow(hwnd) };
     let dpi = if dpi == 0 { 96 } else { dpi };
-    let fonts = make_fonts(dpi);
-    let palette = crate::theme::current();
+    let edit_font = create_edit_font(dpi);
+    let palette = theme::current();
     let brushes = make_brushes(palette);
+    ui::apply_popup_style(hwnd, palette);
 
     let edit = match unsafe {
         CreateWindowExW(
@@ -668,8 +732,8 @@ fn create() -> Option<Panel> {
             logging::error(&format!("CreateWindowExW(EDIT) failed: {err}"));
             unsafe {
                 let _ = DestroyWindow(hwnd);
+                let _ = DeleteObject(HGDIOBJ(edit_font.0));
             }
-            destroy_fonts(&fonts);
             destroy_brushes(&brushes);
             CREATE_FAILED.store(true, Ordering::Relaxed);
             return None;
@@ -683,7 +747,6 @@ fn create() -> Option<Panel> {
             w!(""),
             WS_CHILD
                 | WS_VISIBLE
-                | WS_VSCROLL
                 | WINDOW_STYLE(
                     (LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT)
                         as u32,
@@ -703,85 +766,23 @@ fn create() -> Option<Panel> {
             logging::error(&format!("CreateWindowExW(LISTBOX) failed: {err}"));
             unsafe {
                 let _ = DestroyWindow(hwnd);
+                let _ = DeleteObject(HGDIOBJ(edit_font.0));
             }
-            destroy_fonts(&fonts);
             destroy_brushes(&brushes);
             CREATE_FAILED.store(true, Ordering::Relaxed);
             return None;
         }
     };
 
-    let footer = match unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
-            w!("STATIC"),
-            w!("↑↓ 选择 · Enter 输入 · Esc 关闭"),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_CENTERIMAGE as u32),
-            0,
-            0,
-            10,
-            10,
-            Some(hwnd),
-            Some(HMENU(FOOTER_ID as isize as *mut core::ffi::c_void)),
-            Some(instance),
-            None,
-        )
-    } {
-        Ok(footer) => footer,
-        Err(err) => {
-            logging::error(&format!("CreateWindowExW(STATIC) failed: {err}"));
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            destroy_fonts(&fonts);
-            destroy_brushes(&brushes);
-            CREATE_FAILED.store(true, Ordering::Relaxed);
-            return None;
-        }
-    };
-
-    for control in [edit, list, footer] {
-        unsafe {
-            let _ = send(control, WM_SETFONT, fonts.body.0 as usize, 1);
-        }
+    unsafe {
+        let _ = send(edit, WM_SETFONT, edit_font.0 as usize, 1);
+        let _ = send(list, WM_SETFONT, edit_font.0 as usize, 1);
     }
-    // Dark scroll bars and combo chrome do not follow WM_CTLCOLOR*.
-    ui::set_dark_mode(palette.dark);
     ui::theme_control(list, palette.dark);
     ui::theme_control(edit, palette.dark);
+    ui::install_smooth_listbox(list, ui::ListSurface::Card);
 
-    let settings_link = match create_static_link(hwnd, instance, SETTINGS_LINK_ID, "设置") {
-        Some(link) => link,
-        None => {
-            logging::error("CreateWindowExW(settings link) failed");
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            destroy_fonts(&fonts);
-            destroy_brushes(&brushes);
-            CREATE_FAILED.store(true, Ordering::Relaxed);
-            return None;
-        }
-    };
-    let manage_link = match create_static_link(hwnd, instance, MANAGE_LINK_ID, "管理短语") {
-        Some(link) => link,
-        None => {
-            logging::error("CreateWindowExW(manage link) failed");
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            destroy_fonts(&fonts);
-            destroy_brushes(&brushes);
-            CREATE_FAILED.store(true, Ordering::Relaxed);
-            return None;
-        }
-    };
-    unsafe {
-        let _ = send(settings_link, WM_SETFONT, fonts.small.0 as usize, 1);
-        let _ = send(manage_link, WM_SETFONT, fonts.small.0 as usize, 1);
-    }
-
-    let cue = platform::wide("搜索短语…");
+    let cue = platform::wide("搜索短语标题或正文…");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         let _ = send(edit, EM_LIMITTEXT, 200, 0);
@@ -792,7 +793,7 @@ fn create() -> Option<Panel> {
                 GetLastError()
             ));
             let _ = DestroyWindow(hwnd);
-            destroy_fonts(&fonts);
+            let _ = DeleteObject(HGDIOBJ(edit_font.0));
             destroy_brushes(&brushes);
             CREATE_FAILED.store(true, Ordering::Relaxed);
             return None;
@@ -805,9 +806,7 @@ fn create() -> Option<Panel> {
         hwnd,
         edit,
         list,
-        footer,
-        settings_link,
-        manage_link,
+        edit_font,
         filtered: Vec::new(),
         items: Vec::new(),
         categories: Vec::new(),
@@ -823,7 +822,6 @@ fn create() -> Option<Panel> {
         last_query: String::new(),
         report: None,
         notify: HWND::default(),
-        fonts,
         brushes,
         dpi,
         hiding: false,
@@ -831,22 +829,15 @@ fn create() -> Option<Panel> {
         monitor: None,
         opening: false,
         deferred_inactive: false,
+        hover: HoverTarget::None,
+        tracking_mouse: false,
     };
 
     let mut rect = RECT::default();
     unsafe {
         let _ = GetClientRect(hwnd, &mut rect);
     }
-    layout_controls(
-        panel.edit,
-        panel.list,
-        panel.footer,
-        panel.settings_link,
-        panel.manage_link,
-        panel.dpi,
-        rect.right,
-        rect.bottom,
-    );
+    layout_panel(&panel, rect.right, rect.bottom);
 
     Some(panel)
 }
@@ -947,13 +938,9 @@ fn commit() {
         return;
     }
 
-    // Keep the UI thread responsive: guards can wait up to ~650 ms on a hung
-    // target. The worker reports back through WM_INJECT_DONE with its session.
     let session = SESSION.load(Ordering::Relaxed);
     INJECTING.store(true, Ordering::Relaxed);
     let notify_raw = notify.0 as isize;
-    // Read the insertion mode once on the UI thread; the worker never touches
-    // the store beyond the standard use-count update.
     let options = inject::Options::from_settings();
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
@@ -988,7 +975,6 @@ pub fn finish_insert(session: u64) {
     if SESSION.load(Ordering::Relaxed) != session {
         return;
     }
-
     let monitor = PANEL.with(|slot| {
         slot.borrow_mut()
             .as_mut()
@@ -1008,57 +994,26 @@ fn apply_dpi(dpi: u32) {
     if dpi == 0 {
         return;
     }
-
     let changed = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
-        let Some(panel) = guard.as_mut() else {
-            return false;
-        };
+        let panel = guard.as_mut()?;
         if panel.dpi == dpi {
-            return false;
+            return None;
         }
-        destroy_fonts(&panel.fonts);
-        panel.fonts = make_fonts(dpi);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(panel.edit_font.0));
+        }
+        panel.edit_font = create_edit_font(dpi);
         panel.dpi = dpi;
-        true
+        Some((panel.edit, panel.list, panel.edit_font))
     });
 
-    if !changed {
-        return;
-    }
-
-    let (edit, list, footer, settings_link, manage_link, body, small) = PANEL.with(|slot| {
-        let guard = slot.borrow();
-        let Some(panel) = guard.as_ref() else {
-            return (
-                HWND::default(),
-                HWND::default(),
-                HWND::default(),
-                HWND::default(),
-                HWND::default(),
-                HFONT::default(),
-                HFONT::default(),
-            );
-        };
-        (
-            panel.edit,
-            panel.list,
-            panel.footer,
-            panel.settings_link,
-            panel.manage_link,
-            panel.fonts.body,
-            panel.fonts.small,
-        )
-    });
-
-    unsafe {
-        for control in [edit, list, footer] {
-            let _ = send(control, WM_SETFONT, body.0 as usize, 1);
+    if let Some((edit, list, font)) = changed {
+        unsafe {
+            let _ = send(edit, WM_SETFONT, font.0 as usize, 1);
+            let _ = send(list, WM_SETFONT, font.0 as usize, 1);
+            let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
         }
-        for control in [settings_link, manage_link] {
-            let _ = send(control, WM_SETFONT, small.0 as usize, 1);
-        }
-        let _ = send(list, LB_SETITEMHEIGHT, 0, scaled(ITEM_HEIGHT, dpi) as isize);
     }
 }
 
@@ -1153,77 +1108,6 @@ fn place() {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn layout_controls(
-    edit: HWND,
-    list: HWND,
-    footer: HWND,
-    settings_link: HWND,
-    manage_link: HWND,
-    dpi: u32,
-    width: i32,
-    height: i32,
-) {
-    if width <= 0 || height <= 0 {
-        return;
-    }
-    let margin = scaled(16, dpi);
-    let edit_height = scaled(SEARCH_HEIGHT, dpi);
-    let footer_height = scaled(FOOTER_HEIGHT, dpi);
-    let icon_width = scaled(26, dpi);
-    let hint_width = scaled(84, dpi);
-    let link_width = scaled(52, dpi);
-
-    unsafe {
-        let edit_left = margin + icon_width + scaled(6, dpi);
-        let edit_width =
-            (width - edit_left - margin - hint_width - link_width - scaled(8, dpi)).max(1);
-        let _ = MoveWindow(
-            edit,
-            edit_left,
-            scaled(SEARCH_TOP, dpi),
-            edit_width,
-            edit_height,
-            true,
-        );
-        let _ = MoveWindow(
-            settings_link,
-            width - margin - link_width,
-            scaled(SEARCH_TOP, dpi) + scaled(1, dpi),
-            link_width,
-            scaled(32, dpi),
-            true,
-        );
-        let list_top = scaled(LIST_TOP, dpi);
-        let list_height = (height - list_top - footer_height - scaled(12, dpi)).max(0);
-        let _ = MoveWindow(
-            list,
-            scaled(10, dpi),
-            list_top,
-            width - scaled(20, dpi),
-            list_height,
-            true,
-        );
-        let footer_width = (width - margin * 2 - scaled(94, dpi)).max(1);
-        let _ = MoveWindow(
-            footer,
-            margin,
-            height - footer_height - scaled(8, dpi),
-            footer_width,
-            footer_height,
-            true,
-        );
-        let _ = MoveWindow(
-            manage_link,
-            margin + footer_width,
-            height - footer_height - scaled(8, dpi),
-            scaled(94, dpi),
-            footer_height,
-            true,
-        );
-    }
-}
-
 impl Panel {
     fn selected_index(&self) -> Option<usize> {
         let index = unsafe { send(self.list, LB_GETCURSEL, 0, 0) }.0;
@@ -1236,14 +1120,14 @@ impl Panel {
 }
 
 fn move_selection(delta: i32) {
-    let (list, current, count) = PANEL.with(|slot| {
+    let (hwnd, list, current, count) = PANEL.with(|slot| {
         let guard = slot.borrow();
         let Some(panel) = guard.as_ref() else {
-            return (HWND::default(), 0, 0);
+            return (HWND::default(), HWND::default(), 0, 0);
         };
         let count = unsafe { send(panel.list, LB_GETCOUNT, 0, 0) }.0 as i32;
         let current = panel.selected_index().unwrap_or(0) as i32;
-        (panel.list, current, count)
+        (panel.hwnd, panel.list, current, count)
     });
 
     if list.0.is_null() || count <= 0 {
@@ -1252,24 +1136,7 @@ fn move_selection(delta: i32) {
     let next = (current + delta).clamp(0, count - 1);
     unsafe {
         let _ = send(list, LB_SETCURSEL, next as usize, 0);
-    }
-    refresh_footer();
-}
-
-fn refresh_footer() {
-    let (footer, label) = PANEL.with(|slot| {
-        let guard = slot.borrow();
-        match guard.as_ref() {
-            Some(panel) => (panel.footer, footer_text(panel)),
-            None => (HWND::default(), String::new()),
-        }
-    });
-    if footer.0.is_null() {
-        return;
-    }
-    let wide = platform::wide(&label);
-    unsafe {
-        let _ = SetWindowTextW(footer, PCWSTR(wide.as_ptr()));
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
@@ -1279,19 +1146,16 @@ fn force_foreground(hwnd: HWND) {
         if GetForegroundWindow() == hwnd {
             return;
         }
-
         let foreground = GetForegroundWindow();
         if foreground.0.is_null() {
             return;
         }
-
         let mut pid = 0u32;
         let foreground_thread = GetWindowThreadProcessId(foreground, Some(&mut pid));
         let current_thread = GetCurrentThreadId();
         if IsHungAppWindow(foreground).as_bool() {
             return;
         }
-
         if foreground_thread != 0 && foreground_thread != current_thread {
             let _ = AttachThreadInput(current_thread, foreground_thread, true);
             let _ = SetForegroundWindow(hwnd);
@@ -1301,230 +1165,620 @@ fn force_foreground(hwnd: HWND) {
     }
 }
 
-fn apply_rounding(hwnd: HWND) {
-    let preference = DWMWCP_ROUND;
-    unsafe {
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &preference as *const _ as *const core::ffi::c_void,
-            std::mem::size_of_val(&preference) as u32,
-        );
-    }
+struct CategoryChip {
+    id: Option<String>,
+    name: String,
+    color: Option<COLORREF>,
+    rect: RECT,
 }
 
-fn category_chips(
-    hdc: HDC,
-    panel: &Panel,
-    right_limit: i32,
-    dpi: u32,
-) -> Vec<(Option<String>, String, RECT)> {
-    let mut chips = Vec::new();
-    let top = scaled(CATEGORY_TOP, dpi) + scaled((CATEGORY_HEIGHT - 32) / 2, dpi);
-    let height = scaled(32, dpi);
-    let mut x = scaled(16, dpi);
-    let mut entries: Vec<(Option<String>, String)> = vec![(None, "全部".to_string())];
-    entries.extend(
-        panel
-            .categories
-            .iter()
-            .map(|(id, name)| (Some(id.clone()), name.clone())),
-    );
+fn category_chips(panel: &Panel, rects: &LayoutRects, width: i32) -> Vec<CategoryChip> {
+    let dpi = panel.dpi;
+    let margin = scaled(14, dpi);
+    let right_limit = width - margin;
+    let height = scaled(26, dpi);
+    let top = rects.search_shell.bottom + (scaled(CATEGORY_HEIGHT, dpi) - height) / 2;
+    let mut x = margin;
 
-    unsafe {
-        for (id, name) in entries {
-            let text = platform::wide(&name);
-            let mut size = SIZE::default();
-            if !GetTextExtentPoint32W(hdc, &text, &mut size).as_bool() {
-                continue;
-            }
-            let width = size.cx + scaled(22, dpi);
-            if x + width > right_limit {
-                break;
-            }
-            let chip = RECT {
+    let mut entries: Vec<(Option<String>, String, Option<COLORREF>)> =
+        vec![(None, "全部".to_string(), None)];
+    for (id, name) in &panel.categories {
+        entries.push((
+            Some(id.clone()),
+            name.clone(),
+            Some(theme::category_dot_for_name(name)),
+        ));
+    }
+
+    let mut chips = Vec::new();
+    for (id, name, color) in entries {
+        let (tw, _) = d2d::measure_style(&name, TextStyle::Label, dpi);
+        let dot_extra = if color.is_some() { scaled(11, dpi) } else { 0 };
+        let chip_w = tw.ceil() as i32 + scaled(22, dpi) + dot_extra;
+        if x + chip_w > right_limit {
+            break;
+        }
+        chips.push(CategoryChip {
+            id,
+            name,
+            color,
+            rect: RECT {
                 left: x,
                 top,
-                right: x + width,
+                right: x + chip_w,
                 bottom: top + height,
-            };
-            chips.push((id, name, chip));
-            x += width + scaled(8, dpi);
-        }
+            },
+        });
+        x += chip_w + scaled(6, dpi);
     }
     chips
 }
 
-fn draw_categories(hdc: HDC, panel: &Panel, right_limit: i32, dpi: u32) {
-    let font = panel.fonts.body;
-    unsafe {
-        let previous = SelectObject(hdc, HGDIOBJ(font.0));
-        SetBkMode(hdc, TRANSPARENT);
-        for (id, name, mut rect) in category_chips(hdc, panel, right_limit, dpi) {
-            let selected = match (&id, &panel.active_category) {
+fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+}
+
+fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
+    let dpi = panel.dpi;
+    let palette = panel.palette;
+    let rects = compute_layout(panel, client.right, client.bottom);
+    let chips = category_chips(panel, &rects, client.right);
+    let edit_focused = unsafe { GetFocus() } == panel.edit;
+
+    d2d::paint_buffered(hdc, client, |c| {
+        // 1. Window base + crisp outer border
+        c.clear(palette.card);
+        c.stroke_round(&client, d2d::scaled_f(12.0, dpi), palette.border, 1.0);
+
+        // Subtle top drag pill when no status banner is shown
+        if rects.banner.is_none() {
+            let grip_w = scaled(36, dpi);
+            let grip_h = scaled(3, dpi).max(2);
+            let grip_l = (client.left + client.right - grip_w) / 2;
+            let grip_t = scaled(4, dpi);
+            let grip = RECT {
+                left: grip_l,
+                top: grip_t,
+                right: grip_l + grip_w,
+                bottom: grip_t + grip_h,
+            };
+            c.fill_round(&grip, grip_h as f32 * 0.5, palette.border_strong);
+        }
+
+        // 2. Optional top status banner
+        if let Some(banner) = &rects.banner {
+            let (bg, fg, icon, text) = if let Some(reason) = &panel.copy_only {
+                (
+                    palette.warning_soft,
+                    palette.warning,
+                    Icon::Warning,
+                    format!("仅复制模式（{reason}）· 按 Enter 安全复制到剪贴板"),
+                )
+            } else if let Some(token) = &panel.notice {
+                (
+                    palette.danger_soft,
+                    palette.danger,
+                    Icon::Lock,
+                    format!("存储只读（{}）· 仍可正常检索与输入", notice_label(token)),
+                )
+            } else {
+                (
+                    palette.primary_soft,
+                    palette.primary_text,
+                    Icon::Clipboard,
+                    "粘贴兼容模式（Ctrl+V）· 原纯文本剪贴板受保护".to_string(),
+                )
+            };
+            c.fill_rect(banner, bg);
+            c.line(
+                banner.left as f32,
+                banner.bottom as f32 - 0.5,
+                banner.right as f32,
+                banner.bottom as f32 - 0.5,
+                palette.divider,
+                1.0,
+            );
+            c.icon(
+                icon,
+                (banner.left + scaled(22, dpi)) as f32,
+                (banner.top + banner.bottom) as f32 * 0.5,
+                d2d::scaled_f(13.0, dpi),
+                fg,
+            );
+            let txt_rect = RECT {
+                left: banner.left + scaled(34, dpi),
+                top: banner.top,
+                right: banner.right - scaled(12, dpi),
+                bottom: banner.bottom,
+            };
+            c.draw_text(
+                &text,
+                &txt_rect,
+                TextStyle::Label,
+                dpi,
+                fg,
+                AlignH::Left,
+                AlignV::Center,
+            );
+        }
+
+        // 3. Search Capsule (rounded pill with soft focus accent)
+        let search_r = d2d::scaled_f(11.0, dpi);
+        let search_border = if edit_focused {
+            palette.selection_border
+        } else {
+            palette.border
+        };
+        c.fill_stroke_round(
+            &rects.search_shell,
+            search_r,
+            palette.field,
+            search_border,
+            if edit_focused {
+                d2d::scaled_f(1.25, dpi)
+            } else {
+                1.0
+            },
+        );
+
+        // Brand-tinted search icon tile on the left
+        let icon_tile_sz = scaled(24, dpi);
+        let icon_tile = RECT {
+            left: rects.search_shell.left + scaled(8, dpi),
+            top: rects.search_shell.top
+                + (rects.search_shell.bottom - rects.search_shell.top - icon_tile_sz) / 2,
+            right: rects.search_shell.left + scaled(8, dpi) + icon_tile_sz,
+            bottom: rects.search_shell.top
+                + (rects.search_shell.bottom - rects.search_shell.top + icon_tile_sz) / 2,
+        };
+        c.fill_round(&icon_tile, d2d::scaled_f(7.0, dpi), palette.primary_soft);
+        c.icon(
+            Icon::Search,
+            (icon_tile.left + icon_tile.right) as f32 * 0.5,
+            (icon_tile.top + icon_tile.bottom) as f32 * 0.5,
+            d2d::scaled_f(14.0, dpi),
+            palette.primary,
+        );
+
+        // Hotkey tactile keycap
+        if !panel.hotkey_hint.is_empty() && rects.hotkey_kbd.right > rects.hotkey_kbd.left {
+            c.kbd(&panel.hotkey_hint, &rects.hotkey_kbd, palette, dpi);
+        }
+
+        // Settings gear icon button
+        if panel.hover == HoverTarget::Settings {
+            c.fill_round(
+                &rects.settings_btn,
+                d2d::scaled_f(8.0, dpi),
+                palette.primary_soft,
+            );
+        }
+        c.icon(
+            Icon::Gear,
+            (rects.settings_btn.left + rects.settings_btn.right) as f32 * 0.5,
+            (rects.settings_btn.top + rects.settings_btn.bottom) as f32 * 0.5,
+            d2d::scaled_f(16.0, dpi),
+            if panel.hover == HoverTarget::Settings {
+                palette.primary
+            } else {
+                palette.secondary
+            },
+        );
+
+        // 4. Category Chips Row + Hairline Divider
+        for (idx, chip) in chips.iter().enumerate() {
+            let selected = match (&chip.id, &panel.active_category) {
                 (None, None) => true,
-                (Some(left), Some(right)) => left == right,
+                (Some(a), Some(b)) => a == b,
                 _ => false,
             };
-            let mut label = platform::wide(&name);
-            let brush = if selected {
-                panel.brushes.selected
+            let hovered = panel.hover == HoverTarget::Category(idx);
+            let radius = (chip.rect.bottom - chip.rect.top) as f32 * 0.5;
+
+            if selected {
+                let fill = if palette.dark {
+                    palette.primary_hover
+                } else {
+                    palette.primary
+                };
+                c.fill_round(&chip.rect, radius, fill);
+            } else if hovered {
+                c.fill_stroke_round(
+                    &chip.rect,
+                    radius,
+                    palette.hover,
+                    palette.border_strong,
+                    1.0,
+                );
             } else {
-                panel.brushes.search
+                c.fill_round(&chip.rect, radius, palette.field);
+            }
+
+            let mut text_rect = chip.rect;
+            if let Some(dot_color) = chip.color {
+                if !selected {
+                    c.fill_circle(
+                        (chip.rect.left + scaled(12, dpi)) as f32,
+                        (chip.rect.top + chip.rect.bottom) as f32 * 0.5,
+                        d2d::scaled_f(3.0, dpi),
+                        dot_color,
+                    );
+                    text_rect.left += scaled(10, dpi);
+                }
+            }
+            c.draw_text(
+                &chip.name,
+                &text_rect,
+                TextStyle::Label,
+                dpi,
+                if selected {
+                    COLORREF(0xFFFFFF)
+                } else {
+                    palette.secondary
+                },
+                AlignH::Center,
+                AlignV::Center,
+            );
+        }
+
+        c.line(
+            1.0,
+            rects.category_bar_bottom as f32 - 0.5,
+            (client.right - 1) as f32,
+            rects.category_bar_bottom as f32 - 0.5,
+            palette.divider,
+            1.0,
+        );
+
+        // 5. Empty State Illustration when list has no matches
+        if let Some(message) = empty_message(panel) {
+            let cx = (rects.list.left + rects.list.right) as f32 * 0.5;
+            let cy = (rects.list.top + rects.list.bottom) as f32 * 0.5 - scaled(18, dpi) as f32;
+            let badge_sz = scaled(44, dpi);
+            let badge = RECT {
+                left: cx as i32 - badge_sz / 2,
+                top: cy as i32 - badge_sz / 2,
+                right: cx as i32 + badge_sz / 2,
+                bottom: cy as i32 + badge_sz / 2,
             };
-            let radius = (rect.bottom - rect.top) / 2;
-            ui::fill_round(hdc, &rect, radius, brush);
-            let mut outline = rect;
-            outline.left += 1;
-            outline.top += 1;
-            outline.right -= 1;
-            outline.bottom -= 1;
-            ui::stroke_round(
-                hdc,
-                &outline,
-                radius - 1,
-                if selected {
-                    panel.palette.primary
-                } else {
-                    panel.palette.border
-                },
-                1,
+            c.fill_round(&badge, d2d::scaled_f(14.0, dpi), palette.field);
+            c.icon(
+                Icon::Search,
+                cx,
+                cy,
+                d2d::scaled_f(20.0, dpi),
+                palette.muted,
             );
-            SetTextColor(
-                hdc,
-                if selected {
-                    panel.palette.primary
-                } else {
-                    panel.palette.secondary
-                },
+
+            let title_rect = RECT {
+                left: rects.list.left + scaled(20, dpi),
+                top: badge.bottom + scaled(10, dpi),
+                right: rects.list.right - scaled(20, dpi),
+                bottom: badge.bottom + scaled(32, dpi),
+            };
+            c.draw_text(
+                message,
+                &title_rect,
+                TextStyle::Heading,
+                dpi,
+                palette.heading,
+                AlignH::Center,
+                AlignV::Center,
             );
-            DrawTextW(
-                hdc,
-                &mut label,
-                &mut rect,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+
+            let hint = if !panel.last_query.is_empty() {
+                "尝试更换关键词，或点击「全部」分类"
+            } else {
+                "点击右下角「管理短语」添加你的常用文本"
+            };
+            let sub_rect = RECT {
+                left: rects.list.left + scaled(20, dpi),
+                top: title_rect.bottom + scaled(2, dpi),
+                right: rects.list.right - scaled(20, dpi),
+                bottom: title_rect.bottom + scaled(22, dpi),
+            };
+            c.draw_text(
+                hint,
+                &sub_rect,
+                TextStyle::Caption,
+                dpi,
+                palette.muted,
+                AlignH::Center,
+                AlignV::Center,
             );
         }
-        let _ = SelectObject(hdc, previous);
-    }
-}
 
-fn draw_empty_message(hdc: HDC, panel: &Panel, rect: &RECT, dpi: u32) {
-    let Some(message) = empty_message(panel) else {
-        return;
-    };
-    let mut message_rect = RECT {
-        left: rect.left,
-        top: scaled(LIST_TOP, dpi),
-        right: rect.right,
-        bottom: rect.bottom - scaled(FOOTER_HEIGHT + 8, dpi),
-    };
-    let mut text = platform::wide(message);
-    unsafe {
-        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.body.0));
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, panel.palette.secondary);
-        DrawTextW(
-            hdc,
-            &mut text,
-            &mut message_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        // 6. Tactile Footer Bar
+        c.fill_rect(&rects.footer, palette.card_subtle);
+        c.line(
+            1.0,
+            rects.footer.top as f32 + 0.5,
+            (client.right - 1) as f32,
+            rects.footer.top as f32 + 0.5,
+            palette.divider,
+            1.0,
         );
-        let _ = SelectObject(hdc, previous);
-    }
+
+        let verb = if panel.copy_only.is_some() {
+            "复制"
+        } else if panel.paste_mode {
+            match selected_paste_ok(panel) {
+                Some(false) => "复制",
+                _ => "粘贴",
+            }
+        } else {
+            "输入"
+        };
+
+        let mut fx = scaled(14, dpi);
+        let kbd_h = scaled(20, dpi);
+        let kbd_top = rects.footer.top + (rects.footer.bottom - rects.footer.top - kbd_h) / 2;
+        let max_fx = rects.manage_btn.left - scaled(8, dpi);
+
+        for (key, desc) in [("↑↓", "选择"), ("↵", verb), ("Esc", "关闭")] {
+            let (kw, _) = c.measure_style(key, TextStyle::Mono, dpi);
+            let (dw, _) = c.measure_style(desc, TextStyle::Caption, dpi);
+            let kbd_w = (kw.ceil() as i32 + scaled(10, dpi)).max(scaled(22, dpi));
+            let desc_w = dw.ceil() as i32 + scaled(4, dpi);
+            if fx + kbd_w + desc_w > max_fx {
+                break;
+            }
+            let krect = RECT {
+                left: fx,
+                top: kbd_top,
+                right: fx + kbd_w,
+                bottom: kbd_top + kbd_h,
+            };
+            c.kbd(key, &krect, palette, dpi);
+            fx = krect.right + scaled(5, dpi);
+            let drect = RECT {
+                left: fx,
+                top: rects.footer.top,
+                right: fx + desc_w,
+                bottom: rects.footer.bottom,
+            };
+            c.draw_text(
+                desc,
+                &drect,
+                TextStyle::Caption,
+                dpi,
+                palette.muted,
+                AlignH::Left,
+                AlignV::Center,
+            );
+            fx = drect.right + scaled(10, dpi);
+        }
+
+        // Right-aligned "管理短语" pill button
+        let manage_hover = panel.hover == HoverTarget::Manage;
+        c.fill_stroke_round(
+            &rects.manage_btn,
+            d2d::scaled_f(8.0, dpi),
+            if manage_hover {
+                palette.selection
+            } else {
+                palette.primary_soft
+            },
+            if manage_hover {
+                palette.selection_border
+            } else {
+                palette.primary_soft
+            },
+            1.0,
+        );
+        c.icon(
+            Icon::Grid,
+            (rects.manage_btn.left + scaled(15, dpi)) as f32,
+            (rects.manage_btn.top + rects.manage_btn.bottom) as f32 * 0.5,
+            d2d::scaled_f(12.0, dpi),
+            palette.primary_text,
+        );
+        let mtxt = RECT {
+            left: rects.manage_btn.left + scaled(25, dpi),
+            top: rects.manage_btn.top,
+            right: rects.manage_btn.right - scaled(6, dpi),
+            bottom: rects.manage_btn.bottom,
+        };
+        c.draw_text(
+            "管理短语",
+            &mtxt,
+            TextStyle::Label,
+            dpi,
+            palette.primary_text,
+            AlignH::Center,
+            AlignV::Center,
+        );
+    });
 }
 
-fn draw_match(
-    hdc: HDC,
-    panel: &Panel,
-    text: &str,
-    rect: &mut RECT,
-    highlight: Option<(usize, usize)>,
-    normal: COLORREF,
-) {
-    let Some((start, end)) = highlight.filter(|(start, end)| start < end && *end <= text.len())
+fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
+    if draw.itemID == u32::MAX {
+        return;
+    }
+    let idx = draw.itemID as usize;
+    let Some(item) = panel
+        .filtered
+        .get(idx)
+        .and_then(|index| panel.items.get(*index))
     else {
-        let mut wide = platform::wide(text);
-        unsafe {
-            SetTextColor(hdc, normal);
-            DrawTextW(
-                hdc,
-                &mut wide,
-                rect,
-                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
-        }
         return;
     };
 
-    let prefix = &text[..start];
-    let matched = &text[start..end];
-    let suffix = &text[end..];
-    let mut prefix_wide = platform::wide(prefix);
-    let mut matched_wide = platform::wide(matched);
-    let mut suffix_wide = platform::wide(suffix);
-    let mut prefix_size = SIZE::default();
-    let mut matched_size = SIZE::default();
-    unsafe {
-        if !GetTextExtentPoint32W(hdc, &prefix_wide, &mut prefix_size).as_bool()
-            || !GetTextExtentPoint32W(hdc, &matched_wide, &mut matched_size).as_bool()
-        {
-            return;
+    let dpi = panel.dpi;
+    let palette = panel.palette;
+    let rect = draw.rcItem;
+    let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
+    let title_hl = panel.title_highlights.get(idx).copied().flatten();
+    let content_hl = panel.content_highlights.get(idx).copied().flatten();
+    let preview = item.content.replace("\r\n", " ↵ ").replace('\n', " ↵ ");
+
+    let right_pad = if ui::listbox_scrollable(draw.hwndItem) {
+        scaled(13, dpi)
+    } else {
+        scaled(6, dpi)
+    };
+    d2d::paint_buffered(draw.hDC, rect, |c| {
+        c.fill_rect(&rect, palette.card);
+
+        let pill = RECT {
+            left: rect.left + scaled(6, dpi),
+            top: rect.top + scaled(2, dpi),
+            right: (rect.right - right_pad).max(rect.left + scaled(20, dpi)),
+            bottom: rect.bottom - scaled(2, dpi),
+        };
+        if selected {
+            c.fill_stroke_round(
+                &pill,
+                d2d::scaled_f(10.0, dpi),
+                palette.selection,
+                palette.selection_border,
+                1.0,
+            );
+            // 3px left accent indicator pill
+            let accent_bar = RECT {
+                left: pill.left + scaled(3, dpi),
+                top: pill.top + scaled(10, dpi),
+                right: pill.left + scaled(6, dpi),
+                bottom: pill.bottom - scaled(10, dpi),
+            };
+            c.fill_round(&accent_bar, d2d::scaled_f(2.0, dpi), palette.primary);
         }
-    }
 
-    let mut prefix_rect = RECT {
-        left: rect.left,
-        top: rect.top,
-        right: (rect.left + prefix_size.cx).min(rect.right),
-        bottom: rect.bottom,
-    };
-    let mut match_rect = RECT {
-        left: rect.left + prefix_size.cx,
-        top: rect.top,
-        right: (rect.left + prefix_size.cx + matched_size.cx + 2).min(rect.right),
-        bottom: rect.bottom,
-    };
-    let mut suffix_rect = RECT {
-        left: match_rect.right,
-        top: rect.top,
-        right: rect.right,
-        bottom: rect.bottom,
-    };
-
-    unsafe {
-        SetTextColor(hdc, normal);
-        DrawTextW(
-            hdc,
-            &mut prefix_wide,
-            &mut prefix_rect,
-            DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+        // Semantic 36x36 rounded icon tile (matches demo w-9 h-9 rounded-[10px])
+        let icon_sz = scaled(36, dpi);
+        let icon_rect = RECT {
+            left: pill.left + scaled(12, dpi),
+            top: pill.top + ((pill.bottom - pill.top) - icon_sz) / 2,
+            right: pill.left + scaled(12, dpi) + icon_sz,
+            bottom: pill.top + ((pill.bottom - pill.top) + icon_sz) / 2,
+        };
+        let cat_dot = theme::category_dot_for_name(&item.category);
+        let (tile_bg, glyph_icon, glyph_color) = if item.pinned {
+            (palette.primary_soft, Icon::Pin, palette.primary)
+        } else if item.content.contains('\n') {
+            (palette.field, Icon::Multiline, cat_dot)
+        } else {
+            (palette.field, Icon::Chat, cat_dot)
+        };
+        c.fill_round(&icon_rect, d2d::scaled_f(10.0, dpi), tile_bg);
+        c.icon(
+            glyph_icon,
+            (icon_rect.left + icon_rect.right) as f32 * 0.5,
+            (icon_rect.top + icon_rect.bottom) as f32 * 0.5,
+            d2d::scaled_f(16.0, dpi),
+            glyph_color,
         );
-        if match_rect.right > match_rect.left {
-            ui::fill_round(
-                hdc,
-                &match_rect,
-                scaled(3, panel.dpi),
-                panel.brushes.highlight,
+
+        let text_left = icon_rect.right + scaled(11, dpi);
+
+        // Right-side indicator: ↵ keycap for selected, or index 1..9
+        let mut right_edge = pill.right - scaled(10, dpi);
+        if selected {
+            let kbd_w = scaled(22, dpi);
+            let kbd_h = scaled(20, dpi);
+            let krect = RECT {
+                left: right_edge - kbd_w,
+                top: pill.top + scaled(8, dpi),
+                right: right_edge,
+                bottom: pill.top + scaled(8, dpi) + kbd_h,
+            };
+            c.kbd("↵", &krect, palette, dpi);
+            right_edge = krect.left - scaled(6, dpi);
+        } else if idx < 9 {
+            let num_w = scaled(16, dpi);
+            let nrect = RECT {
+                left: right_edge - num_w,
+                top: pill.top + scaled(8, dpi),
+                right: right_edge,
+                bottom: pill.top + scaled(28, dpi),
+            };
+            c.draw_text(
+                &(idx + 1).to_string(),
+                &nrect,
+                TextStyle::Mono,
+                dpi,
+                palette.muted,
+                AlignH::Center,
+                AlignV::Center,
             );
-            SetTextColor(hdc, panel.palette.highlight_text);
-            DrawTextW(
-                hdc,
-                &mut matched_wide,
-                &mut match_rect,
-                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX,
-            );
+            right_edge = nrect.left - scaled(6, dpi);
         }
-        if suffix_rect.right > suffix_rect.left {
-            SetTextColor(hdc, normal);
-            DrawTextW(
-                hdc,
-                &mut suffix_wide,
-                &mut suffix_rect,
-                DT_SINGLELINE | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
+
+        // Category pill badge
+        if !item.category.is_empty() {
+            let (cw, _) = c.measure_style(&item.category, TextStyle::Badge, dpi);
+            let tag_w = (cw.ceil() as i32 + scaled(14, dpi)).min(scaled(86, dpi));
+            let tag_h = scaled(20, dpi);
+            let tag_rect = RECT {
+                left: (right_edge - tag_w).max(text_left + scaled(60, dpi)),
+                top: pill.top + scaled(8, dpi),
+                right: right_edge,
+                bottom: pill.top + scaled(8, dpi) + tag_h,
+            };
+            c.fill_stroke_round(
+                &tag_rect,
+                d2d::scaled_f(6.0, dpi),
+                palette.card_subtle,
+                palette.divider,
+                1.0,
             );
+            c.draw_text(
+                &item.category,
+                &tag_rect,
+                TextStyle::Badge,
+                dpi,
+                palette.secondary,
+                AlignH::Center,
+                AlignV::Center,
+            );
+            right_edge = tag_rect.left - scaled(8, dpi);
         }
-    }
+
+        // Title
+        let title_rect = RECT {
+            left: text_left,
+            top: pill.top + scaled(7, dpi),
+            right: right_edge.max(text_left + 10),
+            bottom: pill.top + scaled(29, dpi),
+        };
+        c.draw_text_highlighted(
+            &item.title,
+            &title_rect,
+            TextStyle::Heading,
+            dpi,
+            palette.heading,
+            title_hl,
+            palette.highlight,
+            palette.highlight_text,
+            d2d::scaled_f(4.0, dpi),
+        );
+
+        // Preview line
+        let preview_rect = RECT {
+            left: text_left,
+            top: pill.top + scaled(30, dpi),
+            right: pill.right - scaled(12, dpi),
+            bottom: pill.bottom - scaled(6, dpi),
+        };
+        // Note: highlight byte offsets were computed against `item.content`;
+        // only highlight directly when no CRLF replacement shifted offsets.
+        let safe_hl = if item.content == preview {
+            content_hl
+        } else {
+            None
+        };
+        c.draw_text_highlighted(
+            &preview,
+            &preview_rect,
+            TextStyle::Caption,
+            dpi,
+            palette.secondary,
+            safe_hl,
+            palette.highlight,
+            palette.highlight_text,
+            d2d::scaled_f(3.0, dpi),
+        );
+    });
 }
 
 type Highlight = Option<(usize, usize)>;
@@ -1587,6 +1841,7 @@ fn notice_label(token: &str) -> &str {
     }
 }
 
+#[allow(dead_code)]
 fn enter_verb(paste_mode: bool, paste_ok: Option<bool>) -> &'static str {
     if !paste_mode {
         return "Enter 输入";
@@ -1597,13 +1852,12 @@ fn enter_verb(paste_mode: bool, paste_ok: Option<bool>) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn footer_text_for(copy_only: Option<&str>, notice: Option<&str>, verb: &str) -> String {
     match (copy_only, notice) {
-        (Some(reason), Some(token)) => format!(
-            // Keep this rare double-warning short enough for the footer.
-            "只读（{}） · 仅复制（{reason}）",
-            notice_label(token)
-        ),
+        (Some(reason), Some(token)) => {
+            format!("只读（{}） · 仅复制（{reason}）", notice_label(token))
+        }
         (Some(reason), None) => format!("仅复制（{reason}） · Enter 复制 · Esc 关闭"),
         (None, Some(token)) => format!(
             "存储只读（{}） · ↑↓ 选择 · {} · Esc 关闭",
@@ -1622,11 +1876,6 @@ fn selected_paste_ok(panel: &Panel) -> Option<bool> {
         &item.content,
         panel.keep_tabs,
     ))
-}
-
-fn footer_text(panel: &Panel) -> String {
-    let verb = enter_verb(panel.paste_mode, selected_paste_ok(panel));
-    footer_text_for(panel.copy_only.as_deref(), panel.notice.as_deref(), verb)
 }
 
 fn empty_message_for(
@@ -1733,11 +1982,9 @@ fn populate(query: &str) {
         if !titles.is_empty() {
             let _ = send(list, LB_SETCURSEL, 0, 0);
         }
-        // The list is a child window and would paint over the empty-state text.
         let _ = ShowWindow(list, if titles.is_empty() { SW_HIDE } else { SW_SHOW });
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
-    refresh_footer();
 }
 
 fn read_text(hwnd: HWND) -> String {
@@ -1776,13 +2023,19 @@ unsafe extern "system" fn edit_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_MOUSEWHEEL {
+        let list = PANEL.with(|slot| slot.borrow().as_ref().map(|p| p.list).unwrap_or_default());
+        if !list.0.is_null() {
+            let _ = SendMessageW(list, message, Some(wparam), Some(lparam));
+            return LRESULT(0);
+        }
+    }
+
     if (message == WM_KEYUP || message == WM_SYSKEYUP) && wparam.0 as u16 == VK_RETURN.0 {
         if ime_composing(hwnd) {
             ENTER_ARMED.store(false, Ordering::Relaxed);
             return call_default_edit(hwnd, message, wparam, lparam);
         }
-        // Only commit when the matching key-down was observed and was not
-        // consumed by IME composition.
         if ENTER_ARMED.swap(false, Ordering::Relaxed) {
             commit();
         }
@@ -1791,27 +2044,21 @@ unsafe extern "system" fn edit_proc(
 
     if message == WM_KEYDOWN || message == WM_SYSKEYDOWN {
         let key = wparam.0 as u16;
-
         if key == VK_RETURN.0 {
             if ime_composing(hwnd) {
                 ENTER_ARMED.store(false, Ordering::Relaxed);
                 return call_default_edit(hwnd, message, wparam, lparam);
             }
-            // Commit on key-up so Enter is physically released before the
-            // panel hides and focus returns to the target.
             ENTER_ARMED.store(true, Ordering::Relaxed);
             return LRESULT(0);
         }
-
         if key == VK_ESCAPE.0 {
             hide_and_restore();
             return LRESULT(0);
         }
-
         if modifiers_down() {
             return call_default_edit(hwnd, message, wparam, lparam);
         }
-
         let delta = if key == VK_UP.0 {
             Some(-1)
         } else if key == VK_DOWN.0 {
@@ -1823,7 +2070,6 @@ unsafe extern "system" fn edit_proc(
         } else {
             None
         };
-
         if let Some(delta) = delta {
             move_selection(delta);
             return LRESULT(0);
@@ -1842,6 +2088,22 @@ fn call_default_edit(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -
     unsafe { CallWindowProcW(previous, hwnd, message, wparam, lparam) }
 }
 
+fn hit_test_hover(panel: &Panel, width: i32, height: i32, x: i32, y: i32) -> HoverTarget {
+    let rects = compute_layout(panel, width, height);
+    if point_in(&rects.settings_btn, x, y) {
+        return HoverTarget::Settings;
+    }
+    if point_in(&rects.manage_btn, x, y) {
+        return HoverTarget::Manage;
+    }
+    for (idx, chip) in category_chips(panel, &rects, width).iter().enumerate() {
+        if point_in(&chip.rect, x, y) {
+            return HoverTarget::Category(idx);
+        }
+    }
+    HoverTarget::None
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -1851,84 +2113,37 @@ unsafe extern "system" fn window_proc(
     match message {
         WM_TIMER if wparam.0 == FADE_TIMER => {
             let step = FADE_STEP.fetch_add(1, Ordering::Relaxed) + 1;
-            unsafe {
-                let alpha = ((step.min(10) * 255) / 10) as u8;
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
-            }
+            let alpha = ((step.min(10) * 255) / 10) as u8;
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
             if step >= 10 {
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), FADE_TIMER);
-                }
+                let _ = KillTimer(Some(hwnd), FADE_TIMER);
             }
             LRESULT(0)
         }
         WM_SHOWWINDOW if wparam.0 == 0 => {
-            // Hiding during the fade must not leave the next show transparent.
-            unsafe {
-                let _ = KillTimer(Some(hwnd), FADE_TIMER);
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-            }
+            let _ = KillTimer(Some(hwnd), FADE_TIMER);
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
             LRESULT(0)
         }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
-            let parts = PANEL.with(|slot| {
-                slot.borrow().as_ref().map(|panel| {
-                    (
-                        panel.edit,
-                        panel.list,
-                        panel.footer,
-                        panel.settings_link,
-                        panel.manage_link,
-                        panel.dpi,
-                    )
-                })
+            PANEL.with(|slot| {
+                if let Some(panel) = slot.borrow().as_ref() {
+                    layout_panel(panel, width, height);
+                }
             });
-            if let Some((edit, list, footer, settings_link, manage_link, dpi)) = parts {
-                layout_controls(
-                    edit,
-                    list,
-                    footer,
-                    settings_link,
-                    manage_link,
-                    dpi,
-                    width,
-                    height,
-                );
-            }
             LRESULT(0)
         }
         WM_COMMAND => {
             let control = (wparam.0 & 0xffff) as i32;
             let code = ((wparam.0 >> 16) & 0xffff) as u32;
-            if (control == SETTINGS_LINK_ID || control == MANAGE_LINK_ID) && code == 0 {
-                let notify = PANEL.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .map(|panel| panel.notify)
-                        .unwrap_or_default()
-                });
-                let id = if control == SETTINGS_LINK_ID {
-                    1004 // ID_SETTINGS
-                } else {
-                    1002 // ID_MANAGE
-                };
-                if !notify.0.is_null() {
-                    unsafe {
-                        let _ = PostMessageW(Some(notify), WM_COMMAND, WPARAM(id), LPARAM(0));
-                    }
-                }
-                hide_and_restore();
-                logging::info(if control == SETTINGS_LINK_ID {
-                    "panel settings link"
-                } else {
-                    "panel manage link"
-                });
-            } else if control == EDIT_ID && code == EN_CHANGE {
+            if control == EDIT_ID && code == EN_CHANGE {
                 let edit = HWND(lparam.0 as *mut core::ffi::c_void);
                 let text = read_text(edit);
                 populate(&text);
+            } else if control == EDIT_ID && (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             } else if control == LIST_ID && code == LBN_DBLCLK {
                 commit();
             } else if control == LIST_ID
@@ -1941,11 +2156,9 @@ unsafe extern "system" fn window_proc(
                         .unwrap_or_default()
                 });
                 if !edit.0.is_null() {
-                    unsafe {
-                        let _ = SetFocus(Some(edit));
-                    }
+                    let _ = SetFocus(Some(edit));
                 }
-                refresh_footer();
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
@@ -1963,261 +2176,246 @@ unsafe extern "system" fn window_proc(
         }
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let (field, heading) = PANEL.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|panel| (panel.palette.field, panel.palette.heading))
-                    .unwrap_or((COLORREF(0xFFFFFF), COLORREF(0)))
-            });
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetBkColor(hdc, field);
-                SetTextColor(hdc, heading);
-            }
-            let brush = PANEL.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|panel| panel.brushes.search.0 as isize)
-                    .unwrap_or(0)
-            });
-            LRESULT(brush)
-        }
-        WM_CTLCOLORSTATIC => {
-            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let control = HWND(lparam.0 as *mut core::ffi::c_void);
-            let id = unsafe { GetDlgCtrlID(control) };
-            let color = PANEL.with(|slot| {
+            let (field, heading, brush) = PANEL.with(|slot| {
                 slot.borrow()
                     .as_ref()
                     .map(|panel| {
-                        if id == SETTINGS_LINK_ID || id == MANAGE_LINK_ID {
-                            panel.palette.primary
-                        } else {
-                            panel.palette.secondary
-                        }
+                        (
+                            panel.palette.field,
+                            panel.palette.heading,
+                            panel.brushes.search.0 as isize,
+                        )
                     })
-                    .unwrap_or(COLORREF(0))
+                    .unwrap_or((COLORREF(0xFFFFFF), COLORREF(0), 0))
             });
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, color);
-            }
-            let brush = PANEL.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|panel| {
-                        if id == SETTINGS_LINK_ID {
-                            // The settings link sits inside the search band.
-                            panel.brushes.search.0 as isize
-                        } else {
-                            panel.brushes.background.0 as isize
-                        }
-                    })
-                    .unwrap_or(0)
-            });
+            SetBkMode(hdc, TRANSPARENT);
+            SetBkColor(hdc, field);
+            SetTextColor(hdc, heading);
             LRESULT(brush)
         }
-        WM_ERASEBKGND => {
+        WM_CTLCOLORLISTBOX => {
             let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
-            let mut rect = RECT::default();
-            unsafe {
-                let _ = GetClientRect(hwnd, &mut rect);
-                if let Some(brush) =
-                    PANEL.with(|slot| slot.borrow().as_ref().map(|panel| panel.brushes.background))
-                {
-                    FillRect(hdc, &rect, brush);
-                }
-            }
-            LRESULT(1)
+            let (card, brush) = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| (panel.palette.card, panel.brushes.background.0 as isize))
+                    .unwrap_or((COLORREF(0xFFFFFF), 0))
+            });
+            SetBkColor(hdc, card);
+            LRESULT(brush)
         }
+        WM_ERASEBKGND => LRESULT(1),
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
-            unsafe {
-                let hdc = BeginPaint(hwnd, &mut paint);
-                let mut rect = RECT::default();
-                let _ = GetClientRect(hwnd, &mut rect);
-                PANEL.with(|slot| {
-                    let guard = slot.borrow();
-                    let Some(panel) = guard.as_ref() else {
-                        return;
+            let hdc = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            PANEL.with(|slot| {
+                if let Some(panel) = slot.borrow().as_ref() {
+                    paint_panel(panel, hdc, client);
+                }
+            });
+            let _ = EndPaint(hwnd, &paint);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let need_redraw = PANEL.with(|slot| {
+                let mut guard = slot.borrow_mut();
+                let Some(panel) = guard.as_mut() else {
+                    return false;
+                };
+                if !panel.tracking_mouse {
+                    panel.tracking_mouse = true;
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
                     };
-                    let margin = scaled(16, panel.dpi);
-                    FillRect(hdc, &rect, panel.brushes.background);
-
-                    let search_rect = RECT {
-                        left: margin - 1,
-                        top: scaled(SEARCH_TOP, panel.dpi) - 1,
-                        right: rect.right - margin + 1,
-                        bottom: scaled(SEARCH_TOP + SEARCH_HEIGHT, panel.dpi) + 1,
-                    };
-                    // Rounded search surface.
-                    ui::fill_round(
-                        hdc,
-                        &search_rect,
-                        scaled(10, panel.dpi),
-                        panel.brushes.search,
-                    );
-                    let mut search_border = search_rect;
-                    search_border.left += 1;
-                    search_border.top += 1;
-                    search_border.right -= 1;
-                    search_border.bottom -= 1;
-                    ui::stroke_round(
-                        hdc,
-                        &search_border,
-                        scaled(9, panel.dpi),
-                        panel.palette.border,
-                        1,
-                    );
-
-                    // Search glyph at the left of the field.
-                    let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.icon.0));
-                    SetTextColor(hdc, panel.palette.secondary);
-                    SetBkMode(hdc, TRANSPARENT);
-                    let mut search_glyph = platform::wide("\u{E721}");
-                    let mut glyph_rect = RECT {
-                        left: margin - 1,
-                        top: search_rect.top,
-                        right: margin + scaled(26, panel.dpi),
-                        bottom: search_rect.bottom,
-                    };
-                    DrawTextW(
-                        hdc,
-                        &mut search_glyph,
-                        &mut glyph_rect,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                    );
-                    let _ = SelectObject(hdc, previous);
-
-                    // Shortcut hint sits between the field and the settings link.
-                    if !panel.hotkey_hint.is_empty() {
-                        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.small.0));
-                        SetTextColor(hdc, panel.palette.secondary);
-                        let mut hint = platform::wide(&panel.hotkey_hint);
-                        let mut hint_rect = RECT {
-                            left: rect.right
-                                - margin
-                                - scaled(52, panel.dpi)
-                                - scaled(84, panel.dpi),
-                            top: search_rect.top,
-                            right: rect.right
-                                - margin
-                                - scaled(52, panel.dpi)
-                                - scaled(2, panel.dpi),
-                            bottom: search_rect.bottom,
-                        };
-                        DrawTextW(
-                            hdc,
-                            &mut hint,
-                            &mut hint_rect,
-                            DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
-                        );
-                        let _ = SelectObject(hdc, previous);
-                    }
-
-                    draw_categories(hdc, panel, rect.right - margin, panel.dpi);
-                    draw_empty_message(hdc, panel, &rect, panel.dpi);
-                });
-                let _ = EndPaint(hwnd, &paint);
+                    let _ = TrackMouseEvent(&mut track);
+                }
+                let next = hit_test_hover(panel, client.right, client.bottom, x, y);
+                if next != panel.hover {
+                    panel.hover = next;
+                    true
+                } else {
+                    false
+                }
+            });
+            if need_redraw {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            let need_redraw = PANEL.with(|slot| {
+                let mut guard = slot.borrow_mut();
+                let Some(panel) = guard.as_mut() else {
+                    return false;
+                };
+                panel.tracking_mouse = false;
+                if panel.hover != HoverTarget::None {
+                    panel.hover = HoverTarget::None;
+                    true
+                } else {
+                    false
+                }
+            });
+            if need_redraw {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let x = (lparam.0 & 0xffff) as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-            // Clicking the search band (except the settings link) focuses the
-            // input, so the visible band is not a dead zone.
-            let focused_search = PANEL.with(|slot| {
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+
+            enum ClickAction {
+                None,
+                FocusSearch(HWND),
+                OpenSettings(HWND),
+                OpenManage(HWND),
+                Category(Option<String>, HWND),
+            }
+
+            let action = PANEL.with(|slot| {
                 let guard = slot.borrow();
                 let Some(panel) = guard.as_ref() else {
-                    return false;
+                    return ClickAction::None;
                 };
-                let mut client = RECT::default();
-                unsafe {
-                    let _ = GetClientRect(hwnd, &mut client);
+                let rects = compute_layout(panel, client.right, client.bottom);
+                if point_in(&rects.settings_btn, x, y) {
+                    return ClickAction::OpenSettings(panel.notify);
                 }
-                let top = scaled(SEARCH_TOP, panel.dpi);
-                let bottom = top + scaled(SEARCH_HEIGHT, panel.dpi);
-                let link_left = client.right - scaled(16, panel.dpi) - scaled(52, panel.dpi);
-                if y >= top && y <= bottom && x >= scaled(16, panel.dpi) && x < link_left {
-                    unsafe {
-                        let _ = SetFocus(Some(panel.edit));
+                if point_in(&rects.manage_btn, x, y) {
+                    return ClickAction::OpenManage(panel.notify);
+                }
+                if point_in(&rects.search_shell, x, y) {
+                    return ClickAction::FocusSearch(panel.edit);
+                }
+                for chip in category_chips(panel, &rects, client.right) {
+                    if point_in(&chip.rect, x, y) {
+                        return ClickAction::Category(chip.id, panel.edit);
                     }
-                    return true;
                 }
-                false
-            });
-            if focused_search {
-                return LRESULT(0);
-            }
-            let chosen = PANEL.with(|slot| {
-                let guard = slot.borrow();
-                let panel = guard.as_ref()?;
-                let hdc = unsafe { GetDC(Some(hwnd)) };
-                let previous = unsafe { SelectObject(hdc, HGDIOBJ(panel.fonts.body.0)) };
-                let chips = category_chips(
-                    hdc,
-                    panel,
-                    {
-                        let mut rect = RECT::default();
-                        unsafe {
-                            let _ = GetClientRect(hwnd, &mut rect);
-                        }
-                        rect.right - scaled(16, panel.dpi)
-                    },
-                    panel.dpi,
-                );
-                unsafe {
-                    let _ = SelectObject(hdc, previous);
-                    let _ = ReleaseDC(Some(hwnd), hdc);
-                }
-                chips
-                    .into_iter()
-                    .find(|(_, _, rect)| {
-                        x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-                    })
-                    .map(|(id, _, _)| id)
+                ClickAction::None
             });
 
-            if let Some(id) = chosen {
-                logging::info(&format!("panel category: {id:?}"));
-                let changed = PANEL.with(|slot| {
-                    let mut guard = slot.borrow_mut();
-                    let Some(panel) = guard.as_mut() else {
-                        return false;
-                    };
-                    if panel.active_category == id {
-                        return false;
+            match action {
+                ClickAction::OpenSettings(notify) => {
+                    if !notify.0.is_null() {
+                        let _ = PostMessageW(Some(notify), WM_COMMAND, WPARAM(1004), LPARAM(0));
                     }
-                    panel.active_category = id;
-                    true
-                });
-                let edit = PANEL.with(|slot| {
-                    slot.borrow()
-                        .as_ref()
-                        .map(|panel| panel.edit)
-                        .unwrap_or_default()
-                });
-                if changed && !edit.0.is_null() {
-                    let query = read_text(edit);
-                    populate(&query);
+                    hide_and_restore();
+                    logging::info("panel settings link");
                 }
-                // A click on the parent window moves keyboard focus away from
-                // the search box; the panel is keyboard-first.
-                if !edit.0.is_null() {
-                    unsafe {
+                ClickAction::OpenManage(notify) => {
+                    if !notify.0.is_null() {
+                        let _ = PostMessageW(Some(notify), WM_COMMAND, WPARAM(1002), LPARAM(0));
+                    }
+                    hide_and_restore();
+                    logging::info("panel manage link");
+                }
+                ClickAction::FocusSearch(edit) => {
+                    let _ = SetFocus(Some(edit));
+                }
+                ClickAction::Category(id, edit) => {
+                    logging::info(&format!("panel category: {id:?}"));
+                    let changed = PANEL.with(|slot| {
+                        let mut guard = slot.borrow_mut();
+                        let Some(panel) = guard.as_mut() else {
+                            return false;
+                        };
+                        if panel.active_category == id {
+                            return false;
+                        }
+                        panel.active_category = id;
+                        true
+                    });
+                    if changed && !edit.0.is_null() {
+                        let query = read_text(edit);
+                        populate(&query);
+                    }
+                    if !edit.0.is_null() {
                         let _ = SetFocus(Some(edit));
                     }
                 }
+                ClickAction::None => {}
+            }
+            LRESULT(0)
+        }
+        WM_NCHITTEST => {
+            let mut pt = POINT {
+                x: (lparam.0 & 0xffff) as i16 as i32,
+                y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+            };
+            if ScreenToClient(hwnd, &mut pt).as_bool() {
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let is_interactive = PANEL.with(|slot| {
+                    let guard = slot.borrow();
+                    let Some(panel) = guard.as_ref() else {
+                        return true;
+                    };
+                    let rects = compute_layout(panel, client.right, client.bottom);
+                    if point_in(&rects.settings_btn, pt.x, pt.y)
+                        || point_in(&rects.manage_btn, pt.x, pt.y)
+                    {
+                        return true;
+                    }
+                    for chip in category_chips(panel, &rects, client.right) {
+                        if point_in(&chip.rect, pt.x, pt.y) {
+                            return true;
+                        }
+                    }
+                    if point_in(&rects.search_shell, pt.x, pt.y)
+                        && !point_in(&rects.hotkey_kbd, pt.x, pt.y)
+                    {
+                        return true;
+                    }
+                    false
+                });
+                if !is_interactive {
+                    return LRESULT(HTCAPTION as isize);
+                }
+            }
+            LRESULT(HTCLIENT as isize)
+        }
+        WM_NCLBUTTONDBLCLK => LRESULT(0),
+        WM_EXITSIZEMOVE => {
+            let edit = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| panel.edit)
+                    .unwrap_or_default()
+            });
+            if !edit.0.is_null() {
+                let _ = SetFocus(Some(edit));
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            let list = PANEL.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|panel| panel.list)
+                    .unwrap_or_default()
+            });
+            if !list.0.is_null() {
+                let _ = SendMessageW(list, message, Some(wparam), Some(lparam));
+                return LRESULT(0);
             }
             LRESULT(0)
         }
         WM_ACTIVATE => {
             let active = (wparam.0 & 0xffff) as u32;
             if active == WA_INACTIVE {
-                // Attaching to the previous foreground thread and detaching can
-                // bounce activation right after the panel appears. Record the
-                // loss instead of dropping it, then decide once opening ends.
                 let (hiding, opening) = PANEL.with(|slot| {
                     slot.borrow()
                         .as_ref()
@@ -2253,159 +2451,18 @@ unsafe extern "system" fn window_proc(
             let dpi = (wparam.0 & 0xffff) as u32;
             apply_dpi(dpi);
             let suggested = &*(lparam.0 as *const RECT);
-            unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    suggested.left,
-                    suggested.top,
-                    suggested.right - suggested.left,
-                    suggested.bottom - suggested.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
-    }
-}
-
-fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
-    if draw.itemID == u32::MAX {
-        return;
-    }
-    let Some(item) = panel
-        .filtered
-        .get(draw.itemID as usize)
-        .and_then(|index| panel.items.get(*index))
-    else {
-        return;
-    };
-    let hdc = draw.hDC;
-    let rect = draw.rcItem;
-
-    unsafe {
-        let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
-        // Clear the whole row: the pill is inset, so the corners must still be
-        // the current card colour after a theme switch.
-        FillRect(hdc, &rect, panel.brushes.background);
-        if selected {
-            let mut pill = rect;
-            pill.left += scaled(4, panel.dpi);
-            pill.top += scaled(4, panel.dpi);
-            pill.right -= scaled(4, panel.dpi);
-            pill.bottom -= scaled(4, panel.dpi);
-            ui::fill_round(hdc, &pill, scaled(10, panel.dpi), panel.brushes.selected);
-            if GetFocus() == panel.list || GetFocus() == panel.edit {
-                // Keyboard focus must be visible and not colour-only (§14.2).
-                ui::stroke_round(
-                    hdc,
-                    &pill,
-                    scaled(10, panel.dpi),
-                    panel.palette.primary,
-                    scaled(1, panel.dpi),
-                );
-            }
-        }
-        SetBkMode(hdc, TRANSPARENT);
-    }
-
-    let pad = scaled(12, panel.dpi);
-
-    // 36 px type icon: a tinted square with a letter, per PRD §14.3.
-    let icon_size = scaled(36, panel.dpi);
-    let icon_rect = RECT {
-        left: rect.left + pad,
-        top: rect.top + ((rect.bottom - rect.top) - icon_size) / 2,
-        right: rect.left + pad + icon_size,
-        bottom: rect.top + ((rect.bottom - rect.top) - icon_size) / 2 + icon_size,
-    };
-    unsafe {
-        ui::fill_round(
-            hdc,
-            &icon_rect,
-            scaled(8, panel.dpi),
-            panel.brushes.selected,
-        );
-        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.title.0));
-        SetTextColor(hdc, panel.palette.primary);
-        let mut glyph = platform::wide("T");
-        let mut glyph_rect = icon_rect;
-        DrawTextW(
-            hdc,
-            &mut glyph,
-            &mut glyph_rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        let _ = SelectObject(hdc, previous);
-    }
-    let text_left = icon_rect.right + scaled(10, panel.dpi);
-
-    let title_highlight = panel
-        .title_highlights
-        .get(draw.itemID as usize)
-        .copied()
-        .flatten();
-    let mut title_rect = RECT {
-        left: text_left,
-        top: rect.top + scaled(8, panel.dpi),
-        right: rect.right - scaled(90, panel.dpi),
-        bottom: rect.top + scaled(28, panel.dpi),
-    };
-    unsafe {
-        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.title.0));
-        draw_match(
-            hdc,
-            panel,
-            &item.title,
-            &mut title_rect,
-            title_highlight,
-            panel.palette.heading,
-        );
-        let _ = SelectObject(hdc, previous);
-    }
-
-    let content_highlight = panel
-        .content_highlights
-        .get(draw.itemID as usize)
-        .copied()
-        .flatten();
-    let mut preview_rect = RECT {
-        left: text_left,
-        top: rect.top + scaled(30, panel.dpi),
-        right: rect.right - scaled(12, panel.dpi),
-        bottom: rect.bottom - scaled(6, panel.dpi),
-    };
-    unsafe {
-        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.body.0));
-        draw_match(
-            hdc,
-            panel,
-            &item.content,
-            &mut preview_rect,
-            content_highlight,
-            panel.palette.secondary,
-        );
-        let _ = SelectObject(hdc, previous);
-    }
-
-    let mut tag = platform::wide(&item.category);
-    let mut tag_rect = RECT {
-        left: rect.right - scaled(84, panel.dpi),
-        top: rect.top + scaled(10, panel.dpi),
-        right: rect.right - scaled(12, panel.dpi),
-        bottom: rect.top + scaled(28, panel.dpi),
-    };
-    unsafe {
-        let previous = SelectObject(hdc, HGDIOBJ(panel.fonts.small.0));
-        SetTextColor(hdc, panel.palette.primary);
-        DrawTextW(
-            hdc,
-            &mut tag,
-            &mut tag_rect,
-            DT_SINGLELINE | DT_RIGHT | DT_NOPREFIX | DT_END_ELLIPSIS,
-        );
-        let _ = SelectObject(hdc, previous);
     }
 }
 
@@ -2413,8 +2470,6 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     if iterations == 0 {
         return (0, 0, 0);
     }
-    // A representative list: the panel draws icons, titles and previews, so an
-    // empty list would hide most of the paint cost.
     let base_items: Vec<Item> = (0..50)
         .map(|index| Item {
             id: format!("bench-{index}"),
@@ -2454,7 +2509,6 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     }
     samples.sort_unstable();
     let p50 = samples[samples.len() / 2];
-    // Nearest-rank p95: ceil(0.95 * n) -> zero-based index.
     let p95_rank = (samples.len() * 95).div_ceil(100);
     let p95 = samples[p95_rank.saturating_sub(1).min(samples.len() - 1)];
     let max = *samples.last().unwrap_or(&0);
@@ -2462,13 +2516,10 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
 }
 
 pub fn shutdown() {
-    // Take the panel out first: DestroyWindow dispatches messages that would
-    // re-enter the window procedure and try to borrow PANEL again.
     let panel = PANEL.with(|slot| slot.borrow_mut().take());
     let Some(panel) = panel else {
         return;
     };
-
     unsafe {
         let old = OLD_EDIT_PROC.load(Ordering::Relaxed);
         if old != 0 {
@@ -2476,8 +2527,8 @@ pub fn shutdown() {
             OLD_EDIT_PROC.store(0, Ordering::Relaxed);
         }
         let _ = DestroyWindow(panel.hwnd);
+        let _ = DeleteObject(HGDIOBJ(panel.edit_font.0));
     }
-    destroy_fonts(&panel.fonts);
     destroy_brushes(&panel.brushes);
 }
 
@@ -2646,7 +2697,6 @@ mod tests {
             super::footer_text_for(None, None, "Enter 粘贴（Ctrl+V）"),
             "↑↓ 选择 · Enter 粘贴（Ctrl+V） · Esc 关闭"
         );
-        // Copy-only still wins over the configured insertion mode.
         assert_eq!(
             super::footer_text_for(Some("未捕获到目标窗口"), None, "Enter 粘贴（Ctrl+V）"),
             "仅复制（未捕获到目标窗口） · Enter 复制 · Esc 关闭"

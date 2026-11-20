@@ -1,7 +1,7 @@
-//! Shared colour tokens for the panel, management and settings windows.
+//! Shared colour tokens for QuickPhrase 2.0 (Porcelain Mica Light / Obsidian Velvet Dark).
 //!
 //! `theme = system` follows the Windows app theme; light/dark are explicit.
-//! Values come from PRD §14.2; dark values keep the same roles and contrast.
+//! Every foreground/background pair is checked against WCAG AA contrast ratios.
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, ERROR_SUCCESS, WIN32_ERROR};
@@ -15,69 +15,139 @@ const APP_THEME_VALUE: PCWSTR = w!("AppsUseLightTheme");
 pub struct Palette {
     pub dark: bool,
     pub page: COLORREF,
+    pub sidebar: COLORREF,
     pub card: COLORREF,
+    pub card_subtle: COLORREF,
     pub heading: COLORREF,
     pub secondary: COLORREF,
+    pub muted: COLORREF,
     pub border: COLORREF,
+    pub border_strong: COLORREF,
+    pub divider: COLORREF,
+    pub hover: COLORREF,
     pub selection: COLORREF,
+    pub selection_border: COLORREF,
     pub primary: COLORREF,
     pub primary_hover: COLORREF,
     /// Pressed/hover fill where white button text must keep >=4.5:1.
     pub primary_active: COLORREF,
+    pub primary_soft: COLORREF,
+    pub primary_text: COLORREF,
     pub highlight: COLORREF,
     pub highlight_text: COLORREF,
+    pub kbd_bg: COLORREF,
+    pub kbd_border: COLORREF,
     pub success: COLORREF,
+    pub success_soft: COLORREF,
     pub warning: COLORREF,
+    pub warning_soft: COLORREF,
     pub error: COLORREF,
-    /// Destructive-button text/border; darker than `error` so white cards
-    /// keep >=4.5:1.
+    /// Destructive-button text/border; keeps >=4.5:1 on card/danger_soft.
     pub danger: COLORREF,
+    pub danger_soft: COLORREF,
     /// Background used by inputs (search box, edits).
     pub field: COLORREF,
+    pub field_focus: COLORREF,
 }
 
-const fn c(r: u32, g: u32, b: u32) -> COLORREF {
+pub const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
     COLORREF(r | (g << 8) | (b << 16))
+}
+
+/// Deterministic category accent dot palette.
+pub const CATEGORY_DOTS: [COLORREF; 6] = [
+    rgb(0x5B, 0x50, 0xF0), // Iris Indigo
+    rgb(0x0E, 0xA5, 0xA4), // Teal
+    rgb(0xD9, 0x77, 0x06), // Amber
+    rgb(0xE1, 0x1D, 0x68), // Rose
+    rgb(0x25, 0x63, 0xEB), // Cobalt
+    rgb(0x7C, 0x3A, 0xED), // Violet
+];
+
+#[allow(dead_code)]
+pub fn category_dot(index: usize) -> COLORREF {
+    CATEGORY_DOTS[index % CATEGORY_DOTS.len()]
+}
+
+pub fn category_dot_for_name(name: &str) -> COLORREF {
+    if name.is_empty() {
+        return rgb(0x88, 0x90, 0xA8);
+    }
+    let mut hash: usize = 5381;
+    for byte in name.as_bytes() {
+        hash = hash.wrapping_mul(33).wrapping_add(*byte as usize);
+    }
+    CATEGORY_DOTS[hash % CATEGORY_DOTS.len()]
 }
 
 pub const LIGHT: Palette = Palette {
     dark: false,
-    page: c(0xF5, 0xF6, 0xFB),
-    card: c(0xFF, 0xFF, 0xFF),
-    heading: c(0x22, 0x24, 0x3E),
-    secondary: c(0x77, 0x7D, 0x92),
-    border: c(0xE9, 0xEB, 0xF3),
-    selection: c(0xF0, 0xED, 0xFF),
-    primary: c(0x76, 0x55, 0xE9),
-    primary_hover: c(0x5E, 0x45, 0xD7),
-    primary_active: c(0x5E, 0x45, 0xD7),
-    highlight: c(0xFF, 0xF1, 0xB8),
-    highlight_text: c(0x4A, 0x2C, 0xB8),
-    success: c(0x22, 0xC5, 0x5E),
-    warning: c(0xF5, 0x9E, 0x0B),
-    error: c(0xEF, 0x44, 0x44),
-    danger: c(0xC6, 0x28, 0x28),
-    field: c(0xF1, 0xF2, 0xF9),
+    page: rgb(0xF3, 0xF5, 0xFA),
+    sidebar: rgb(0xF7, 0xF8, 0xFC),
+    card: rgb(0xFF, 0xFF, 0xFF),
+    card_subtle: rgb(0xF7, 0xF8, 0xFC),
+    heading: rgb(0x16, 0x18, 0x26),
+    secondary: rgb(0x58, 0x5F, 0x78),
+    muted: rgb(0x64, 0x6C, 0x86),
+    border: rgb(0xE4, 0xE7, 0xF2),
+    border_strong: rgb(0xCE, 0xD4, 0xE6),
+    divider: rgb(0xEC, 0xEF, 0xF7),
+    hover: rgb(0xF1, 0xF3, 0xFA),
+    selection: rgb(0xEE, 0xF0, 0xFF),
+    selection_border: rgb(0xB9, 0xB3, 0xFA),
+    primary: rgb(0x5B, 0x50, 0xF0),
+    primary_hover: rgb(0x4A, 0x3E, 0xE0),
+    primary_active: rgb(0x3D, 0x31, 0xCC),
+    primary_soft: rgb(0xEF, 0xEF, 0xFE),
+    primary_text: rgb(0x4C, 0x40, 0xE0),
+    highlight: rgb(0xFF, 0xF0, 0xB3),
+    highlight_text: rgb(0x46, 0x2A, 0xA8),
+    kbd_bg: rgb(0xFF, 0xFF, 0xFF),
+    kbd_border: rgb(0xD6, 0xDB, 0xE9),
+    success: rgb(0x15, 0x80, 0x3D),
+    success_soft: rgb(0xE8, 0xF7, 0xEE),
+    warning: rgb(0xB4, 0x53, 0x09),
+    warning_soft: rgb(0xFE, 0xF3, 0xDC),
+    error: rgb(0xDC, 0x26, 0x26),
+    danger: rgb(0xC6, 0x28, 0x28),
+    danger_soft: rgb(0xFD, 0xEC, 0xEC),
+    field: rgb(0xF1, 0xF3, 0xF9),
+    field_focus: rgb(0xFF, 0xFF, 0xFF),
 };
 
 pub const DARK: Palette = Palette {
     dark: true,
-    page: c(0x14, 0x15, 0x1F),
-    card: c(0x1D, 0x1F, 0x2B),
-    heading: c(0xF2, 0xF3, 0xFA),
-    secondary: c(0xA6, 0xAC, 0xC4),
-    border: c(0x2C, 0x30, 0x40),
-    selection: c(0x2A, 0x24, 0x50),
-    primary: c(0x8B, 0x6C, 0xF2),
-    primary_hover: c(0x7A, 0x58, 0xE8),
-    primary_active: c(0x6D, 0x4A, 0xD8),
-    highlight: c(0x4B, 0x3D, 0x12),
-    highlight_text: c(0xFF, 0xE9, 0xA8),
-    success: c(0x4A, 0xDE, 0x80),
-    warning: c(0xFB, 0xBF, 0x24),
-    error: c(0xF8, 0x71, 0x71),
-    danger: c(0xF8, 0x71, 0x71),
-    field: c(0x23, 0x26, 0x34),
+    page: rgb(0x10, 0x12, 0x1A),
+    sidebar: rgb(0x14, 0x17, 0x22),
+    card: rgb(0x18, 0x1B, 0x26),
+    card_subtle: rgb(0x15, 0x18, 0x23),
+    heading: rgb(0xF2, 0xF4, 0xFB),
+    secondary: rgb(0x9E, 0xA6, 0xC0),
+    muted: rgb(0x7E, 0x87, 0xA6),
+    border: rgb(0x2A, 0x2F, 0x42),
+    border_strong: rgb(0x3A, 0x41, 0x59),
+    divider: rgb(0x23, 0x28, 0x38),
+    hover: rgb(0x22, 0x27, 0x38),
+    selection: rgb(0x26, 0x25, 0x47),
+    selection_border: rgb(0x5E, 0x56, 0xC4),
+    primary: rgb(0x7B, 0x72, 0xFF),
+    primary_hover: rgb(0x6C, 0x62, 0xEE),
+    primary_active: rgb(0x5B, 0x50, 0xDC),
+    primary_soft: rgb(0x25, 0x23, 0x4A),
+    primary_text: rgb(0xAD, 0xA6, 0xFF),
+    highlight: rgb(0x4A, 0x3D, 0x14),
+    highlight_text: rgb(0xFD, 0xE6, 0x8A),
+    kbd_bg: rgb(0x25, 0x2A, 0x3C),
+    kbd_border: rgb(0x39, 0x40, 0x5A),
+    success: rgb(0x4A, 0xDE, 0x80),
+    success_soft: rgb(0x16, 0x33, 0x24),
+    warning: rgb(0xFB, 0xBF, 0x24),
+    warning_soft: rgb(0x36, 0x2B, 0x14),
+    error: rgb(0xF8, 0x71, 0x71),
+    danger: rgb(0xF8, 0x71, 0x71),
+    danger_soft: rgb(0x3A, 0x1E, 0x24),
+    field: rgb(0x21, 0x26, 0x36),
+    field_focus: rgb(0x26, 0x2C, 0x3F),
 };
 
 /// Resolve a persisted preference (`system` / `light` / `dark`).
@@ -152,8 +222,8 @@ mod tests {
     fn explicit_preferences_resolve() {
         assert_eq!(resolve("light").dark, false);
         assert_eq!(resolve("dark").dark, true);
-        assert_eq!(contrast_ratio(LIGHT.heading, LIGHT.card) >= 4.5, true);
-        assert_eq!(contrast_ratio(DARK.heading, DARK.card) >= 4.5, true);
+        assert!(contrast_ratio(LIGHT.heading, LIGHT.card) >= 4.5);
+        assert!(contrast_ratio(DARK.heading, DARK.card) >= 4.5);
     }
 
     #[test]
@@ -164,8 +234,12 @@ mod tests {
                 "heading on card"
             );
             assert!(
-                contrast_ratio(palette.secondary, palette.card) >= 3.0,
+                contrast_ratio(palette.secondary, palette.card) >= 4.5,
                 "secondary on card"
+            );
+            assert!(
+                contrast_ratio(palette.primary_text, palette.card) >= 4.5,
+                "primary_text on card"
             );
             assert!(
                 contrast_ratio(palette.primary, palette.card) >= 3.0,
@@ -184,8 +258,20 @@ mod tests {
                 "heading on field"
             );
             assert!(
-                contrast_ratio(palette.secondary, palette.page) >= 3.0,
+                contrast_ratio(palette.secondary, palette.page) >= 4.5,
                 "secondary on page"
+            );
+            assert!(
+                contrast_ratio(palette.secondary, palette.sidebar) >= 4.5,
+                "secondary on sidebar"
+            );
+            assert!(
+                contrast_ratio(palette.muted, palette.page) >= 4.5,
+                "muted on page"
+            );
+            assert!(
+                contrast_ratio(palette.muted, palette.card_subtle) >= 4.5,
+                "muted on card_subtle"
             );
             let button_fill = if palette.dark {
                 palette.primary_hover
@@ -199,6 +285,14 @@ mod tests {
             assert!(
                 contrast_ratio(palette.danger, palette.card) >= 4.5,
                 "danger button text"
+            );
+            assert!(
+                contrast_ratio(palette.warning, palette.warning_soft) >= 4.5,
+                "warning banner text"
+            );
+            assert!(
+                contrast_ratio(palette.danger, palette.danger_soft) >= 4.5,
+                "danger banner text"
             );
         }
     }

@@ -1,9 +1,11 @@
 #![windows_subsystem = "windows"]
 
+mod about_ui;
 mod app;
 mod capture;
 mod clipboard;
 mod context;
+mod d2d;
 mod foreground;
 mod hotkey;
 mod inject;
@@ -17,6 +19,7 @@ mod single_instance;
 mod storage;
 mod theme;
 mod tray;
+mod tray_menu;
 mod ui;
 mod uia;
 
@@ -39,6 +42,7 @@ fn main() {
     let search_bench = has(&args, "--search-bench");
     let manage_test = has(&args, "--manage-test");
     let settings_test = has(&args, "--settings-test");
+    let about_test = has(&args, "--about-test");
     let delay = value(&args, "--delay")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(1500);
@@ -67,6 +71,26 @@ fn main() {
         logging::info(&format!(
             "search bench: n=1000 queries=100 p50={p50}us p95={p95}us max={max}us"
         ));
+        return;
+    }
+
+    if about_test {
+        storage::init();
+        if !about_ui::show_test() {
+            logging::error("about-test: window creation failed");
+            std::process::exit(4);
+        }
+        let mut message = MSG::default();
+        while unsafe { GetMessageW(&mut message, None, 0, 0) }.0 > 0 {
+            unsafe {
+                if about_ui::is_dialog_message(&message) {
+                    continue;
+                }
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+        about_ui::shutdown();
         return;
     }
 

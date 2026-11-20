@@ -32,6 +32,7 @@ fn find_rc() -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=app.manifest");
+    println!("cargo:rerun-if-changed=assets/quickphrase.ico");
 
     // Neither rc.exe nor llvm-rc is on PATH on a typical build machine.
     if std::env::var_os("RC").is_none() {

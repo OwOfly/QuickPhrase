@@ -1,5 +1,4 @@
-//! M1-5 settings window: hotkey, tab policy, theme, startup, data dir,
-//! clipboard restore.
+//! QuickPhrase 2.0 two-pane Fluent settings center (Direct2D + DirectWrite).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,84 +6,125 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect,
-    SetBkColor, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, DeleteObject, EndPaint, InvalidateRect, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
+use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetFocus, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
+    VK_DOWN, VK_ESCAPE, VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::hotkey;
-use crate::logging;
-use crate::platform;
-use crate::storage;
-use crate::ui;
+use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::{hotkey, logging, platform, storage, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.SettingsWindow");
 const TITLE: PCWSTR = w!("QuickPhrase 设置");
 
-const ID_HOTKEY_TEXT: i32 = 300;
 const ID_HOTKEY_RECORD: i32 = 301;
-const ID_TAB_POLICY: i32 = 302;
-const ID_THEME: i32 = 303;
-const ID_STARTUP: i32 = 304;
-const ID_DATA_DIR: i32 = 305;
 const ID_RESTORE_CLIP: i32 = 306;
 const ID_SAVE: i32 = 307;
 const ID_CANCEL: i32 = 308;
-const ID_STATUS: i32 = 309;
-const ID_LBL_HOTKEY: i32 = 310;
-const ID_LBL_TAB: i32 = 311;
-const ID_LBL_THEME: i32 = 312;
-const ID_LBL_DATA: i32 = 313;
-const ID_INSERTION: i32 = 314;
-const ID_LBL_INSERTION: i32 = 315;
-const ID_LBL_STARTUP: i32 = 316;
-const ID_LBL_CLIPBOARD: i32 = 317;
+const ID_COPY_DIR: i32 = 320;
+const ID_OPEN_DIR: i32 = 321;
 
-const WIDTH: i32 = 580;
-const HEIGHT: i32 = 470;
+const WIDTH: i32 = 740;
+// The Input page needs 430 logical px of body plus the 52 px footer; keep
+// enough client height at the minimum size so it never slides under the footer.
+const HEIGHT: i32 = 560;
 const MIN_WIDTH: i32 = 500;
-const MIN_HEIGHT: i32 = 420;
-const SS_LEFT: u32 = 0;
-const SS_PATHELLIPSIS: u32 = 0x0000_8000;
+const MIN_HEIGHT: i32 = 540;
+const NAV_WIDTH: i32 = 172;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    General,
+    Input,
+    Appearance,
+    Data,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hover {
+    None,
+    Nav(usize),
+    Startup,
+    ModeUnicode,
+    ModePaste,
+    TabSpaces,
+    TabKeep,
+    ThemeCard(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusItem {
+    Custom(Hover),
+    HotkeyRecord,
+    RestoreClip,
+    CopyDir,
+    OpenDir,
+    Save,
+    Cancel,
+}
+
+#[derive(Default, Clone, Copy)]
+struct Rects {
+    nav_pane: RECT,
+    content_pane: RECT,
+    footer: RECT,
+    status: RECT,
+    nav_items: [RECT; 4],
+    // General
+    hotkey_card: RECT,
+    hotkey_kbd_box: RECT,
+    startup_card: RECT,
+    startup_switch: RECT,
+    // Input
+    mode_unicode: RECT,
+    mode_paste: RECT,
+    paste_warn: RECT,
+    tab_card: RECT,
+    tab_spaces: RECT,
+    tab_keep: RECT,
+    clip_card: RECT,
+    // Appearance
+    theme_cards: [RECT; 3],
+    // Data
+    data_card: RECT,
+    data_path_box: RECT,
+    stat_boxes: [RECT; 3],
+}
 
 struct SettingsUi {
     hwnd: HWND,
-    hotkey_text: HWND,
-    lbl_hotkey: HWND,
-    lbl_tab: HWND,
-    lbl_theme: HWND,
-    lbl_data: HWND,
-    lbl_startup: HWND,
-    lbl_clipboard: HWND,
     hotkey_record: HWND,
-    insertion: HWND,
-    lbl_insertion: HWND,
-    tab_policy: HWND,
-    theme: HWND,
-    startup: HWND,
-    data_dir: HWND,
     restore_clip: HWND,
+    copy_dir: HWND,
+    open_dir: HWND,
     save: HWND,
     cancel: HWND,
-    status: HWND,
     font: HFONT,
-    brush: HBRUSH,
-    card_brush: HBRUSH,
-    field_brush: HBRUSH,
-    card: RECT,
-    palette: crate::theme::Palette,
+    palette: theme::Palette,
     dpi: u32,
+    tab: Tab,
+    hover: Hover,
+    focus: Hover,
+    active: bool,
+    tracking_mouse: bool,
+    rects: Rects,
     capturing: bool,
     hotkey_candidate: String,
     original_hotkey: String,
-    loading: bool,
+    paste_mode: bool,
+    keep_tabs: bool,
+    theme_pref: String,
+    startup: bool,
+    status_text: String,
+    data_dir: String,
 }
 
 thread_local! {
@@ -98,67 +138,20 @@ fn scaled(value: i32, dpi: u32) -> i32 {
 }
 
 fn make_font(dpi: u32) -> HFONT {
-    let face = platform::wide("Microsoft YaHei UI");
+    ui::make_font(ui::FontRole::BodyInput, dpi)
+}
+
+fn set_status(ui: &mut SettingsUi, text: &str) {
+    ui.status_text = text.to_string();
     unsafe {
-        CreateFontW(
-            -scaled(14, dpi),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            CLEARTYPE_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            PCWSTR(face.as_ptr()),
-        )
+        let _ = InvalidateRect(Some(ui.hwnd), None, false);
     }
 }
 
-fn set_text(control: HWND, text: &str) {
-    let wide = platform::wide(text);
+fn set_button_text(hwnd: HWND, text: &str) {
+    let w = platform::wide(text);
     unsafe {
-        let _ = SetWindowTextW(control, PCWSTR(wide.as_ptr()));
-    }
-}
-
-fn status(ui: &SettingsUi, text: &str) {
-    set_text(ui.status, text);
-}
-
-fn add_combo_items(combo: HWND, items: &[&str]) {
-    unsafe {
-        let _ = SendMessageW(combo, CB_RESETCONTENT, Some(WPARAM(0)), Some(LPARAM(0)));
-    }
-    for item in items {
-        let wide = platform::wide(item);
-        unsafe {
-            let _ = SendMessageW(
-                combo,
-                CB_ADDSTRING,
-                Some(WPARAM(0)),
-                Some(LPARAM(wide.as_ptr() as isize)),
-            );
-        }
-    }
-}
-
-fn combo_index(combo: HWND) -> usize {
-    let index = unsafe { SendMessageW(combo, CB_GETCURSEL, Some(WPARAM(0)), Some(LPARAM(0))) }.0;
-    if index < 0 {
-        0
-    } else {
-        index as usize
-    }
-}
-
-fn set_combo(combo: HWND, index: usize) {
-    unsafe {
-        let _ = SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(index)), Some(LPARAM(0)));
+        let _ = SetWindowTextW(hwnd, PCWSTR(w.as_ptr()));
     }
 }
 
@@ -166,164 +159,1235 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let margin = scaled(16, ui.dpi);
-    let row = scaled(34, ui.dpi);
-    let gap = scaled(8, ui.dpi);
-    let label_width = scaled(112, ui.dpi);
-    let card = RECT {
-        left: margin,
-        top: margin,
-        right: width - margin,
-        bottom: height - margin - scaled(48, ui.dpi),
+    let dpi = ui.dpi;
+    let nav_w = scaled(NAV_WIDTH, dpi).min((width / 3).max(scaled(124, dpi)));
+    let footer_h = scaled(52, dpi);
+
+    let nav_pane = RECT {
+        left: 0,
+        top: 0,
+        right: nav_w,
+        bottom: height,
     };
-    ui.card = card;
-    let pad = scaled(16, ui.dpi);
-    let field_x = card.left + pad + label_width;
-    let field_right = card.right - pad;
-    let field_width = (field_right - field_x).max(1);
-    let mut y = card.top + pad;
+    let content_pane = RECT {
+        left: nav_w,
+        top: 0,
+        right: width,
+        bottom: (height - footer_h).max(1),
+    };
+    let footer = RECT {
+        left: nav_w,
+        top: content_pane.bottom,
+        right: width,
+        bottom: height,
+    };
+
+    // Nav items (below top-left brand logo header)
+    let npad = scaled(10, dpi);
+    let item_h = scaled(38, dpi);
+    let mut nav_items = [RECT::default(); 4];
+    for (i, item) in nav_items.iter_mut().enumerate() {
+        let top = scaled(74, dpi) + (item_h + scaled(4, dpi)) * i as i32;
+        *item = RECT {
+            left: npad,
+            top,
+            right: nav_w - npad,
+            bottom: top + item_h,
+        };
+    }
+
+    let cpad = scaled(22, dpi);
+    let cl = content_pane.left + cpad;
+    let cr = (content_pane.right - cpad).max(cl + 100);
+    let cw = cr - cl;
+    let body_top = scaled(68, dpi);
+
+    // --- Tab 0: General ---
+    let compact = cw < scaled(380, dpi);
+    let hk_card_h = if ui.capturing {
+        if compact {
+            scaled(142, dpi)
+        } else {
+            scaled(112, dpi)
+        }
+    } else if compact {
+        scaled(104, dpi)
+    } else {
+        scaled(74, dpi)
+    };
+    let hotkey_card = RECT {
+        left: cl,
+        top: body_top,
+        right: cr,
+        bottom: body_top + hk_card_h,
+    };
+    let rec_w = scaled(76, dpi);
+    let rec_h = scaled(32, dpi);
+    let (rec_x, rec_y, hotkey_kbd_box) = if compact {
+        let ctrl_y = hotkey_card.top + scaled(58, dpi);
+        let kbd_l = hotkey_card.left + scaled(16, dpi);
+        let rx = hotkey_card.right - scaled(16, dpi) - rec_w;
+        let kbd_r = (rx - scaled(8, dpi)).max(kbd_l + scaled(80, dpi));
+        (
+            rx,
+            ctrl_y,
+            RECT {
+                left: kbd_l,
+                top: ctrl_y,
+                right: kbd_r,
+                bottom: ctrl_y + rec_h,
+            },
+        )
+    } else {
+        let rx = hotkey_card.right - scaled(16, dpi) - rec_w;
+        let ry = hotkey_card.top + scaled(21, dpi);
+        let kbd_w = scaled(128, dpi).min((cw / 3).max(scaled(86, dpi)));
+        (
+            rx,
+            ry,
+            RECT {
+                left: rx - scaled(8, dpi) - kbd_w,
+                top: ry,
+                right: rx - scaled(8, dpi),
+                bottom: ry + rec_h,
+            },
+        )
+    };
+    let startup_top = hotkey_card.bottom + scaled(12, dpi);
+    let startup_h = scaled(74, dpi);
+    let startup_card = RECT {
+        left: cl,
+        top: startup_top,
+        right: cr,
+        bottom: startup_top + startup_h,
+    };
+    let sw_w = scaled(40, dpi);
+    let sw_h = scaled(22, dpi);
+    let startup_switch = RECT {
+        left: startup_card.right - scaled(18, dpi) - sw_w,
+        top: startup_card.top + (startup_h - sw_h) / 2,
+        right: startup_card.right - scaled(18, dpi),
+        bottom: startup_card.top + (startup_h + sw_h) / 2,
+    };
+
+    // --- Tab 1: Input ---
+    let radio_h = scaled(70, dpi);
+    let mode_unicode = RECT {
+        left: cl,
+        top: body_top,
+        right: cr,
+        bottom: body_top + radio_h,
+    };
+    let mode_paste = RECT {
+        left: cl,
+        top: mode_unicode.bottom + scaled(8, dpi),
+        right: cr,
+        bottom: mode_unicode.bottom + scaled(8, dpi) + radio_h,
+    };
+    let paste_warn = if ui.paste_mode {
+        RECT {
+            left: cl,
+            top: mode_paste.bottom + scaled(8, dpi),
+            right: cr,
+            bottom: mode_paste.bottom + scaled(8, dpi) + scaled(38, dpi),
+        }
+    } else {
+        RECT {
+            left: cl,
+            top: mode_paste.bottom,
+            right: cr,
+            bottom: mode_paste.bottom,
+        }
+    };
+    let tab_top = paste_warn.bottom + scaled(10, dpi);
+    let tab_card = RECT {
+        left: cl,
+        top: tab_top,
+        right: cr,
+        bottom: tab_top + scaled(84, dpi),
+    };
+    let seg_pad = scaled(14, dpi);
+    let seg_top = tab_card.top + scaled(40, dpi);
+    let seg_h = scaled(32, dpi);
+    let seg_mid = cl + cw / 2;
+    let tab_spaces = RECT {
+        left: cl + seg_pad,
+        top: seg_top,
+        right: seg_mid - scaled(3, dpi),
+        bottom: seg_top + seg_h,
+    };
+    let tab_keep = RECT {
+        left: seg_mid + scaled(3, dpi),
+        top: seg_top,
+        right: cr - seg_pad,
+        bottom: seg_top + seg_h,
+    };
+    let clip_top = tab_card.bottom + scaled(10, dpi);
+    let clip_card = RECT {
+        left: cl,
+        top: clip_top,
+        right: cr,
+        bottom: clip_top + scaled(64, dpi),
+    };
+    let clip_btn_w = scaled(166, dpi).min((cw / 2).max(scaled(110, dpi)));
+    let clip_btn_h = scaled(32, dpi);
+
+    // --- Tab 2: Appearance ---
+    let card_gap = scaled(12, dpi);
+    let tcard_w = ((cw - card_gap * 2) / 3).max(scaled(80, dpi));
+    let tcard_h = scaled(136, dpi);
+    let mut theme_cards = [RECT::default(); 3];
+    for (i, tc) in theme_cards.iter_mut().enumerate() {
+        let x = cl + (tcard_w + card_gap) * i as i32;
+        *tc = RECT {
+            left: x,
+            top: body_top,
+            right: x + tcard_w,
+            bottom: body_top + tcard_h,
+        };
+    }
+
+    // --- Tab 3: Data ---
+    let data_card = RECT {
+        left: cl,
+        top: body_top,
+        right: cr,
+        bottom: body_top + scaled(196, dpi),
+    };
+    let dpad = scaled(16, dpi);
+    let btn_sm_w = scaled(76, dpi);
+    let path_top = data_card.top + scaled(42, dpi);
+    let path_h = scaled(34, dpi);
+    let data_path_box = RECT {
+        left: data_card.left + dpad,
+        top: path_top,
+        right: (data_card.right - dpad - btn_sm_w * 2 - scaled(14, dpi))
+            .max(data_card.left + dpad + 60),
+        bottom: path_top + path_h,
+    };
+    let stat_top = path_top + path_h + scaled(18, dpi);
+    let stat_h = scaled(72, dpi);
+    let stat_gap = scaled(10, dpi);
+    let stat_w = ((cw - dpad * 2 - stat_gap * 2) / 3).max(scaled(64, dpi));
+    let mut stat_boxes = [RECT::default(); 3];
+    for (i, sb) in stat_boxes.iter_mut().enumerate() {
+        let x = data_card.left + dpad + (stat_w + stat_gap) * i as i32;
+        *sb = RECT {
+            left: x,
+            top: stat_top,
+            right: x + stat_w,
+            bottom: stat_top + stat_h,
+        };
+    }
+
+    // Footer buttons
+    let save_w = scaled(92, dpi);
+    let cancel_w = scaled(72, dpi);
+    let fbtn_h = scaled(32, dpi);
+    let fbtn_y = footer.top + (footer_h - fbtn_h) / 2;
+    let status = RECT {
+        left: cl,
+        top: footer.top,
+        right: (cr - save_w - cancel_w - scaled(20, dpi)).max(cl + 20),
+        bottom: footer.bottom,
+    };
 
     unsafe {
+        let _ = MoveWindow(ui.hotkey_record, rec_x, rec_y, rec_w, rec_h, true);
         let _ = MoveWindow(
-            ui.lbl_hotkey,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
+            ui.restore_clip,
+            clip_card.right - scaled(16, dpi) - clip_btn_w,
+            clip_card.top + ((clip_card.bottom - clip_card.top) - clip_btn_h) / 2,
+            clip_btn_w,
+            clip_btn_h,
             true,
         );
         let _ = MoveWindow(
-            ui.hotkey_text,
-            field_x,
-            y,
-            (field_width - scaled(80, ui.dpi)).max(1),
-            row,
+            ui.copy_dir,
+            data_path_box.right + scaled(8, dpi),
+            path_top,
+            btn_sm_w,
+            path_h,
             true,
         );
         let _ = MoveWindow(
-            ui.hotkey_record,
-            field_right - scaled(72, ui.dpi),
-            y,
-            scaled(72, ui.dpi),
-            row,
+            ui.open_dir,
+            data_path_box.right + scaled(8, dpi) + btn_sm_w + scaled(6, dpi),
+            path_top,
+            btn_sm_w,
+            path_h,
             true,
         );
-        y += row + gap;
-        let _ = MoveWindow(
-            ui.lbl_insertion,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
-            true,
-        );
-        let _ = MoveWindow(
-            ui.insertion,
-            field_x,
-            y,
-            scaled(300, ui.dpi),
-            ui::combo_height(ui.insertion, ui.dpi),
-            true,
-        );
-        y += row + gap;
-        let _ = MoveWindow(ui.lbl_tab, card.left + pad, y, label_width - gap, row, true);
-        let _ = MoveWindow(
-            ui.tab_policy,
-            field_x,
-            y,
-            scaled(260, ui.dpi),
-            ui::combo_height(ui.tab_policy, ui.dpi),
-            true,
-        );
-        y += row + gap;
-        let _ = MoveWindow(
-            ui.lbl_theme,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
-            true,
-        );
-        let _ = MoveWindow(
-            ui.theme,
-            field_x,
-            y,
-            scaled(200, ui.dpi),
-            ui::combo_height(ui.theme, ui.dpi),
-            true,
-        );
-        y += row + gap;
-        let _ = MoveWindow(
-            ui.lbl_startup,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
-            true,
-        );
-        let _ = MoveWindow(ui.startup, field_x, y, field_width, row, true);
-        y += row + gap;
-        let _ = MoveWindow(
-            ui.lbl_data,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
-            true,
-        );
-        let _ = MoveWindow(ui.data_dir, field_x, y, field_width, row, true);
-        y += row + gap;
-        let _ = MoveWindow(
-            ui.lbl_clipboard,
-            card.left + pad,
-            y,
-            label_width - gap,
-            row,
-            true,
-        );
-        let _ = MoveWindow(ui.restore_clip, field_x, y, scaled(250, ui.dpi), row, true);
-
-        let actions_top = height - margin - scaled(32, ui.dpi);
-        let _ = MoveWindow(
-            ui.status,
-            margin,
-            actions_top,
-            (width - margin * 2 - scaled(190, ui.dpi)).max(1),
-            scaled(32, ui.dpi),
-            true,
-        );
-        let _ = MoveWindow(
-            ui.save,
-            width - margin - scaled(176, ui.dpi),
-            actions_top,
-            scaled(84, ui.dpi),
-            scaled(32, ui.dpi),
-            true,
-        );
+        let _ = MoveWindow(ui.save, cr - save_w, fbtn_y, save_w, fbtn_h, true);
         let _ = MoveWindow(
             ui.cancel,
-            width - margin - scaled(84, ui.dpi),
-            actions_top,
-            scaled(84, ui.dpi),
-            scaled(32, ui.dpi),
+            cr - save_w - scaled(8, dpi) - cancel_w,
+            fbtn_y,
+            cancel_w,
+            fbtn_h,
             true,
+        );
+
+        let _ = ShowWindow(
+            ui.hotkey_record,
+            if ui.tab == Tab::General {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = ShowWindow(
+            ui.restore_clip,
+            if ui.tab == Tab::Input {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = ShowWindow(
+            ui.copy_dir,
+            if ui.tab == Tab::Data {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+        let _ = ShowWindow(
+            ui.open_dir,
+            if ui.tab == Tab::Data {
+                SW_SHOW
+            } else {
+                SW_HIDE
+            },
+        );
+    }
+
+    ui.rects = Rects {
+        nav_pane,
+        content_pane,
+        footer,
+        status,
+        nav_items,
+        hotkey_card,
+        hotkey_kbd_box,
+        startup_card,
+        startup_switch,
+        mode_unicode,
+        mode_paste,
+        paste_warn,
+        tab_card,
+        tab_spaces,
+        tab_keep,
+        clip_card,
+        theme_cards,
+        data_card,
+        data_path_box,
+        stat_boxes,
+    };
+}
+
+fn relayout(ui: &mut SettingsUi) {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetClientRect(ui.hwnd, &mut rect);
+    }
+    layout(ui, rect.right, rect.bottom);
+    unsafe {
+        let _ = InvalidateRect(Some(ui.hwnd), None, false);
+    }
+}
+
+fn paint_settings(ui: &SettingsUi, hdc: HDC, client: RECT) {
+    let dpi = ui.dpi;
+    let p = ui.palette;
+    let r = ui.rects;
+
+    d2d::paint_buffered(hdc, client, |c| {
+        // 1. Background surfaces
+        c.fill_rect(&r.nav_pane, p.sidebar);
+        c.fill_rect(&r.content_pane, p.page);
+        c.fill_rect(&r.footer, p.card_subtle);
+        c.line(
+            r.nav_pane.right as f32 - 0.5,
+            0.0,
+            r.nav_pane.right as f32 - 0.5,
+            client.bottom as f32,
+            p.divider,
+            1.0,
+        );
+        c.line(
+            r.footer.left as f32,
+            r.footer.top as f32 + 0.5,
+            r.footer.right as f32,
+            r.footer.top as f32 + 0.5,
+            p.divider,
+            1.0,
+        );
+
+        // 2. Top-left Brand Logo Header + Navigation Rail
+        let badge_sz = scaled(32, dpi);
+        let badge_l = scaled(14, dpi);
+        let badge_t = scaled(17, dpi);
+        let badge = RECT {
+            left: badge_l,
+            top: badge_t,
+            right: badge_l + badge_sz,
+            bottom: badge_t + badge_sz,
+        };
+        c.brand_logo(&badge, dpi);
+        let brand_name = RECT {
+            left: badge.right + scaled(9, dpi),
+            top: badge.top - scaled(1, dpi),
+            right: r.nav_pane.right - scaled(8, dpi),
+            bottom: badge.top + scaled(17, dpi),
+        };
+        let brand_sub = RECT {
+            left: badge.right + scaled(9, dpi),
+            top: brand_name.bottom,
+            right: r.nav_pane.right - scaled(8, dpi),
+            bottom: badge.bottom + scaled(2, dpi),
+        };
+        c.draw_text(
+            "QuickPhrase",
+            &brand_name,
+            TextStyle::Heading,
+            dpi,
+            p.heading,
+            AlignH::Left,
+            AlignV::Center,
+        );
+        c.draw_text(
+            "偏好设置",
+            &brand_sub,
+            TextStyle::Badge,
+            dpi,
+            p.muted,
+            AlignH::Left,
+            AlignV::Center,
+        );
+        c.line(
+            scaled(14, dpi) as f32,
+            scaled(62, dpi) as f32 - 0.5,
+            (r.nav_pane.right - scaled(14, dpi)) as f32,
+            scaled(62, dpi) as f32 - 0.5,
+            p.divider,
+            1.0,
+        );
+
+        let nav_defs = [
+            (Tab::General, Icon::Keyboard, "热键与启动"),
+            (Tab::Input, Icon::EditPen, "输入与剪贴板"),
+            (Tab::Appearance, Icon::Palette, "外观与主题"),
+            (Tab::Data, Icon::Folder, "数据与存储"),
+        ];
+        for (idx, (tab, icon, label)) in nav_defs.iter().enumerate() {
+            let item = r.nav_items[idx];
+            let selected = ui.tab == *tab;
+            let hovered = ui.hover == Hover::Nav(idx);
+            if selected {
+                c.fill_round(&item, d2d::scaled_f(10.0, dpi), p.selection);
+                let bar = RECT {
+                    left: item.left + scaled(3, dpi),
+                    top: item.top + scaled(9, dpi),
+                    right: item.left + scaled(6, dpi),
+                    bottom: item.bottom - scaled(9, dpi),
+                };
+                c.fill_round(&bar, d2d::scaled_f(2.0, dpi), p.primary);
+            } else if hovered {
+                c.fill_round(&item, d2d::scaled_f(10.0, dpi), p.hover);
+            }
+            let fg = if selected {
+                p.primary_text
+            } else {
+                p.secondary
+            };
+            c.icon(
+                *icon,
+                (item.left + scaled(22, dpi)) as f32,
+                (item.top + item.bottom) as f32 * 0.5,
+                d2d::scaled_f(15.5, dpi),
+                fg,
+            );
+            let txt = RECT {
+                left: item.left + scaled(38, dpi),
+                top: item.top,
+                right: item.right - scaled(8, dpi),
+                bottom: item.bottom,
+            };
+            c.draw_text(
+                label,
+                &txt,
+                if selected {
+                    TextStyle::Heading
+                } else {
+                    TextStyle::Body
+                },
+                dpi,
+                fg,
+                AlignH::Left,
+                AlignV::Center,
+            );
+        }
+
+        // 3. Section Header
+        let (title, subtitle) = match ui.tab {
+            Tab::General => ("热键与启动", "配置全局唤起快捷键与系统自启动行为"),
+            Tab::Input => ("输入与剪贴板", "选择文本注入策略与剪贴板安全保护"),
+            Tab::Appearance => ("外观与主题", "点击卡片即时预览全部窗口的视觉主题"),
+            Tab::Data => (
+                "数据与存储",
+                "本地 JSON 原子写入 · 自动保留最近 5 份滚动备份",
+            ),
+        };
+        let hdr_l = r.content_pane.left + scaled(22, dpi);
+        let hdr_r = r.content_pane.right - scaled(22, dpi);
+        let title_r = RECT {
+            left: hdr_l,
+            top: scaled(16, dpi),
+            right: hdr_r,
+            bottom: scaled(40, dpi),
+        };
+        let sub_r = RECT {
+            left: hdr_l,
+            top: scaled(40, dpi),
+            right: hdr_r,
+            bottom: scaled(58, dpi),
+        };
+        c.draw_text(
+            title,
+            &title_r,
+            TextStyle::Display,
+            dpi,
+            p.heading,
+            AlignH::Left,
+            AlignV::Center,
+        );
+        c.draw_text(
+            subtitle,
+            &sub_r,
+            TextStyle::Caption,
+            dpi,
+            p.secondary,
+            AlignH::Left,
+            AlignV::Center,
+        );
+
+        // 4. Active Tab Body
+        match ui.tab {
+            Tab::General => paint_tab_general(ui, c, p, r, dpi),
+            Tab::Input => paint_tab_input(ui, c, p, r, dpi),
+            Tab::Appearance => paint_tab_appearance(ui, c, p, r, dpi),
+            Tab::Data => paint_tab_data(ui, c, p, r, dpi),
+        }
+
+        // 5. Keyboard focus ring for custom cards/navigation.
+        if let Some(rect) = focus_rect(ui) {
+            c.stroke_round(
+                &rect,
+                d2d::scaled_f(10.0, dpi),
+                p.primary,
+                d2d::scaled_f(1.5, dpi),
+            );
+        }
+
+        // 6. Footer Status
+        c.draw_text(
+            &ui.status_text,
+            &r.status,
+            TextStyle::Caption,
+            dpi,
+            p.muted,
+            AlignH::Left,
+            AlignV::Center,
+        );
+    });
+}
+
+fn paint_tab_general(
+    ui: &SettingsUi,
+    c: &mut d2d::Canvas<'_>,
+    p: theme::Palette,
+    r: Rects,
+    dpi: u32,
+) {
+    let rad = d2d::scaled_f(12.0, dpi);
+    let pad = scaled(16, dpi);
+
+    // Hotkey Card
+    c.fill_stroke_round(
+        &r.hotkey_card,
+        rad,
+        p.card,
+        if ui.capturing { p.primary } else { p.border },
+        if ui.capturing {
+            d2d::scaled_f(1.5, dpi)
+        } else {
+            1.0
+        },
+    );
+    let title_right = if r.hotkey_kbd_box.top > r.hotkey_card.top + scaled(40, dpi) {
+        r.hotkey_card.right - pad
+    } else {
+        r.hotkey_kbd_box.left - scaled(10, dpi)
+    };
+    let t1 = RECT {
+        left: r.hotkey_card.left + pad,
+        top: r.hotkey_card.top + scaled(14, dpi),
+        right: title_right,
+        bottom: r.hotkey_card.top + scaled(34, dpi),
+    };
+    let d1 = RECT {
+        left: t1.left,
+        top: t1.bottom + scaled(2, dpi),
+        right: t1.right,
+        bottom: t1.bottom + scaled(20, dpi),
+    };
+    c.draw_text(
+        "全局唤起快捷键",
+        &t1,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.draw_text(
+        "在任意输入框按下即可弹出短语面板",
+        &d1,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+
+    // Hotkey KBD Container
+    c.fill_stroke_round(
+        &r.hotkey_kbd_box,
+        d2d::scaled_f(9.0, dpi),
+        p.field,
+        p.border,
+        1.0,
+    );
+    let hk_display = if ui.hotkey_candidate.is_empty() {
+        ui.original_hotkey.as_str()
+    } else {
+        ui.hotkey_candidate.as_str()
+    };
+    let inner_kbd = RECT {
+        left: r.hotkey_kbd_box.left + scaled(6, dpi),
+        top: r.hotkey_kbd_box.top + scaled(5, dpi),
+        right: r.hotkey_kbd_box.right - scaled(6, dpi),
+        bottom: r.hotkey_kbd_box.bottom - scaled(5, dpi),
+    };
+    c.kbd(hk_display, &inner_kbd, p, dpi);
+
+    if ui.capturing {
+        let hint_box = RECT {
+            left: r.hotkey_card.left + pad,
+            top: r.hotkey_card.bottom - scaled(38, dpi),
+            right: r.hotkey_card.right - pad,
+            bottom: r.hotkey_card.bottom - scaled(12, dpi),
+        };
+        c.fill_round(&hint_box, d2d::scaled_f(8.0, dpi), p.primary_soft);
+        let ht = RECT {
+            left: hint_box.left + scaled(10, dpi),
+            top: hint_box.top,
+            right: hint_box.right - scaled(10, dpi),
+            bottom: hint_box.bottom,
+        };
+        c.draw_text(
+            "正在录制：请直接按下新的组合键（需含 Ctrl / Alt / Shift / Win），按 Esc 取消",
+            &ht,
+            TextStyle::Label,
+            dpi,
+            p.primary_text,
+            AlignH::Left,
+            AlignV::Center,
+        );
+    }
+
+    // Startup Card
+    c.fill_stroke_round(
+        &r.startup_card,
+        rad,
+        if ui.hover == Hover::Startup {
+            p.hover
+        } else {
+            p.card
+        },
+        p.border,
+        1.0,
+    );
+    let t2 = RECT {
+        left: r.startup_card.left + pad,
+        top: r.startup_card.top + scaled(14, dpi),
+        right: r.startup_switch.left - scaled(12, dpi),
+        bottom: r.startup_card.top + scaled(34, dpi),
+    };
+    let d2 = RECT {
+        left: t2.left,
+        top: t2.bottom + scaled(2, dpi),
+        right: t2.right,
+        bottom: t2.bottom + scaled(20, dpi),
+    };
+    c.draw_text(
+        "随 Windows 开机启动",
+        &t2,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.draw_text(
+        "登录系统后自动在托盘静默就绪，无需管理员权限",
+        &d2,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.switch(
+        &r.startup_switch,
+        ui.startup,
+        ui.hover == Hover::Startup,
+        false,
+        p,
+        dpi,
+    );
+}
+
+fn paint_tab_input(
+    ui: &SettingsUi,
+    c: &mut d2d::Canvas<'_>,
+    p: theme::Palette,
+    r: Rects,
+    dpi: u32,
+) {
+    let rad = d2d::scaled_f(12.0, dpi);
+    let pad = scaled(14, dpi);
+
+    // Radio Card 1: Unicode
+    let uni_sel = !ui.paste_mode;
+    c.fill_stroke_round(
+        &r.mode_unicode,
+        rad,
+        if uni_sel {
+            p.selection
+        } else if ui.hover == Hover::ModeUnicode {
+            p.hover
+        } else {
+            p.card
+        },
+        if uni_sel { p.primary } else { p.border },
+        if uni_sel {
+            d2d::scaled_f(1.5, dpi)
+        } else {
+            1.0
+        },
+    );
+    let rcx = (r.mode_unicode.left + scaled(22, dpi)) as f32;
+    let rcy = (r.mode_unicode.top + scaled(24, dpi)) as f32;
+    c.stroke_circle(
+        rcx,
+        rcy,
+        d2d::scaled_f(7.0, dpi),
+        if uni_sel { p.primary } else { p.border_strong },
+        d2d::scaled_f(1.6, dpi),
+    );
+    if uni_sel {
+        c.fill_circle(rcx, rcy, d2d::scaled_f(3.6, dpi), p.primary);
+    }
+    let ut = RECT {
+        left: r.mode_unicode.left + scaled(38, dpi),
+        top: r.mode_unicode.top + scaled(12, dpi),
+        right: r.mode_unicode.left + scaled(160, dpi),
+        bottom: r.mode_unicode.top + scaled(34, dpi),
+    };
+    c.draw_text(
+        "Unicode 直接输入",
+        &ut,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    let rec_pill = RECT {
+        left: ut.right + scaled(2, dpi),
+        top: r.mode_unicode.top + scaled(14, dpi),
+        right: ut.right + scaled(40, dpi),
+        bottom: r.mode_unicode.top + scaled(32, dpi),
+    };
+    c.fill_round(&rec_pill, d2d::scaled_f(6.0, dpi), p.success_soft);
+    c.draw_text(
+        "推荐",
+        &rec_pill,
+        TextStyle::Badge,
+        dpi,
+        p.success,
+        AlignH::Center,
+        AlignV::Center,
+    );
+    let ud = RECT {
+        left: ut.left,
+        top: ut.bottom + scaled(2, dpi),
+        right: r.mode_unicode.right - pad,
+        bottom: r.mode_unicode.bottom - scaled(8, dpi),
+    };
+    c.draw_text(
+        "通过 SendInput 模拟键盘输入，完全不占用或污染剪贴板，适合绝大多数场景",
+        &ud,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+
+    // Radio Card 2: Paste Mode
+    let pas_sel = ui.paste_mode;
+    c.fill_stroke_round(
+        &r.mode_paste,
+        rad,
+        if pas_sel {
+            p.selection
+        } else if ui.hover == Hover::ModePaste {
+            p.hover
+        } else {
+            p.card
+        },
+        if pas_sel { p.primary } else { p.border },
+        if pas_sel {
+            d2d::scaled_f(1.5, dpi)
+        } else {
+            1.0
+        },
+    );
+    let pcx = (r.mode_paste.left + scaled(22, dpi)) as f32;
+    let pcy = (r.mode_paste.top + scaled(24, dpi)) as f32;
+    c.stroke_circle(
+        pcx,
+        pcy,
+        d2d::scaled_f(7.0, dpi),
+        if pas_sel { p.primary } else { p.border_strong },
+        d2d::scaled_f(1.6, dpi),
+    );
+    if pas_sel {
+        c.fill_circle(pcx, pcy, d2d::scaled_f(3.6, dpi), p.primary);
+    }
+    let pt = RECT {
+        left: r.mode_paste.left + scaled(38, dpi),
+        top: r.mode_paste.top + scaled(12, dpi),
+        right: r.mode_paste.right - pad,
+        bottom: r.mode_paste.top + scaled(34, dpi),
+    };
+    c.draw_text(
+        "粘贴兼容模式 (Ctrl+V)",
+        &pt,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    let pd = RECT {
+        left: pt.left,
+        top: pt.bottom + scaled(2, dpi),
+        right: r.mode_paste.right - pad,
+        bottom: r.mode_paste.bottom - scaled(8, dpi),
+    };
+    c.draw_text(
+        "通过剪贴板粘贴输入，对特殊富文本控件兼容性更好；终端与未知区域仍仅复制",
+        &pd,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+
+    // Optional Paste Warning Banner
+    if ui.paste_mode && r.paste_warn.bottom > r.paste_warn.top {
+        c.fill_round(&r.paste_warn, d2d::scaled_f(9.0, dpi), p.warning_soft);
+        c.icon(
+            Icon::Warning,
+            (r.paste_warn.left + scaled(18, dpi)) as f32,
+            (r.paste_warn.top + r.paste_warn.bottom) as f32 * 0.5,
+            d2d::scaled_f(13.5, dpi),
+            p.warning,
+        );
+        let wt = RECT {
+            left: r.paste_warn.left + scaled(32, dpi),
+            top: r.paste_warn.top,
+            right: r.paste_warn.right - scaled(10, dpi),
+            bottom: r.paste_warn.bottom,
+        };
+        c.draw_text(
+            "粘贴模式会替换当前剪贴板；原纯文本可在下方或托盘一键恢复，非文本无法恢复",
+            &wt,
+            TextStyle::Label,
+            dpi,
+            p.warning,
+            AlignH::Left,
+            AlignV::Center,
+        );
+    }
+
+    // Tab Policy Segmented Card
+    c.fill_stroke_round(&r.tab_card, rad, p.card, p.border, 1.0);
+    let ttl = RECT {
+        left: r.tab_card.left + pad,
+        top: r.tab_card.top + scaled(10, dpi),
+        right: r.tab_card.right - pad,
+        bottom: r.tab_card.top + scaled(32, dpi),
+    };
+    c.draw_text(
+        "制表符 (Tab) 策略",
+        &ttl,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    let seg_well = RECT {
+        left: r.tab_spaces.left - scaled(3, dpi),
+        top: r.tab_spaces.top - scaled(3, dpi),
+        right: r.tab_keep.right + scaled(3, dpi),
+        bottom: r.tab_keep.bottom + scaled(3, dpi),
+    };
+    c.fill_round(&seg_well, d2d::scaled_f(9.0, dpi), p.field);
+
+    let keep_active = ui.paste_mode && ui.keep_tabs;
+    if !keep_active {
+        c.fill_stroke_round(
+            &r.tab_spaces,
+            d2d::scaled_f(7.0, dpi),
+            p.card,
+            p.border,
+            1.0,
+        );
+    } else if ui.hover == Hover::TabSpaces {
+        c.fill_round(&r.tab_spaces, d2d::scaled_f(7.0, dpi), p.hover);
+    }
+    if keep_active {
+        c.fill_stroke_round(&r.tab_keep, d2d::scaled_f(7.0, dpi), p.card, p.border, 1.0);
+    } else if ui.paste_mode && ui.hover == Hover::TabKeep {
+        c.fill_round(&r.tab_keep, d2d::scaled_f(7.0, dpi), p.hover);
+    }
+    c.draw_text(
+        "转换为 4 空格",
+        &r.tab_spaces,
+        TextStyle::Label,
+        dpi,
+        if !keep_active { p.heading } else { p.secondary },
+        AlignH::Center,
+        AlignV::Center,
+    );
+    c.draw_text(
+        if ui.paste_mode {
+            "保留原始 Tab"
+        } else {
+            "保留原始 Tab（仅粘贴模式）"
+        },
+        &r.tab_keep,
+        TextStyle::Label,
+        dpi,
+        if !ui.paste_mode {
+            p.muted
+        } else if keep_active {
+            p.heading
+        } else {
+            p.secondary
+        },
+        AlignH::Center,
+        AlignV::Center,
+    );
+
+    // Clipboard Card
+    c.fill_stroke_round(&r.clip_card, rad, p.card, p.border, 1.0);
+    let ct = RECT {
+        left: r.clip_card.left + pad,
+        top: r.clip_card.top + scaled(11, dpi),
+        right: r.clip_card.right - scaled(188, dpi),
+        bottom: r.clip_card.top + scaled(31, dpi),
+    };
+    let cd = RECT {
+        left: ct.left,
+        top: ct.bottom + scaled(2, dpi),
+        right: ct.right,
+        bottom: r.clip_card.bottom - scaled(8, dpi),
+    };
+    c.draw_text(
+        "剪贴板快照恢复",
+        &ct,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.draw_text(
+        "还原上次快捷复制或粘贴前的纯文本内容",
+        &cd,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+}
+
+fn paint_tab_appearance(
+    ui: &SettingsUi,
+    c: &mut d2d::Canvas<'_>,
+    p: theme::Palette,
+    r: Rects,
+    dpi: u32,
+) {
+    let cards = [
+        ("light", "浅色 Porcelain", false, false),
+        ("dark", "深色 Obsidian", true, false),
+        ("system", "跟随 Windows", false, true),
+    ];
+
+    for (idx, (key, title, is_dark, is_split)) in cards.iter().enumerate() {
+        let card = r.theme_cards[idx];
+        let active = ui.theme_pref == *key;
+        let hovered = ui.hover == Hover::ThemeCard(idx);
+
+        c.fill_stroke_round(
+            &card,
+            d2d::scaled_f(12.0, dpi),
+            if hovered && !active { p.hover } else { p.card },
+            if active { p.primary } else { p.border },
+            if active { d2d::scaled_f(2.0, dpi) } else { 1.0 },
+        );
+
+        // Miniature window preview
+        let mpad = scaled(10, dpi);
+        let mini = RECT {
+            left: card.left + mpad,
+            top: card.top + mpad,
+            right: card.right - mpad,
+            bottom: card.bottom - scaled(38, dpi),
+        };
+        let mrad = d2d::scaled_f(8.0, dpi);
+        if *is_split {
+            let mid = (mini.left + mini.right) / 2;
+            let left_half = RECT { right: mid, ..mini };
+            let right_half = RECT { left: mid, ..mini };
+            c.fill_round(&mini, mrad, theme::LIGHT.page);
+            c.fill_rect(&right_half, theme::DARK.page);
+            // Tiny light pill
+            let lp = RECT {
+                left: left_half.left + scaled(6, dpi),
+                top: left_half.top + scaled(10, dpi),
+                right: mid - scaled(4, dpi),
+                bottom: left_half.top + scaled(24, dpi),
+            };
+            c.fill_round(&lp, d2d::scaled_f(4.0, dpi), theme::LIGHT.card);
+            let lp2 = RECT {
+                top: lp.bottom + scaled(6, dpi),
+                bottom: lp.bottom + scaled(22, dpi),
+                ..lp
+            };
+            c.fill_round(&lp2, d2d::scaled_f(4.0, dpi), theme::LIGHT.selection);
+            // Tiny dark pill
+            let rp = RECT {
+                left: mid + scaled(4, dpi),
+                top: right_half.top + scaled(10, dpi),
+                right: right_half.right - scaled(6, dpi),
+                bottom: right_half.top + scaled(24, dpi),
+            };
+            c.fill_round(&rp, d2d::scaled_f(4.0, dpi), theme::DARK.card);
+            let rp2 = RECT {
+                top: rp.bottom + scaled(6, dpi),
+                bottom: rp.bottom + scaled(22, dpi),
+                ..rp
+            };
+            c.fill_round(&rp2, d2d::scaled_f(4.0, dpi), theme::DARK.selection);
+            c.stroke_round(&mini, mrad, p.border, 1.0);
+        } else {
+            let mp = if *is_dark { theme::DARK } else { theme::LIGHT };
+            c.fill_stroke_round(&mini, mrad, mp.page, mp.border, 1.0);
+            let sbar = RECT {
+                left: mini.left + scaled(8, dpi),
+                top: mini.top + scaled(10, dpi),
+                right: mini.right - scaled(8, dpi),
+                bottom: mini.top + scaled(24, dpi),
+            };
+            c.fill_stroke_round(&sbar, d2d::scaled_f(4.0, dpi), mp.card, mp.border, 1.0);
+            c.fill_circle(
+                (sbar.left + scaled(6, dpi)) as f32,
+                (sbar.top + sbar.bottom) as f32 * 0.5,
+                d2d::scaled_f(2.5, dpi),
+                mp.primary,
+            );
+            let sel = RECT {
+                left: mini.left + scaled(8, dpi),
+                top: sbar.bottom + scaled(8, dpi),
+                right: mini.right - scaled(8, dpi),
+                bottom: sbar.bottom + scaled(26, dpi),
+            };
+            c.fill_stroke_round(
+                &sel,
+                d2d::scaled_f(5.0, dpi),
+                mp.selection,
+                mp.selection_border,
+                1.0,
+            );
+            let r2 = RECT {
+                left: mini.left + scaled(8, dpi),
+                top: sel.bottom + scaled(6, dpi),
+                right: mini.right - scaled(28, dpi),
+                bottom: (sel.bottom + scaled(18, dpi)).min(mini.bottom - scaled(6, dpi)),
+            };
+            c.fill_round(&r2, d2d::scaled_f(4.0, dpi), mp.card);
+        }
+
+        // Card Label + Active Checkmark
+        let lbl = RECT {
+            left: card.left + scaled(12, dpi),
+            top: mini.bottom + scaled(4, dpi),
+            right: card.right - scaled(28, dpi),
+            bottom: card.bottom - scaled(4, dpi),
+        };
+        c.draw_text(
+            title,
+            &lbl,
+            TextStyle::Label,
+            dpi,
+            p.heading,
+            AlignH::Left,
+            AlignV::Center,
+        );
+        if active {
+            let cx = (card.right - scaled(18, dpi)) as f32;
+            let cy = (lbl.top + lbl.bottom) as f32 * 0.5;
+            c.fill_circle(cx, cy, d2d::scaled_f(8.0, dpi), p.primary);
+            c.icon(
+                Icon::Check,
+                cx,
+                cy,
+                d2d::scaled_f(9.0, dpi),
+                COLORREF(0xFFFFFF),
+            );
+        }
+    }
+}
+
+fn paint_tab_data(ui: &SettingsUi, c: &mut d2d::Canvas<'_>, p: theme::Palette, r: Rects, dpi: u32) {
+    let rad = d2d::scaled_f(12.0, dpi);
+    let pad = scaled(16, dpi);
+    c.fill_stroke_round(&r.data_card, rad, p.card, p.border, 1.0);
+
+    let title_r = RECT {
+        left: r.data_card.left + pad,
+        top: r.data_card.top + scaled(14, dpi),
+        right: r.data_card.right - pad,
+        bottom: r.data_card.top + scaled(34, dpi),
+    };
+    c.draw_text(
+        "本地数据目录",
+        &title_r,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+
+    c.fill_stroke_round(
+        &r.data_path_box,
+        d2d::scaled_f(9.0, dpi),
+        p.field,
+        p.border,
+        1.0,
+    );
+    let ptxt = RECT {
+        left: r.data_path_box.left + scaled(10, dpi),
+        top: r.data_path_box.top,
+        right: r.data_path_box.right - scaled(10, dpi),
+        bottom: r.data_path_box.bottom,
+    };
+    c.draw_text(
+        &ui.data_dir,
+        &ptxt,
+        TextStyle::Mono,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+
+    let active_count = storage::data_clone()
+        .map(|d| d.snippets.iter().filter(|s| s.deleted_at.is_none()).count())
+        .unwrap_or(0);
+    let read_only = storage::read_only_notice().is_some();
+    let stats = [
+        (format!("{active_count}"), "有效短语", p.heading),
+        ("5 份".to_string(), "滚动备份", p.heading),
+        (
+            if read_only {
+                "只读".to_string()
+            } else {
+                "正常".to_string()
+            },
+            "存储状态",
+            if read_only { p.warning } else { p.success },
+        ),
+    ];
+
+    for (idx, (val, label, val_color)) in stats.iter().enumerate() {
+        let sb = r.stat_boxes[idx];
+        c.fill_round(&sb, d2d::scaled_f(10.0, dpi), p.card_subtle);
+        let vr = RECT {
+            left: sb.left + scaled(6, dpi),
+            top: sb.top + scaled(12, dpi),
+            right: sb.right - scaled(6, dpi),
+            bottom: sb.top + scaled(40, dpi),
+        };
+        let lr = RECT {
+            left: sb.left + scaled(6, dpi),
+            top: vr.bottom,
+            right: sb.right - scaled(6, dpi),
+            bottom: sb.bottom - scaled(8, dpi),
+        };
+        c.draw_text(
+            val,
+            &vr,
+            TextStyle::Display,
+            dpi,
+            *val_color,
+            AlignH::Center,
+            AlignV::Center,
+        );
+        c.draw_text(
+            label,
+            &lr,
+            TextStyle::Caption,
+            dpi,
+            p.muted,
+            AlignH::Center,
+            AlignV::Center,
         );
     }
 }
 
-fn create_control(
-    class: PCWSTR,
-    text: &str,
-    style: WINDOW_STYLE,
-    parent: HWND,
-    id: i32,
-    instance: HINSTANCE,
-) -> HWND {
+fn create_button(text: &str, parent: HWND, id: i32, instance: HINSTANCE, visible: bool) -> HWND {
     let text = platform::wide(text);
-    unsafe {
+    let mut style = WS_CHILD | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32);
+    if visible {
+        style |= WS_VISIBLE;
+    }
+    let hwnd = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
-            class,
+            w!("BUTTON"),
             PCWSTR(text.as_ptr()),
             style,
             0,
@@ -336,20 +1400,22 @@ fn create_control(
             None,
         )
         .unwrap_or_default()
-    }
+    };
+    ui::install_button(hwnd);
+    hwnd
 }
 
 fn create() -> Option<SettingsUi> {
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
     let instance = HINSTANCE(module.0);
-    let palette = crate::theme::current();
+    let palette = theme::current();
     let class = WNDCLASSW {
-        style: Default::default(),
+        style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(window_proc),
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: instance,
-        hIcon: Default::default(),
+        hIcon: ui::load_app_icon(instance),
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
         hbrBackground: HBRUSH::default(),
         lpszMenuName: PCWSTR::null(),
@@ -369,7 +1435,7 @@ fn create() -> Option<SettingsUi> {
             WINDOW_EX_STYLE::default(),
             CLASS,
             TITLE,
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             120,
             120,
             scaled(WIDTH, dpi),
@@ -382,353 +1448,93 @@ fn create() -> Option<SettingsUi> {
     }
     .ok()?;
 
-    crate::ui::apply_window_style(hwnd);
+    ui::apply_window_style(hwnd);
+    ui::apply_window_icon(hwnd, instance);
+    let win_dpi = unsafe { GetDpiForWindow(hwnd) };
+    let dpi = if win_dpi == 0 { dpi } else { win_dpi };
     let font = make_font(dpi);
-    let control_brush = unsafe { CreateSolidBrush(palette.page) };
-    let card_brush = unsafe { CreateSolidBrush(palette.card) };
-    let field_brush = unsafe { CreateSolidBrush(palette.field) };
-    let hotkey_text = create_control(
-        w!("STATIC"),
-        "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_HOTKEY_TEXT,
-        instance,
-    );
-    let lbl_hotkey = create_control(
-        w!("STATIC"),
-        "全局快捷键",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_HOTKEY,
-        instance,
-    );
-    let lbl_tab = create_control(
-        w!("STATIC"),
-        "Tab 键",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_TAB,
-        instance,
-    );
-    let lbl_theme = create_control(
-        w!("STATIC"),
-        "主题",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_THEME,
-        instance,
-    );
-    let lbl_data = create_control(
-        w!("STATIC"),
-        "数据目录",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_DATA,
-        instance,
-    );
-    let lbl_insertion = create_control(
-        w!("STATIC"),
-        "输入方式",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_INSERTION,
-        instance,
-    );
-    let lbl_startup = create_control(
-        w!("STATIC"),
-        "启动",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_STARTUP,
-        instance,
-    );
-    let lbl_clipboard = create_control(
-        w!("STATIC"),
-        "剪贴板",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_LBL_CLIPBOARD,
-        instance,
-    );
-    let insertion = create_control(
-        w!("COMBOBOX"),
-        "",
-        WS_CHILD
-            | WS_VISIBLE
-            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
-        hwnd,
-        ID_INSERTION,
-        instance,
-    );
-    let hotkey_record = create_control(
-        w!("BUTTON"),
-        "录制",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
-        hwnd,
-        ID_HOTKEY_RECORD,
-        instance,
-    );
-    let tab_policy = create_control(
-        w!("COMBOBOX"),
-        "",
-        WS_CHILD
-            | WS_VISIBLE
-            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
-        hwnd,
-        ID_TAB_POLICY,
-        instance,
-    );
-    let theme = create_control(
-        w!("COMBOBOX"),
-        "",
-        WS_CHILD
-            | WS_VISIBLE
-            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
-        hwnd,
-        ID_THEME,
-        instance,
-    );
-    let startup = create_control(
-        w!("BUTTON"),
-        "开机启动",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_AUTOCHECKBOX as u32),
-        hwnd,
-        ID_STARTUP,
-        instance,
-    );
-    let data_dir = create_control(
-        w!("STATIC"),
-        "",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT | SS_PATHELLIPSIS),
-        hwnd,
-        ID_DATA_DIR,
-        instance,
-    );
-    let restore_clip = create_control(
-        w!("BUTTON"),
-        "恢复上次复制的剪贴板内容",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
-        hwnd,
-        ID_RESTORE_CLIP,
-        instance,
-    );
-    let save = create_control(
-        w!("BUTTON"),
-        "保存",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
-        hwnd,
-        ID_SAVE,
-        instance,
-    );
-    let cancel = create_control(
-        w!("BUTTON"),
-        "取消",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
-        hwnd,
-        ID_CANCEL,
-        instance,
-    );
-    let status = create_control(
-        w!("STATIC"),
-        "就绪",
-        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-        hwnd,
-        ID_STATUS,
-        instance,
-    );
 
-    let mut ui = SettingsUi {
-        hwnd,
-        hotkey_text,
-        lbl_hotkey,
-        lbl_tab,
-        lbl_theme,
-        lbl_data,
-        lbl_startup,
-        lbl_clipboard,
-        hotkey_record,
-        insertion,
-        lbl_insertion,
-        tab_policy,
-        theme,
-        startup,
-        data_dir,
-        restore_clip,
-        save,
-        cancel,
-        status,
-        card: RECT::default(),
-        font,
-        palette,
-        brush: control_brush,
-        card_brush,
-        field_brush,
-        dpi,
-        capturing: false,
-        hotkey_candidate: String::new(),
-        original_hotkey: String::new(),
-        loading: true,
-    };
-
-    for button in [hotkey_record, restore_clip, save, cancel] {
-        crate::ui::install_button(button);
-    }
-    for control in [
-        hotkey_text,
-        hotkey_record,
-        insertion,
-        tab_policy,
-        theme,
-        startup,
-        data_dir,
-        restore_clip,
-        save,
-        cancel,
-    ] {
-        ui::theme_control(control, palette.dark);
-    }
-    for combo in [insertion, tab_policy, theme] {
-        ui::theme_combo(combo, palette.dark);
-        ui::install_combo(combo);
-    }
+    let hotkey_record = create_button("录制", hwnd, ID_HOTKEY_RECORD, instance, true);
+    let restore_clip = create_button("恢复上次剪贴板内容", hwnd, ID_RESTORE_CLIP, instance, false);
+    let copy_dir = create_button("复制路径", hwnd, ID_COPY_DIR, instance, false);
+    let open_dir = create_button("打开目录", hwnd, ID_OPEN_DIR, instance, false);
+    let save = create_button("保存设置", hwnd, ID_SAVE, instance, true);
+    let cancel = create_button("取消", hwnd, ID_CANCEL, instance, true);
 
     for control in [
-        hotkey_text,
         hotkey_record,
-        insertion,
-        tab_policy,
-        theme,
-        startup,
-        data_dir,
         restore_clip,
+        copy_dir,
+        open_dir,
         save,
         cancel,
-        status,
     ] {
         unsafe {
             let _ = SendMessageW(
                 control,
                 WM_SETFONT,
-                Some(WPARAM(ui.font.0 as usize)),
-                Some(LPARAM(1)),
-            );
-            let style = GetWindowLongW(control, GWL_STYLE);
-            let _ = SetWindowLongW(control, GWL_STYLE, style | WS_TABSTOP.0 as i32);
-        }
-    }
-
-    for combo in [insertion, tab_policy, theme] {
-        unsafe {
-            let _ = SendMessageW(
-                combo,
-                CB_SETITEMHEIGHT,
-                Some(WPARAM(usize::MAX)),
-                Some(LPARAM(scaled(31, dpi) as isize)),
-            );
-            let _ = SendMessageW(
-                combo,
-                CB_SETITEMHEIGHT,
-                Some(WPARAM(0)),
-                Some(LPARAM(scaled(28, dpi) as isize)),
-            );
-        }
-    }
-
-    for label in [
-        lbl_hotkey,
-        lbl_insertion,
-        lbl_tab,
-        lbl_theme,
-        lbl_startup,
-        lbl_data,
-        lbl_clipboard,
-    ] {
-        unsafe {
-            let _ = SendMessageW(
-                label,
-                WM_SETFONT,
-                Some(WPARAM(ui.font.0 as usize)),
+                Some(WPARAM(font.0 as usize)),
                 Some(LPARAM(1)),
             );
         }
     }
 
-    add_combo_items(theme, &["跟随系统", "浅色", "深色"]);
+    let mut ui = SettingsUi {
+        hwnd,
+        hotkey_record,
+        restore_clip,
+        copy_dir,
+        open_dir,
+        save,
+        cancel,
+        font,
+        palette,
+        dpi,
+        tab: Tab::General,
+        hover: Hover::None,
+        focus: Hover::None,
+        active: false,
+        tracking_mouse: false,
+        rects: Rects::default(),
+        capturing: false,
+        hotkey_candidate: String::new(),
+        original_hotkey: String::new(),
+        paste_mode: false,
+        keep_tabs: false,
+        theme_pref: "system".to_string(),
+        startup: false,
+        status_text: "就绪".to_string(),
+        data_dir: platform::data_dir().display().to_string(),
+    };
 
-    let mut rect = RECT::default();
-    unsafe {
-        let _ = GetClientRect(hwnd, &mut rect);
-    }
-    layout(&mut ui, rect.right, rect.bottom);
     load(&mut ui);
-    ui.loading = false;
+    relayout(&mut ui);
     Some(ui)
-}
-
-fn relayout(ui: &mut SettingsUi) {
-    let mut rect = RECT::default();
-    unsafe {
-        let _ = GetClientRect(ui.hwnd, &mut rect);
-    }
-    layout(ui, rect.right, rect.bottom);
-}
-
-fn fill_tab_items(ui: &mut SettingsUi, paste_mode: bool) {
-    if paste_mode {
-        add_combo_items(
-            ui.tab_policy,
-            &["Tab 转 4 空格", "保留制表符（仅粘贴模式）"],
-        );
-    } else {
-        add_combo_items(ui.tab_policy, &["Tab 转 4 空格（Unicode 模式固定）"]);
-    }
-    // The combo's window height depends on its item count.
-    relayout(ui);
 }
 
 fn load(ui: &mut SettingsUi) {
     let settings = storage::settings_clone().unwrap_or_default();
     ui.capturing = false;
+    set_button_text(ui.hotkey_record, "录制");
     ui.original_hotkey = settings.hotkey.clone();
     ui.hotkey_candidate = settings.hotkey.clone();
-    let paste_mode = settings.insertion_mode == "paste";
-    ui.loading = true;
-    set_text(ui.hotkey_text, &settings.hotkey);
-    add_combo_items(
-        ui.insertion,
-        &["Unicode 直接输入（默认）", "粘贴模式（Ctrl+V）"],
-    );
-    set_combo(ui.insertion, if paste_mode { 1 } else { 0 });
-    fill_tab_items(ui, paste_mode);
-    set_combo(
-        ui.tab_policy,
-        if paste_mode && settings.tab_policy == "tab" {
-            1
-        } else {
-            0
-        },
-    );
-    set_combo(
-        ui.theme,
-        match settings.theme.as_str() {
-            "light" => 1,
-            "dark" => 2,
-            _ => 0,
-        },
-    );
-    unsafe {
-        let _ = SendMessageW(
-            ui.startup,
-            BM_SETCHECK,
-            Some(WPARAM(if settings.startup { 1 } else { 0 })),
-            Some(LPARAM(0)),
-        );
+    ui.paste_mode = settings.insertion_mode == "paste";
+    ui.keep_tabs = ui.paste_mode && settings.tab_policy == "tab";
+    ui.theme_pref = settings.theme.clone();
+    ui.startup = settings.startup;
+    ui.data_dir = platform::data_dir().display().to_string();
+    apply_live_theme(ui, &ui.theme_pref.clone());
+}
+
+fn apply_live_theme(ui: &mut SettingsUi, pref: &str) {
+    let palette = theme::resolve(pref);
+    if palette != ui.palette {
+        ui.palette = palette;
+        ui::apply_window_style_for(ui.hwnd, palette, true);
     }
-    set_text(ui.data_dir, &platform::data_dir().display().to_string());
-    // `load` fills the insertion combo after the initial layout.
-    relayout(ui);
-    ui.loading = false;
+    unsafe {
+        let _ = InvalidateRect(Some(ui.hwnd), None, false);
+    }
 }
 
 pub fn show() {
@@ -758,49 +1564,12 @@ pub fn show() {
         let _ = SetForegroundWindow(hwnd);
     }
     UI.with(|slot| {
-        let mut guard = match slot.try_borrow_mut() {
-            Ok(guard) => guard,
-            Err(_) => {
-                logging::warn("settings: window is busy (modal dialog?)");
-                return;
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            if let Some(ui) = guard.as_mut() {
+                load(ui);
+                ui.status_text = "就绪".to_string();
+                relayout(ui);
             }
-        };
-        if let Some(ui) = guard.as_mut() {
-            let palette = crate::theme::current();
-            if palette != ui.palette {
-                unsafe {
-                    let _ = DeleteObject(HGDIOBJ(ui.brush.0));
-                    let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
-                    let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
-                }
-                ui.brush = unsafe { CreateSolidBrush(palette.page) };
-                ui.card_brush = unsafe { CreateSolidBrush(palette.card) };
-                ui.field_brush = unsafe { CreateSolidBrush(palette.field) };
-                ui.palette = palette;
-                for control in [
-                    ui.hotkey_text,
-                    ui.hotkey_record,
-                    ui.insertion,
-                    ui.tab_policy,
-                    ui.theme,
-                    ui.startup,
-                    ui.data_dir,
-                    ui.restore_clip,
-                    ui.save,
-                    ui.cancel,
-                ] {
-                    ui::theme_control(control, palette.dark);
-                }
-                for combo in [ui.insertion, ui.tab_policy, ui.theme] {
-                    ui::theme_combo(combo, palette.dark);
-                }
-                ui::apply_window_style(ui.hwnd);
-                unsafe {
-                    let _ = InvalidateRect(Some(ui.hwnd), None, true);
-                }
-            }
-            load(ui);
-            status(ui, "就绪");
         }
     });
 }
@@ -830,29 +1599,103 @@ pub fn shutdown() {
     unsafe {
         let _ = DestroyWindow(ui.hwnd);
         let _ = DeleteObject(HGDIOBJ(ui.font.0));
-        let _ = DeleteObject(HGDIOBJ(ui.brush.0));
-        let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
-        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
     }
 }
 
-/// Let Tab/Enter traverse the settings controls like a dialog.
 pub fn is_dialog_message(message: &MSG) -> bool {
     let hwnd = UI.with(|slot| {
         slot.try_borrow()
             .ok()
             .and_then(|guard| guard.as_ref().map(|ui| ui.hwnd))
     });
-    match hwnd {
-        Some(hwnd) if !hwnd.0.is_null() => unsafe { IsDialogMessageW(hwnd, message).as_bool() },
-        _ => false,
+    let Some(hwnd) = hwnd.filter(|hwnd| !hwnd.0.is_null()) else {
+        return false;
+    };
+    if !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return false;
     }
+    let focus = unsafe { GetFocus() };
+    if focus != hwnd && !unsafe { IsChild(hwnd, focus).as_bool() } {
+        return false;
+    }
+
+    if message.message == WM_KEYDOWN && message.wParam.0 as u32 == VK_TAB.0 as u32 {
+        let focused = unsafe { GetFocus() };
+        let owns_focus = focused == hwnd || unsafe { IsChild(hwnd, focused).as_bool() };
+        if !unsafe { IsWindowVisible(hwnd).as_bool() } || !owns_focus {
+            return false;
+        }
+        let capturing = UI.with(|slot| {
+            slot.try_borrow()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|ui| ui.capturing))
+                .unwrap_or(false)
+        });
+        let backwards = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        if capturing {
+            // A Tab press abandons recording instead of being stored as an
+            // invalid hotkey, then continues with normal focus navigation.
+            let next = UI.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return None;
+                };
+                guard.as_mut().and_then(|ui| {
+                    ui.capturing = false;
+                    set_button_text(ui.hotkey_record, "录制");
+                    relayout(ui);
+                    set_status(ui, "已取消录制");
+                    handle_tab(ui, backwards)
+                })
+            });
+            if let Some(next) = next {
+                unsafe {
+                    let _ = SetFocus(Some(next));
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            return true;
+        }
+        let next = UI.with(|slot| {
+            let Ok(mut guard) = slot.try_borrow_mut() else {
+                return None;
+            };
+            guard.as_mut().and_then(|ui| handle_tab(ui, backwards))
+        });
+        if let Some(next) = next {
+            unsafe {
+                let _ = SetFocus(Some(next));
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+        return true;
+    }
+
+    // Custom-drawn controls own the keyboard while the parent window is focused.
+    let custom = UI.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .map(|ui| ui.focus != Hover::None && unsafe { GetFocus() } == ui.hwnd)
+            })
+            .unwrap_or(false)
+    });
+    if custom {
+        return false;
+    }
+    unsafe { IsDialogMessageW(hwnd, message).as_bool() }
 }
 
 fn capture_key(ui: &mut SettingsUi, vk: u32) {
+    if vk == VK_TAB.0 as u32 {
+        return;
+    }
     if vk == 0x1B {
         ui.capturing = false;
-        status(ui, "已取消录制");
+        set_button_text(ui.hotkey_record, "录制");
+        relayout(ui);
+        set_status(ui, "已取消录制");
         return;
     }
     if matches!(vk, 0x10 | 0x11 | 0x12 | 0x5B | 0x5C | 0x5D) {
@@ -876,7 +1719,7 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
     let spec = hotkey::Spec { modifiers, vk };
     let text = spec.text();
     if hotkey::parse(&text).is_none() {
-        status(
+        set_status(
             ui,
             "无效组合：请同时按下 Ctrl/Alt/Shift/Win 与字母、数字或 F1–F24",
         );
@@ -884,13 +1727,14 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
     }
     let same_as_current = hotkey::parse(&ui.original_hotkey) == Some(spec);
     if !same_as_current && !hotkey::is_available(ui.hwnd, &text) {
-        status(ui, "该快捷键已被其他程序占用");
+        set_status(ui, "该快捷键已被其他程序占用");
         return;
     }
-    ui.hotkey_candidate = text.clone();
-    set_text(ui.hotkey_text, &text);
+    ui.hotkey_candidate = text;
     ui.capturing = false;
-    status(ui, "快捷键已录制，保存后生效");
+    set_button_text(ui.hotkey_record, "录制");
+    relayout(ui);
+    set_status(ui, "快捷键已录制，保存后生效");
 }
 
 fn save(ui: &mut SettingsUi) {
@@ -901,81 +1745,285 @@ fn save(ui: &mut SettingsUi) {
     } else {
         ui.hotkey_candidate.clone()
     };
-    // Tab stays as spaces unless the user opted into paste mode.
-    let insertion = if combo_index(ui.insertion) == 1 {
-        "paste"
-    } else {
-        "unicode"
-    };
-    let tab_policy = if insertion == "paste" && combo_index(ui.tab_policy) == 1 {
+    let insertion = if ui.paste_mode { "paste" } else { "unicode" };
+    let tab_policy = if ui.paste_mode && ui.keep_tabs {
         "tab"
     } else {
         "spaces4"
     };
-    let theme = match combo_index(ui.theme) {
-        1 => "light",
-        2 => "dark",
-        _ => "system",
-    };
-    let startup =
-        unsafe { SendMessageW(ui.startup, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0 == 1 };
-
     settings.hotkey = candidate.clone();
     settings.insertion_mode = insertion.to_string();
     settings.tab_policy = tab_policy.to_string();
-    settings.theme = theme.to_string();
-    settings.startup = startup;
+    settings.theme = ui.theme_pref.clone();
+    settings.startup = ui.startup;
 
     if let Some(error) = storage::save_settings(settings.clone()).err() {
-        status(ui, &format!("保存失败（{error}）"));
+        set_status(ui, &format!("保存失败（{error}）"));
         return;
     }
 
-    // Apply the hotkey on the main window; revert if the system refuses it.
     if let Err(code) = crate::app::apply_hotkey(&candidate) {
         let reapply = crate::app::apply_hotkey(&original.hotkey).is_ok();
-        let rewrite = match storage::save_settings(original.clone()) {
-            Ok(()) => true,
-            Err(err) => {
-                logging::error(&format!("settings: rollback write failed ({err})"));
-                false
-            }
-        };
+        let rewrite = storage::save_settings(original.clone()).is_ok();
         ui.hotkey_candidate = original.hotkey.clone();
-        set_text(ui.hotkey_text, &original.hotkey);
         if reapply && rewrite {
-            status(ui, &format!("快捷键注册失败（{code}），已恢复原设置"));
+            set_status(ui, &format!("快捷键注册失败（{code}），已恢复原设置"));
         } else {
-            status(ui, "回滚失败：请重启程序并检查热键设置");
+            set_status(ui, "回滚失败：请重启程序并检查热键设置");
         }
         return;
     }
     ui.original_hotkey = candidate;
 
-    if let Err(code) = platform::set_startup(startup) {
+    if let Err(code) = platform::set_startup(ui.startup) {
         logging::warn(&format!("settings: startup change failed ({code})"));
         let mut revert = settings.clone();
         revert.startup = original.startup;
         let rollback = storage::save_settings(revert);
-        if let Err(err) = &rollback {
-            logging::error(&format!("settings: startup rollback write failed ({err})"));
-        }
-        unsafe {
-            let _ = SendMessageW(
-                ui.startup,
-                BM_SETCHECK,
-                Some(WPARAM(if original.startup { 1 } else { 0 })),
-                Some(LPARAM(0)),
-            );
-        }
+        ui.startup = original.startup;
         if rollback.is_ok() {
-            status(ui, "开机启动未生效，已恢复原设置");
+            set_status(ui, "开机启动未生效，已恢复原设置");
         } else {
-            status(ui, "开机启动未生效，且回滚写盘失败，请重启后检查");
+            set_status(ui, "开机启动未生效，且回滚写盘失败");
         }
         return;
     }
-    status(ui, "已保存");
+    apply_live_theme(ui, &ui.theme_pref.clone());
+    set_status(ui, "全部设置已保存并生效");
+}
+
+fn point_in(r: &RECT, x: i32, y: i32) -> bool {
+    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
+}
+
+/// Ordered Tab stops for the active page. Custom-drawn cards and native
+/// buttons share one list so keyboard order stays predictable.
+fn focus_items(ui: &SettingsUi) -> Vec<FocusItem> {
+    let mut items = vec![
+        FocusItem::Custom(Hover::Nav(0)),
+        FocusItem::Custom(Hover::Nav(1)),
+        FocusItem::Custom(Hover::Nav(2)),
+        FocusItem::Custom(Hover::Nav(3)),
+    ];
+    match ui.tab {
+        Tab::General => {
+            items.push(FocusItem::Custom(Hover::Startup));
+            items.push(FocusItem::HotkeyRecord);
+        }
+        Tab::Input => {
+            items.push(FocusItem::Custom(Hover::ModeUnicode));
+            items.push(FocusItem::Custom(Hover::ModePaste));
+            if ui.paste_mode {
+                items.push(FocusItem::Custom(Hover::TabSpaces));
+                items.push(FocusItem::Custom(Hover::TabKeep));
+            }
+            items.push(FocusItem::RestoreClip);
+        }
+        Tab::Appearance => {
+            for index in 0..3 {
+                items.push(FocusItem::Custom(Hover::ThemeCard(index)));
+            }
+        }
+        Tab::Data => {
+            items.push(FocusItem::CopyDir);
+            items.push(FocusItem::OpenDir);
+        }
+    }
+    items.push(FocusItem::Save);
+    items.push(FocusItem::Cancel);
+    items
+}
+
+fn native_focus_hwnd(ui: &SettingsUi, item: FocusItem) -> Option<HWND> {
+    let hwnd = match item {
+        FocusItem::HotkeyRecord => ui.hotkey_record,
+        FocusItem::RestoreClip => ui.restore_clip,
+        FocusItem::CopyDir => ui.copy_dir,
+        FocusItem::OpenDir => ui.open_dir,
+        FocusItem::Save => ui.save,
+        FocusItem::Cancel => ui.cancel,
+        FocusItem::Custom(_) => return None,
+    };
+    (!hwnd.0.is_null()).then_some(hwnd)
+}
+
+fn current_focus_item(ui: &SettingsUi) -> Option<FocusItem> {
+    let focused = unsafe { GetFocus() };
+    if focused == ui.hwnd {
+        return (ui.focus != Hover::None).then_some(FocusItem::Custom(ui.focus));
+    }
+    focus_items(ui)
+        .into_iter()
+        .find(|item| native_focus_hwnd(ui, *item) == Some(focused))
+}
+
+/// Move the keyboard focus to the next/previous Tab stop and return the HWND
+/// that must receive SetFocus outside the UI RefCell borrow.
+fn handle_tab(ui: &mut SettingsUi, backwards: bool) -> Option<HWND> {
+    let items = focus_items(ui);
+    if items.is_empty() {
+        return None;
+    }
+    let current = current_focus_item(ui).and_then(|item| items.iter().position(|it| *it == item));
+    let next = match current {
+        Some(index) => {
+            let len = items.len();
+            if backwards {
+                (index + len - 1) % len
+            } else {
+                (index + 1) % len
+            }
+        }
+        None if backwards => items.len() - 1,
+        None => 0,
+    };
+    match items[next] {
+        FocusItem::Custom(target) => {
+            ui.focus = target;
+            Some(ui.hwnd)
+        }
+        native => {
+            ui.focus = Hover::None;
+            native_focus_hwnd(ui, native)
+        }
+    }
+}
+
+/// Rectangle for the focused custom control, or None when a native control
+/// owns focus (owner-draw buttons already paint their own focus ring).
+fn focus_rect(ui: &SettingsUi) -> Option<RECT> {
+    if !ui.active || unsafe { GetFocus() } != ui.hwnd {
+        return None;
+    }
+    match ui.focus {
+        Hover::Nav(index) => ui.rects.nav_items.get(index).copied(),
+        Hover::Startup => Some(ui.rects.startup_card),
+        Hover::ModeUnicode => Some(ui.rects.mode_unicode),
+        Hover::ModePaste => Some(ui.rects.mode_paste),
+        Hover::TabSpaces => Some(ui.rects.tab_spaces),
+        Hover::TabKeep => Some(ui.rects.tab_keep),
+        Hover::ThemeCard(index) => ui.rects.theme_cards.get(index).copied(),
+        Hover::None => None,
+    }
+}
+
+fn confirm_paste_mode(hwnd: HWND) -> bool {
+    let text = platform::wide(
+        "粘贴模式会用 Ctrl+V 插入，并替换当前剪贴板。\n\
+         原纯文本内容可在托盘或设置中恢复；非文本内容无法恢复。\n\
+         终端、未知区域与多行文本仍只会复制，不会粘贴。\n\n\
+         启用粘贴模式吗？",
+    );
+    let caption = platform::wide("QuickPhrase 粘贴模式");
+    let answer = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_YESNO | MB_ICONWARNING,
+        )
+    };
+    answer == IDYES
+}
+
+/// Apply a card/nav action. Returns true when the caller must confirm paste
+/// mode after releasing the UI borrow.
+fn activate_hover(ui: &mut SettingsUi, target: Hover) -> bool {
+    match target {
+        Hover::Nav(index) => {
+            let next = match index {
+                0 => Tab::General,
+                1 => Tab::Input,
+                2 => Tab::Appearance,
+                _ => Tab::Data,
+            };
+            if ui.tab != next {
+                ui.tab = next;
+                ui.capturing = false;
+                set_button_text(ui.hotkey_record, "录制");
+                relayout(ui);
+            }
+        }
+        Hover::Startup => {
+            ui.startup = !ui.startup;
+            set_status(ui, "未保存更改");
+        }
+        Hover::ModeUnicode => {
+            if ui.paste_mode {
+                ui.paste_mode = false;
+                ui.keep_tabs = false;
+                relayout(ui);
+                set_status(ui, "未保存：已切换为 Unicode 直接输入");
+            }
+        }
+        Hover::ModePaste => {
+            if !ui.paste_mode {
+                return true;
+            }
+        }
+        Hover::TabSpaces => {
+            if ui.keep_tabs {
+                ui.keep_tabs = false;
+                set_status(ui, "未保存更改");
+            }
+        }
+        Hover::TabKeep => {
+            if ui.paste_mode && !ui.keep_tabs {
+                ui.keep_tabs = true;
+                set_status(ui, "未保存更改");
+            }
+        }
+        Hover::ThemeCard(index) => {
+            let pref = match index {
+                0 => "light",
+                1 => "dark",
+                _ => "system",
+            };
+            ui.theme_pref = pref.to_string();
+            apply_live_theme(ui, pref);
+            set_status(ui, "主题已即时预览（保存后持久化）");
+        }
+        Hover::None => {}
+    }
+    false
+}
+
+fn hit_hover(ui: &SettingsUi, x: i32, y: i32) -> Hover {
+    for (idx, item) in ui.rects.nav_items.iter().enumerate() {
+        if point_in(item, x, y) {
+            return Hover::Nav(idx);
+        }
+    }
+    match ui.tab {
+        Tab::General => {
+            if point_in(&ui.rects.startup_card, x, y) {
+                return Hover::Startup;
+            }
+        }
+        Tab::Input => {
+            if point_in(&ui.rects.mode_unicode, x, y) {
+                return Hover::ModeUnicode;
+            }
+            if point_in(&ui.rects.mode_paste, x, y) {
+                return Hover::ModePaste;
+            }
+            if point_in(&ui.rects.tab_spaces, x, y) {
+                return Hover::TabSpaces;
+            }
+            if point_in(&ui.rects.tab_keep, x, y) {
+                return Hover::TabKeep;
+            }
+        }
+        Tab::Appearance => {
+            for (idx, card) in ui.rects.theme_cards.iter().enumerate() {
+                if point_in(card, x, y) {
+                    return Hover::ThemeCard(idx);
+                }
+            }
+        }
+        Tab::Data => {}
+    }
+    Hover::None
 }
 
 unsafe extern "system" fn window_proc(
@@ -985,6 +2033,22 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_ACTIVATE | WM_KILLFOCUS | WM_SETFOCUS => {
+            if message == WM_ACTIVATE {
+                let active = (wparam.0 & 0xffff) as u32 != WA_INACTIVE;
+                UI.with(|slot| {
+                    if let Ok(mut guard) = slot.try_borrow_mut() {
+                        if let Some(ui) = guard.as_mut() {
+                            ui.active = active;
+                        }
+                    }
+                });
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
@@ -1000,9 +2064,8 @@ unsafe extern "system" fn window_proc(
         WM_GETMINMAXINFO => {
             let info = &mut *(lparam.0 as *mut MINMAXINFO);
             UI.with(|slot| {
-                let guard = match slot.try_borrow() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
+                let Ok(guard) = slot.try_borrow() else {
+                    return;
                 };
                 let dpi = guard
                     .as_ref()
@@ -1022,76 +2085,39 @@ unsafe extern "system" fn window_proc(
                 suggested.bottom - suggested.top,
             );
             UI.with(|slot| {
-                let mut guard = match slot.try_borrow_mut() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
-                };
-                let Some(ui) = guard.as_mut() else {
-                    return;
-                };
-                unsafe {
-                    let _ = DeleteObject(HGDIOBJ(ui.font.0));
-                }
-                ui.font = make_font(dpi);
-                ui.dpi = dpi;
-                for control in [
-                    ui.hotkey_text,
-                    ui.lbl_hotkey,
-                    ui.lbl_insertion,
-                    ui.lbl_tab,
-                    ui.lbl_theme,
-                    ui.lbl_startup,
-                    ui.lbl_data,
-                    ui.lbl_clipboard,
-                    ui.hotkey_record,
-                    ui.insertion,
-                    ui.tab_policy,
-                    ui.theme,
-                    ui.startup,
-                    ui.data_dir,
-                    ui.restore_clip,
-                    ui.save,
-                    ui.cancel,
-                    ui.status,
-                ] {
-                    unsafe {
-                        let _ = SendMessageW(
-                            control,
-                            WM_SETFONT,
-                            Some(WPARAM(ui.font.0 as usize)),
-                            Some(LPARAM(1)),
-                        );
+                if let Ok(mut guard) = slot.try_borrow_mut() {
+                    if let Some(ui) = guard.as_mut() {
+                        let _ = DeleteObject(HGDIOBJ(ui.font.0));
+                        ui.font = make_font(dpi);
+                        ui.dpi = dpi;
+                        for control in [
+                            ui.hotkey_record,
+                            ui.restore_clip,
+                            ui.copy_dir,
+                            ui.open_dir,
+                            ui.save,
+                            ui.cancel,
+                        ] {
+                            let _ = SendMessageW(
+                                control,
+                                WM_SETFONT,
+                                Some(WPARAM(ui.font.0 as usize)),
+                                Some(LPARAM(1)),
+                            );
+                        }
+                        layout(ui, width, height);
                     }
                 }
-                for combo in [ui.insertion, ui.tab_policy, ui.theme] {
-                    unsafe {
-                        let _ = SendMessageW(
-                            combo,
-                            CB_SETITEMHEIGHT,
-                            Some(WPARAM(usize::MAX)),
-                            Some(LPARAM(scaled(31, dpi) as isize)),
-                        );
-                        let _ = SendMessageW(
-                            combo,
-                            CB_SETITEMHEIGHT,
-                            Some(WPARAM(0)),
-                            Some(LPARAM(scaled(28, dpi) as isize)),
-                        );
-                    }
-                }
-                layout(ui, width, height);
             });
-            unsafe {
-                let _ = SetWindowPos(
-                    hwnd,
-                    None,
-                    left,
-                    top,
-                    width,
-                    height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                left,
+                top,
+                width,
+                height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN
@@ -1111,276 +2137,311 @@ unsafe extern "system" fn window_proc(
             });
             LRESULT(0)
         }
-        WM_COMMAND => {
-            let id = wparam.0 & 0xffff;
-            let notification = ((wparam.0 >> 16) & 0xffff) as u32;
-            let mut ask_paste_warning = false;
+        WM_KEYDOWN
+            if UI.with(|slot| {
+                slot.try_borrow()
+                    .ok()
+                    .and_then(|guard| {
+                        guard.as_ref().map(|ui| {
+                            !ui.capturing
+                                && ui.focus != Hover::None
+                                && unsafe { GetFocus() } == ui.hwnd
+                        })
+                    })
+                    .unwrap_or(false)
+            }) =>
+        {
+            let mut ask_paste = false;
+            let mut focus_after = None;
             UI.with(|slot| {
-                let mut guard = match slot.try_borrow_mut() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return;
                 };
                 let Some(ui) = guard.as_mut() else {
                     return;
                 };
-                match id as i32 {
-                    ID_HOTKEY_RECORD if notification == BN_CLICKED => {
-                        ui.capturing = true;
-                        unsafe {
-                            let _ = SetFocus(Some(hwnd));
+                let vk = wparam.0 as u16;
+                let repeated = lparam.0 & (1 << 30) != 0;
+                if (vk == VK_SPACE.0 || vk == VK_RETURN.0) && !repeated {
+                    ask_paste = activate_hover(ui, ui.focus);
+                } else if vk == VK_ESCAPE.0 {
+                    ui.focus = Hover::None;
+                    focus_after = Some(hwnd);
+                } else if vk == VK_LEFT.0 || vk == VK_UP.0 {
+                    focus_after = handle_tab(ui, true);
+                } else if vk == VK_RIGHT.0 || vk == VK_DOWN.0 {
+                    focus_after = handle_tab(ui, false);
+                }
+            });
+            if let Some(next) = focus_after {
+                unsafe {
+                    let _ = SetFocus(Some(next));
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            if ask_paste && confirm_paste_mode(hwnd) {
+                UI.with(|slot| {
+                    if let Ok(mut guard) = slot.try_borrow_mut() {
+                        if let Some(ui) = guard.as_mut() {
+                            ui.paste_mode = true;
+                            relayout(ui);
+                            set_status(ui, "未保存：粘贴模式会替换剪贴板");
                         }
-                        status(ui, "请按下新的组合键（含 Ctrl/Alt/Shift/Win）");
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let redraw = UI.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return false;
+                };
+                let Some(ui) = guard.as_mut() else {
+                    return false;
+                };
+                if !ui.tracking_mouse {
+                    ui.tracking_mouse = true;
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut track);
+                }
+                let next = hit_hover(ui, x, y);
+                if next != ui.hover {
+                    ui.hover = next;
+                    true
+                } else {
+                    false
+                }
+            });
+            if redraw {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            let redraw = UI.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return false;
+                };
+                let Some(ui) = guard.as_mut() else {
+                    return false;
+                };
+                ui.tracking_mouse = false;
+                if ui.hover != Hover::None {
+                    ui.hover = Hover::None;
+                    true
+                } else {
+                    false
+                }
+            });
+            if redraw {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xffff) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+            let mut ask_paste = false;
+            let mut focus_parent = false;
+            UI.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return;
+                };
+                let Some(ui) = guard.as_mut() else {
+                    return;
+                };
+                let target = hit_hover(ui, x, y);
+                if target != Hover::None {
+                    ui.focus = target;
+                    focus_parent = true;
+                }
+                ask_paste = activate_hover(ui, target);
+            });
+            if focus_parent {
+                unsafe {
+                    if GetFocus() != hwnd {
+                        let _ = SetFocus(Some(hwnd));
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+            if ask_paste && confirm_paste_mode(hwnd) {
+                UI.with(|slot| {
+                    if let Ok(mut guard) = slot.try_borrow_mut() {
+                        if let Some(ui) = guard.as_mut() {
+                            ui.paste_mode = true;
+                            relayout(ui);
+                            set_status(ui, "未保存：粘贴模式会替换剪贴板");
+                        }
+                    }
+                });
+            }
+            LRESULT(0)
+        }
+        WM_COMMAND => {
+            let id = (wparam.0 & 0xffff) as i32;
+            let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            UI.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return;
+                };
+                let Some(ui) = guard.as_mut() else {
+                    return;
+                };
+                match id {
+                    ID_HOTKEY_RECORD if notification == BN_CLICKED => {
+                        ui.focus = Hover::None;
+                        ui.capturing = !ui.capturing;
+                        set_button_text(
+                            ui.hotkey_record,
+                            if ui.capturing {
+                                "录制中…"
+                            } else {
+                                "录制"
+                            },
+                        );
+                        if ui.capturing {
+                            let _ = SetFocus(Some(hwnd));
+                            ui.status_text =
+                                "请按下新的组合键（含 Ctrl/Alt/Shift/Win）".to_string();
+                        } else {
+                            ui.status_text = "已取消录制".to_string();
+                        }
+                        relayout(ui);
                     }
                     ID_SAVE => save(ui),
                     ID_CANCEL => {
                         load(ui);
-                        status(ui, "已取消");
+                        relayout(ui);
+                        set_status(ui, "已取消修改");
                     }
                     ID_RESTORE_CLIP if notification == BN_CLICKED => {
                         match crate::clipboard::last_snapshot() {
                             Some(snapshot) if snapshot.text.is_some() => {
                                 if crate::clipboard::restore(&snapshot) {
-                                    status(ui, "已恢复上次剪贴板内容");
+                                    set_status(ui, "已恢复上次剪贴板内容");
                                 } else {
-                                    status(ui, "无法恢复：剪贴板内容已变化（可能已恢复过，或被其他程序修改）");
+                                    set_status(ui, "无法恢复：剪贴板内容已变化");
                                 }
                             }
-                            _ => status(ui, "没有可恢复的剪贴板内容"),
+                            _ => set_status(ui, "没有可恢复的剪贴板内容"),
                         }
                     }
-                    ID_INSERTION if notification == CBN_SELCHANGE => {
-                        if ui.loading {
-                            return;
-                        }
-                        if combo_index(ui.insertion) == 1 {
-                            // Ask outside this borrow: MessageBoxW pumps messages.
-                            ask_paste_warning = true;
-                        } else {
-                            fill_tab_items(ui, false);
-                            set_combo(ui.tab_policy, 0);
-                            status(ui, "未保存：已选择 Unicode");
-                        }
+                    ID_COPY_DIR if notification == BN_CLICKED => {
+                        let _ = crate::clipboard::set_text_with_snapshot(&ui.data_dir);
+                        set_status(ui, "已复制本地数据目录路径");
                     }
-                    ID_TAB_POLICY | ID_THEME if notification == CBN_SELCHANGE => {
-                        if !ui.loading {
-                            status(ui, "未保存");
-                        }
+                    ID_OPEN_DIR if notification == BN_CLICKED => {
+                        let path = platform::wide(&ui.data_dir);
+                        let _ = ShellExecuteW(
+                            Some(hwnd),
+                            w!("open"),
+                            PCWSTR(path.as_ptr()),
+                            PCWSTR::null(),
+                            PCWSTR::null(),
+                            SW_SHOWNORMAL,
+                        );
+                        set_status(ui, "已打开本地数据目录");
                     }
-                    ID_STARTUP if notification == BN_CLICKED => {
-                        if !ui.loading {
-                            status(ui, "未保存");
-                        }
-                    }
+                    _ if notification == BN_SETFOCUS || notification == BN_KILLFOCUS => unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    },
                     _ => {}
                 }
             });
-
-            if ask_paste_warning {
-                let text = platform::wide(
-                    "粘贴模式会用 Ctrl+V 插入，并替换当前剪贴板。\n\
-                     原纯文本内容可在托盘恢复；非文本内容无法恢复。\n\
-                     终端、未知区域与多行文本仍只会复制，不会粘贴。\n\n\
-                     启用粘贴模式吗？",
-                );
-                let caption = platform::wide("QuickPhrase 粘贴模式");
-                let answer = unsafe {
-                    MessageBoxW(
-                        Some(hwnd),
-                        PCWSTR(text.as_ptr()),
-                        PCWSTR(caption.as_ptr()),
-                        MB_YESNO | MB_ICONWARNING,
-                    )
-                };
-                let persisted = storage::settings_clone().unwrap_or_default();
-                let persisted_paste = persisted.insertion_mode == "paste";
-                UI.with(|slot| {
-                    let mut guard = match slot.try_borrow_mut() {
-                        Ok(guard) => guard,
-                        Err(_) => {
-                            logging::warn(
-                                "settings: window closed while the paste warning was open",
-                            );
-                            return;
-                        }
-                    };
-                    let Some(ui) = guard.as_mut() else {
-                        return;
-                    };
-                    if answer != IDYES {
-                        set_combo(ui.insertion, if persisted_paste { 1 } else { 0 });
-                        fill_tab_items(ui, persisted_paste);
-                        set_combo(
-                            ui.tab_policy,
-                            if persisted_paste && persisted.tab_policy == "tab" {
-                                1
-                            } else {
-                                0
-                            },
-                        );
-                        status(
-                            ui,
-                            if persisted_paste {
-                                "保持原设置：粘贴模式"
-                            } else {
-                                "未启用粘贴模式"
-                            },
-                        );
-                    } else {
-                        // Re-assert the accepted mode: a modal-time reopen may
-                        // have reloaded the persisted (Unicode) value.
-                        set_combo(ui.insertion, 1);
-                        fill_tab_items(ui, true);
-                        set_combo(ui.tab_policy, 0);
-                        status(ui, "未保存：粘贴模式会替换剪贴板");
-                    }
-                });
-            }
             LRESULT(0)
         }
-        WM_ERASEBKGND => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
-            let mut rect = RECT::default();
-            unsafe {
-                let _ = GetClientRect(hwnd, &mut rect);
-            }
-            let brush = UI.with(|slot| {
-                slot.try_borrow()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().map(|ui| ui.brush))
-                    .unwrap_or_default()
-            });
-            if !brush.0.is_null() {
-                unsafe {
-                    FillRect(hdc, &rect, brush);
-                }
-                return LRESULT(1);
-            }
-            LRESULT(0)
-        }
-        WM_CTLCOLORSTATIC => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
-            let control = HWND(lparam.0 as *mut core::ffi::c_void);
-            let (color, brush) = UI.with(|slot| {
-                slot.try_borrow()
-                    .ok()
-                    .and_then(|guard| {
-                        guard.as_ref().map(|ui| {
-                            // Labels sit on the card; the status line sits on
-                            // the page below it, so it must not leave a band.
-                            let brush = if control == ui.status {
-                                ui.brush
-                            } else {
-                                ui.card_brush
-                            };
-                            (ui.palette.secondary, brush.0 as isize)
-                        })
-                    })
-                    .unwrap_or((COLORREF(0), 0))
-            });
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, color);
-            }
-            LRESULT(brush)
-        }
-        WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut core::ffi::c_void);
-            let (heading, field, brush) = UI.with(|slot| {
-                slot.try_borrow()
-                    .ok()
-                    .and_then(|guard| {
-                        guard.as_ref().map(|ui| {
-                            (
-                                ui.palette.heading,
-                                ui.palette.field,
-                                ui.field_brush.0 as isize,
-                            )
-                        })
-                    })
-                    .unwrap_or((COLORREF(0), COLORREF(0), 0))
-            });
-            unsafe {
-                SetBkMode(hdc, TRANSPARENT);
-                SetBkColor(hdc, field);
-                SetTextColor(hdc, heading);
-            }
-            LRESULT(brush)
-        }
+        WM_ERASEBKGND => LRESULT(1),
         WM_DRAWITEM => {
             let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
-            let (palette, dpi, font) = UI.with(|slot| {
-                slot.try_borrow()
-                    .ok()
-                    .and_then(|guard| guard.as_ref().map(|ui| (ui.palette, ui.dpi, ui.font)))
-                    .unwrap_or((crate::theme::current(), 96, HFONT::default()))
+            UI.with(|slot| {
+                let Ok(guard) = slot.try_borrow() else {
+                    return;
+                };
+                let Some(ui) = guard.as_ref() else {
+                    return;
+                };
+                match draw.CtlID as i32 {
+                    ID_SAVE => ui::draw_button(
+                        draw,
+                        ui.palette,
+                        ui::ButtonKind::Primary,
+                        ui.dpi,
+                        ui.palette.card_subtle,
+                    ),
+                    ID_CANCEL => ui::draw_button(
+                        draw,
+                        ui.palette,
+                        ui::ButtonKind::Secondary,
+                        ui.dpi,
+                        ui.palette.card_subtle,
+                    ),
+                    ID_HOTKEY_RECORD => ui::draw_button(
+                        draw,
+                        ui.palette,
+                        if ui.capturing {
+                            ui::ButtonKind::Primary
+                        } else {
+                            ui::ButtonKind::Subtle
+                        },
+                        ui.dpi,
+                        ui.palette.card,
+                    ),
+                    _ => ui::draw_button(
+                        draw,
+                        ui.palette,
+                        ui::ButtonKind::Secondary,
+                        ui.dpi,
+                        ui.palette.card,
+                    ),
+                }
             });
-            if matches!(draw.CtlID as i32, ID_INSERTION | ID_TAB_POLICY | ID_THEME) {
-                ui::draw_combo_item(draw, palette, dpi, font);
-                return LRESULT(1);
-            }
-            let kind = if draw.CtlID == ID_SAVE as u32 {
-                ui::ButtonKind::Primary
-            } else {
-                ui::ButtonKind::Secondary
-            };
-            // Save/cancel sit on the page below the card; the rest are inside.
-            let background = if draw.CtlID == ID_SAVE as u32 || draw.CtlID == ID_CANCEL as u32 {
-                palette.page
-            } else {
-                palette.card
-            };
-            ui::draw_button(draw, palette, kind, dpi, background);
             LRESULT(1)
         }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
-            unsafe {
-                let hdc = BeginPaint(hwnd, &mut paint);
-                let (card, palette, dpi) = UI.with(|slot| {
-                    slot.try_borrow()
-                        .ok()
-                        .and_then(|guard| guard.as_ref().map(|ui| (ui.card, ui.palette, ui.dpi)))
-                        .unwrap_or((RECT::default(), crate::theme::current(), 96))
-                });
-                if card.right > card.left && card.bottom > card.top {
-                    ui::card(hdc, &card, palette, dpi);
+            let hdc = BeginPaint(hwnd, &mut paint);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            UI.with(|slot| {
+                if let Ok(guard) = slot.try_borrow() {
+                    if let Some(ui) = guard.as_ref() {
+                        paint_settings(ui, hdc, client);
+                    }
                 }
-                let _ = EndPaint(hwnd, &paint);
-            }
+            });
+            let _ = EndPaint(hwnd, &paint);
             LRESULT(0)
         }
         WM_CLOSE => {
             if QUIT_ON_CLOSE.load(Ordering::Relaxed) {
-                unsafe {
-                    let _ = DestroyWindow(hwnd);
-                }
+                let _ = DestroyWindow(hwnd);
             } else {
-                unsafe {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
+                let _ = ShowWindow(hwnd, SW_HIDE);
             }
             LRESULT(0)
         }
         WM_DESTROY => {
             UI.with(|slot| {
-                let mut guard = match slot.try_borrow_mut() {
-                    Ok(guard) => guard,
-                    Err(_) => return,
-                };
-                if let Some(ui) = guard.take() {
-                    unsafe {
+                if let Ok(mut guard) = slot.try_borrow_mut() {
+                    if let Some(ui) = guard.take() {
                         let _ = DeleteObject(HGDIOBJ(ui.font.0));
-                        let _ = DeleteObject(HGDIOBJ(ui.brush.0));
-                        let _ = DeleteObject(HGDIOBJ(ui.card_brush.0));
-                        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                     }
                 }
             });
             if QUIT_ON_CLOSE.load(Ordering::Relaxed) {
-                unsafe { PostQuitMessage(0) };
+                PostQuitMessage(0);
             }
             LRESULT(0)
         }
-        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }

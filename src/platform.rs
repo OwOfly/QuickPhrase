@@ -101,6 +101,7 @@ pub fn error_box(title: &str, text: &str) {
     message_box(title, text, MB_OK | MB_ICONERROR);
 }
 
+#[allow(dead_code)]
 pub fn info_box(title: &str, text: &str) {
     message_box(title, text, MB_OK | MB_ICONINFORMATION);
 }

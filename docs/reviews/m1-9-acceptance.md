@@ -55,6 +55,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希**取代**上方初次打包哈希；`dist/SHA256SUMS.txt` 已同步。打包脚本的资源版本、暂存目录与 zip 内容断言全部通过，仍未自动创建或推送 `v0.1.0` 标签。
 
+## UI v2 打磨后重打包（2026-11-20）
+
+Fluent/Direct2D 界面重做及复核修复后再次打包：
+
+```
+exe bytes=750080
+zip bytes=460842
+sha256=d05546afb418247f6e5a735f86511d23f044b8861ddca889191ba9449b5be821
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代此前所有 UI 迭代的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

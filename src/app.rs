@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -137,6 +137,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
         };
     });
 
+    storage::init();
     let tray_ok = tray::add(hwnd, icon, TIP_NORMAL);
     STATE.with(|state| state.borrow_mut().tray_ok = tray_ok);
     if tray_ok {
@@ -147,7 +148,6 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     }
 
     let mut hotkey_registered = false;
-    storage::init();
     let hotkey_text = current_hotkey();
     match hotkey::register_text(hwnd, &hotkey_text) {
         Ok(_) => {
@@ -210,7 +210,10 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             break;
         }
         unsafe {
-            if manage::is_dialog_message(&message) || settings_ui::is_dialog_message(&message) {
+            if manage::is_dialog_message(&message)
+                || settings_ui::is_dialog_message(&message)
+                || crate::about_ui::is_dialog_message(&message)
+            {
                 continue;
             }
             let _ = TranslateMessage(&message);
@@ -312,6 +315,8 @@ unsafe extern "system" fn window_proc(
             panel::shutdown();
             manage::shutdown();
             settings_ui::shutdown();
+            crate::tray_menu::shutdown();
+            crate::about_ui::shutdown();
             let (tray_ok, hotkey_ok) = STATE.with(|state| {
                 let state = state.borrow();
                 (state.tray_ok, state.hotkey_ok)
@@ -335,83 +340,24 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn append_item(menu: HMENU, flags: MENU_ITEM_FLAGS, id: usize, text: PCWSTR, label: &str) {
-    if unsafe { AppendMenuW(menu, flags, id, text) }.is_err() {
-        logging::warn(&format!("tray menu: could not add {label}"));
-    }
-}
-
 unsafe fn show_menu(hwnd: HWND) {
     let (paused, hotkey_ok) = STATE.with(|state| {
         let state = state.borrow();
         (state.paused, state.hotkey_ok)
     });
-    let Ok(menu) = CreatePopupMenu() else {
-        logging::warn("tray menu: CreatePopupMenu failed");
-        return;
-    };
-
-    append_item(
-        menu,
-        MF_STRING,
-        ID_OPEN as usize,
-        w!("打开快捷面板"),
-        "open",
-    );
-    append_item(
-        menu,
-        MF_STRING,
-        ID_MANAGE as usize,
-        w!("管理短语"),
-        "manage",
-    );
-    let pause_label = if paused {
-        w!("恢复快捷键")
-    } else if !hotkey_ok {
-        w!("重试注册快捷键")
-    } else {
-        w!("暂停快捷键")
-    };
-    append_item(menu, MF_STRING, ID_PAUSE as usize, pause_label, "pause");
-    append_item(
-        menu,
-        MF_STRING,
-        ID_SETTINGS as usize,
-        w!("设置"),
-        "settings",
-    );
-    append_item(
-        menu,
-        MF_STRING,
-        ID_RESTORE_CLIP as usize,
-        w!("恢复上次剪贴板内容"),
-        "restore clipboard",
-    );
-    append_item(menu, MF_SEPARATOR, 0, PCWSTR::null(), "separator");
-    append_item(
-        menu,
-        MF_STRING,
-        ID_ABOUT as usize,
-        w!("关于 QuickPhrase"),
-        "about",
-    );
-    append_item(menu, MF_SEPARATOR, 0, PCWSTR::null(), "separator");
-    append_item(menu, MF_STRING, ID_EXIT as usize, w!("退出"), "exit");
-
-    let mut point = POINT { x: 0, y: 0 };
-    let _ = GetCursorPos(&mut point);
-    let _ = SetForegroundWindow(hwnd);
-    let _ = TrackPopupMenu(
-        menu,
-        TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
-        point.x,
-        point.y,
-        Some(0),
-        hwnd,
-        None,
-    );
-    let _ = DestroyMenu(menu);
-    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+    crate::tray_menu::show(crate::tray_menu::MenuConfig {
+        owner: hwnd,
+        hotkey: current_hotkey(),
+        paused,
+        hotkey_ok,
+        cmd_open: ID_OPEN,
+        cmd_manage: ID_MANAGE,
+        cmd_pause: ID_PAUSE,
+        cmd_settings: ID_SETTINGS,
+        cmd_restore_clip: ID_RESTORE_CLIP,
+        cmd_about: ID_ABOUT,
+        cmd_exit: ID_EXIT,
+    });
 }
 
 fn handle_command(id: u32) {
@@ -691,14 +637,5 @@ fn toggle_hotkey() {
 }
 
 fn about() {
-    platform::info_box(
-        "关于 QuickPhrase",
-        &format!(
-            "QuickPhrase 快语 {}\n\n\
-             全局快捷短语输入器\n\
-             数据目录：{}",
-            env!("CARGO_PKG_VERSION"),
-            platform::data_dir().display()
-        ),
-    );
+    crate::about_ui::show();
 }
