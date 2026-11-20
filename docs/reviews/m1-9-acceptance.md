@@ -133,6 +133,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代拼音检索的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 133/133，panel-smoke 10/10，tray-smoke 19/19。
 
+## 阶段二按应用输入例外后重打包（2026-11-20）
+
+设置 →“应用输入例外”按 exe 覆盖 Unicode/粘贴模式（见 `docs/reviews/stage2-apps-20261120.md`）进入发布包：
+
+```
+exe bytes=1021952
+zip bytes=563881
+sha256=c5e7864afccf5b36abc1e35c84a184c0182b0a4e71eaa5ba78f0589b24db3045
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代变量模板的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 134/134，panel-smoke 10/10，tray-smoke 19/19。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

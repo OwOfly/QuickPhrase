@@ -860,10 +860,12 @@ fn commit() {
             item.id.clone(),
             item.category_id.clone().unwrap_or_default(),
             crate::template::render(&item.content),
+            panel.paste_mode,
+            panel.keep_tabs,
         ))
     });
 
-    let Some((item_index, item_id, category_id, content)) = info else {
+    let Some((item_index, item_id, category_id, content, paste_mode, keep_tabs)) = info else {
         logging::info("panel commit ignored: no matching item");
         return;
     };
@@ -947,7 +949,14 @@ fn commit() {
     let session = SESSION.load(Ordering::Relaxed);
     INJECTING.store(true, Ordering::Relaxed);
     let notify_raw = notify.0 as isize;
-    let options = inject::Options::from_settings();
+    let options = inject::Options {
+        mode: if paste_mode {
+            inject::InsertionMode::Paste
+        } else {
+            inject::InsertionMode::Unicode
+        },
+        keep_tabs,
+    };
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
         .spawn(move || {

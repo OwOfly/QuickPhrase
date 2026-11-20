@@ -373,6 +373,37 @@ pub fn backups_dir() -> Option<PathBuf> {
     with_store(|store| store.dir().join("backups"))
 }
 
+pub fn rules() -> Vec<UserRule> {
+    with_store(|store| store.rules.rules.clone()).unwrap_or_default()
+}
+
+pub fn set_rule(exe: &str, action: &str) -> Result<(), String> {
+    match with_store(|store| store.set_rule(exe, action)) {
+        Some(result) => result,
+        None => Err("storage_unavailable".to_string()),
+    }
+}
+
+pub fn remove_rule(exe: &str) -> Result<(), String> {
+    match with_store(|store| store.remove_rule(exe)) {
+        Some(result) => result,
+        None => Err("storage_unavailable".to_string()),
+    }
+}
+
+pub fn action_for_exe(exe: &str) -> Option<String> {
+    with_store(|store| store.action_for_exe(exe)).flatten()
+}
+
+fn normalize_exe(value: &str) -> String {
+    value
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_lowercase()
+}
+
 pub fn settings_clone() -> Option<Settings> {
     with_store(|store| store.settings().clone())
 }
@@ -1167,9 +1198,85 @@ impl Store {
         &self.settings
     }
 
-    #[allow(dead_code)] // reserved for post-V1 rule evaluation (FR-14)
-    pub fn rules(&self) -> &RulesFile {
-        &self.rules
+    pub fn set_rule(&mut self, exe: &str, action: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let exe = exe.trim();
+        if exe.is_empty() || exe.encode_utf16().count() > 260 || normalize_exe(exe).is_empty() {
+            return Err("rule_exe".to_string());
+        }
+        let action = match action {
+            "paste" => "paste",
+            "unicode" => "unicode",
+            _ => return Err("rule_action".to_string()),
+        };
+        let normalized = normalize_exe(exe);
+        if !self
+            .rules
+            .rules
+            .iter()
+            .any(|rule| normalize_exe(&rule.exe) == normalized)
+            && self.rules.rules.len() >= 100
+        {
+            return Err("rule_limit".to_string());
+        }
+        let previous = self.rules.clone();
+        if let Some(rule) = self
+            .rules
+            .rules
+            .iter_mut()
+            .find(|rule| normalize_exe(&rule.exe) == normalized)
+        {
+            rule.exe = exe.to_string();
+            rule.action = action.to_string();
+        } else {
+            self.rules.rules.push(UserRule {
+                exe: exe.to_string(),
+                action: action.to_string(),
+            });
+        }
+        match self.write_typed(RULES_FILE, &self.rules, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.rules = previous;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn remove_rule(&mut self, exe: &str) -> Result<(), String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let normalized = normalize_exe(exe);
+        let previous = self.rules.clone();
+        let before = self.rules.rules.len();
+        self.rules
+            .rules
+            .retain(|rule| normalize_exe(&rule.exe) != normalized);
+        if self.rules.rules.len() == before {
+            return Err("rule_missing".to_string());
+        }
+        match self.write_typed(RULES_FILE, &self.rules, true) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.rules = previous;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn action_for_exe(&self, exe: &str) -> Option<String> {
+        let normalized = normalize_exe(exe);
+        if normalized.is_empty() {
+            return None;
+        }
+        self.rules
+            .rules
+            .iter()
+            .find(|rule| normalize_exe(&rule.exe) == normalized)
+            .map(|rule| rule.action.clone())
     }
 
     pub fn is_read_only(&self) -> bool {
@@ -1822,6 +1929,53 @@ mod tests {
         assert_eq!(crate::search::rank(&docs, "tk\r\n", 10).len(), 0);
         assert_eq!(crate::search::rank(&docs, "\r\ntk", 10).len(), 0);
         assert_eq!(crate::search::rank(&docs, "退款\n", 10).len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_rules_roundtrip_and_match_basename() {
+        let dir = temp_dir("rules");
+        let mut store = Store::load_from(&dir);
+        store.set_rule("chrome.exe", "paste").expect("add rule");
+        assert_eq!(
+            store.action_for_exe(r"C:\Program Files\Chrome\Chrome.EXE"),
+            Some("paste".to_string())
+        );
+        assert_eq!(store.set_rule(r"C:\", "paste"), Err("rule_exe".to_string()));
+        assert_eq!(store.action_for_exe(""), None);
+        store
+            .set_rule("chrome.exe", "unicode")
+            .expect("replace rule");
+        assert_eq!(
+            store.action_for_exe("chrome.exe"),
+            Some("unicode".to_string())
+        );
+        assert_eq!(store.rules.rules.len(), 1);
+        let mut reloaded = Store::load_from(&dir);
+        assert_eq!(
+            reloaded.action_for_exe("chrome.exe"),
+            Some("unicode".to_string())
+        );
+        assert_eq!(
+            reloaded.set_rule("a.exe", "invalid"),
+            Err("rule_action".to_string())
+        );
+        assert_eq!(
+            reloaded.remove_rule("missing.exe"),
+            Err("rule_missing".to_string())
+        );
+        reloaded.read_only = true;
+        assert_eq!(
+            reloaded.set_rule("a.exe", "paste"),
+            Err("read_only".to_string())
+        );
+        assert_eq!(
+            reloaded.remove_rule("chrome.exe"),
+            Err("read_only".to_string())
+        );
+        reloaded.read_only = false;
+        reloaded.remove_rule("CHROME.EXE").expect("remove rule");
+        assert!(reloaded.action_for_exe("chrome.exe").is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

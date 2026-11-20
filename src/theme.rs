@@ -165,8 +165,22 @@ pub fn resolve(preference: &str) -> Palette {
     }
 }
 
+thread_local! {
+    static PREVIEW: std::cell::RefCell<Option<Palette>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn current() -> Palette {
-    resolve(&crate::storage::settings_clone().unwrap_or_default().theme)
+    PREVIEW
+        .with(|preview| preview.borrow().to_owned())
+        .unwrap_or_else(|| resolve(&crate::storage::settings_clone().unwrap_or_default().theme))
+}
+
+pub fn preview(palette: Palette) {
+    PREVIEW.with(|slot| *slot.borrow_mut() = Some(palette));
+}
+
+pub fn clear_preview() {
+    PREVIEW.with(|slot| *slot.borrow_mut() = None);
 }
 
 fn system_uses_light() -> bool {

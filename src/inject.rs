@@ -45,20 +45,6 @@ impl Default for Options {
     }
 }
 
-impl Options {
-    pub fn from_settings() -> Self {
-        let settings = crate::storage::settings_clone().unwrap_or_default();
-        Self {
-            mode: if settings.insertion_mode == "paste" {
-                InsertionMode::Paste
-            } else {
-                InsertionMode::Unicode
-            },
-            keep_tabs: settings.tab_policy == "tab",
-        }
-    }
-}
-
 enum Plan {
     Insert { text: String, paste: bool },
     CopyOnly(&'static str),

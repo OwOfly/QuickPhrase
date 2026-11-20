@@ -7,7 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, DeleteObject, EndPaint, InvalidateRect, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor, SetBkMode,
+    SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -40,6 +41,11 @@ const ID_EXPORT_DATA: i32 = 322;
 const ID_IMPORT_DATA: i32 = 323;
 const ID_RESTORE_BACKUP: i32 = 324;
 const ID_SORT_MODE: i32 = 325;
+const ID_APPS_ADD: i32 = 326;
+const ID_APPS_REMOVE: i32 = 327;
+const ID_APPS_EXE: i32 = 328;
+const ID_APPS_MODE: i32 = 329;
+const ID_APPS_RULES: i32 = 330;
 
 const WIDTH: i32 = 740;
 // The Input page needs 430 logical px of body plus the 52 px footer; keep
@@ -55,6 +61,7 @@ enum Tab {
     Input,
     Appearance,
     Data,
+    Apps,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -80,6 +87,11 @@ enum FocusItem {
     ImportData,
     RestoreBackup,
     SortMode,
+    AppsExe,
+    AppsMode,
+    AppsRules,
+    AppsAdd,
+    AppsRemove,
     Save,
     Cancel,
 }
@@ -90,7 +102,7 @@ struct Rects {
     content_pane: RECT,
     footer: RECT,
     status: RECT,
-    nav_items: [RECT; 4],
+    nav_items: [RECT; 5],
     // General
     hotkey_card: RECT,
     hotkey_kbd_box: RECT,
@@ -111,6 +123,9 @@ struct Rects {
     data_card: RECT,
     data_path_box: RECT,
     stat_boxes: [RECT; 3],
+    // Apps
+    apps_card: RECT,
+    apps_exe_box: RECT,
 }
 
 struct SettingsUi {
@@ -123,6 +138,12 @@ struct SettingsUi {
     import_data: HWND,
     restore_backup: HWND,
     sort_mode: HWND,
+    apps_exe: HWND,
+    apps_mode: HWND,
+    apps_rules: HWND,
+    apps_add: HWND,
+    apps_remove: HWND,
+    field_brush: HBRUSH,
     save: HWND,
     cancel: HWND,
     font: HFONT,
@@ -204,7 +225,7 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
     // Nav items (below top-left brand logo header)
     let npad = scaled(10, dpi);
     let item_h = scaled(38, dpi);
-    let mut nav_items = [RECT::default(); 4];
+    let mut nav_items = [RECT::default(); 5];
     for (i, item) in nav_items.iter_mut().enumerate() {
         let top = scaled(74, dpi) + (item_h + scaled(4, dpi)) * i as i32;
         *item = RECT {
@@ -424,6 +445,43 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
         bottom: stat_top + stat_h + scaled(14, dpi),
     };
 
+    // --- Tab 4: Apps ---
+    let apps_card = RECT {
+        left: cl,
+        top: body_top,
+        right: cr,
+        bottom: body_top + scaled(380, dpi),
+    };
+    let apad = scaled(16, dpi);
+    let app_row_top = apps_card.top + scaled(64, dpi);
+    let app_row_h = scaled(32, dpi);
+    let app_combo_w = scaled(150, dpi);
+    let app_combo_h = ui::combo_height(ui.apps_mode, dpi);
+    let app_add_w = scaled(80, dpi);
+    let app_gap = scaled(8, dpi);
+    let apps_exe_box = RECT {
+        left: apps_card.left + apad,
+        top: app_row_top,
+        right: apps_card.right - apad,
+        bottom: app_row_top + app_row_h,
+    };
+    let app_mode_top = app_row_top + app_row_h + app_gap;
+    let apps_mode_box = RECT {
+        left: apps_exe_box.left,
+        top: app_mode_top,
+        right: apps_exe_box.left + app_combo_w,
+        bottom: app_mode_top + app_combo_h,
+    };
+    let apps_remove_w = scaled(92, dpi);
+    let apps_remove_top = app_mode_top + app_combo_h + app_gap;
+    let apps_rules_top = apps_remove_top + app_row_h + scaled(10, dpi);
+    let apps_rules_box = RECT {
+        left: apps_card.left + apad,
+        top: apps_rules_top,
+        right: apps_card.right - apad,
+        bottom: apps_card.bottom - apad,
+    };
+
     // Footer buttons
     let save_w = scaled(92, dpi);
     let cancel_w = scaled(72, dpi);
@@ -454,6 +512,46 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
             sort_card.top + ((sort_card.bottom - sort_card.top) - sort_h) / 2,
             sort_w,
             sort_h,
+            true,
+        );
+        let _ = MoveWindow(
+            ui.apps_exe,
+            apps_exe_box.left,
+            apps_exe_box.top,
+            apps_exe_box.right - apps_exe_box.left,
+            apps_exe_box.bottom - apps_exe_box.top,
+            true,
+        );
+        let _ = MoveWindow(
+            ui.apps_mode,
+            apps_mode_box.left,
+            apps_mode_box.top,
+            apps_mode_box.right - apps_mode_box.left,
+            ui::combo_height(ui.apps_mode, dpi),
+            true,
+        );
+        let _ = MoveWindow(
+            ui.apps_add,
+            apps_card.right - apad - app_add_w,
+            apps_mode_box.top,
+            app_add_w,
+            app_row_h,
+            true,
+        );
+        let _ = MoveWindow(
+            ui.apps_remove,
+            apps_exe_box.left,
+            apps_remove_top,
+            apps_remove_w,
+            app_row_h,
+            true,
+        );
+        let _ = MoveWindow(
+            ui.apps_rules,
+            apps_rules_box.left,
+            apps_rules_box.top,
+            apps_rules_box.right - apps_rules_box.left,
+            apps_rules_box.bottom - apps_rules_box.top,
             true,
         );
         let _ = MoveWindow(
@@ -520,6 +618,22 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
                 SW_HIDE
             },
         );
+        for control in [
+            ui.apps_exe,
+            ui.apps_mode,
+            ui.apps_rules,
+            ui.apps_add,
+            ui.apps_remove,
+        ] {
+            let _ = ShowWindow(
+                control,
+                if ui.tab == Tab::Apps {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
         let _ = ShowWindow(
             ui.copy_dir,
             if ui.tab == Tab::Data {
@@ -570,6 +684,8 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
         data_card,
         data_path_box,
         stat_boxes,
+        apps_card,
+        apps_exe_box,
     };
 }
 
@@ -666,6 +782,7 @@ fn paint_settings(ui: &SettingsUi, hdc: HDC, client: RECT) {
             (Tab::Input, Icon::EditPen, "输入与剪贴板"),
             (Tab::Appearance, Icon::Palette, "外观与主题"),
             (Tab::Data, Icon::Folder, "数据与存储"),
+            (Tab::Apps, Icon::Grid, "应用输入例外"),
         ];
         for (idx, (tab, icon, label)) in nav_defs.iter().enumerate() {
             let item = r.nav_items[idx];
@@ -725,6 +842,10 @@ fn paint_settings(ui: &SettingsUi, hdc: HDC, client: RECT) {
                 "数据与存储",
                 "本地 JSON 原子写入 · 自动保留最近 5 份滚动备份",
             ),
+            Tab::Apps => (
+                "应用输入例外",
+                "为单个可执行文件指定 Unicode 或粘贴模式；未命中时使用全局模式",
+            ),
         };
         let hdr_l = r.content_pane.left + scaled(22, dpi);
         let hdr_r = r.content_pane.right - scaled(22, dpi);
@@ -765,6 +886,7 @@ fn paint_settings(ui: &SettingsUi, hdc: HDC, client: RECT) {
             Tab::Input => paint_tab_input(ui, c, p, r, dpi),
             Tab::Appearance => paint_tab_appearance(ui, c, p, r, dpi),
             Tab::Data => paint_tab_data(ui, c, p, r, dpi),
+            Tab::Apps => paint_tab_apps(c, p, r, dpi),
         }
 
         // 5. Keyboard focus ring for custom cards/navigation.
@@ -1401,6 +1523,42 @@ fn paint_tab_appearance(
     );
 }
 
+fn paint_tab_apps(c: &mut d2d::Canvas<'_>, p: theme::Palette, r: Rects, dpi: u32) {
+    let rad = d2d::scaled_f(12.0, dpi);
+    let pad = scaled(16, dpi);
+    c.fill_stroke_round(&r.apps_card, rad, p.card, p.border, 1.0);
+    let title = RECT {
+        left: r.apps_card.left + pad,
+        top: r.apps_card.top + scaled(14, dpi),
+        right: r.apps_card.right - pad,
+        bottom: r.apps_card.top + scaled(34, dpi),
+    };
+    let desc = RECT {
+        left: title.left,
+        top: title.bottom + scaled(2, dpi),
+        right: title.right,
+        bottom: r.apps_exe_box.top - scaled(4, dpi),
+    };
+    c.draw_text(
+        "应用输入例外",
+        &title,
+        TextStyle::Heading,
+        dpi,
+        p.heading,
+        AlignH::Left,
+        AlignV::Center,
+    );
+    c.draw_text(
+        "输入可执行文件名（如 chrome.exe），为该应用单独选择输入模式；未添加规则的应用使用全局设置",
+        &desc,
+        TextStyle::Caption,
+        dpi,
+        p.secondary,
+        AlignH::Left,
+        AlignV::Center,
+    );
+}
+
 fn paint_tab_data(ui: &SettingsUi, c: &mut d2d::Canvas<'_>, p: theme::Palette, r: Rects, dpi: u32) {
     let rad = d2d::scaled_f(12.0, dpi);
     let pad = scaled(16, dpi);
@@ -1531,6 +1689,70 @@ fn create_button(text: &str, parent: HWND, id: i32, instance: HINSTANCE, visible
     hwnd
 }
 
+fn create_input(
+    class: PCWSTR,
+    parent: HWND,
+    id: i32,
+    style: WINDOW_STYLE,
+    instance: HINSTANCE,
+) -> HWND {
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class,
+            PCWSTR::null(),
+            style | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            0,
+            0,
+            10,
+            10,
+            Some(parent),
+            Some(HMENU(id as isize as *mut core::ffi::c_void)),
+            Some(instance),
+            None,
+        )
+        .unwrap_or_default()
+    }
+}
+
+fn control_text(hwnd: HWND) -> String {
+    let length = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }
+        .0
+        .max(0) as usize;
+    if length == 0 {
+        return String::new();
+    }
+    let mut buffer = vec![0u16; length + 1];
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_GETTEXT,
+            Some(WPARAM(buffer.len())),
+            Some(LPARAM(buffer.as_mut_ptr() as isize)),
+        );
+    }
+    String::from_utf16_lossy(&buffer[..length])
+}
+
+fn reload_apps_rules(ui: &SettingsUi) {
+    let mut text = String::new();
+    for rule in storage::rules() {
+        if !text.is_empty() {
+            text.push_str("\r\n");
+        }
+        let mode = if rule.action == "paste" {
+            "粘贴"
+        } else {
+            "Unicode"
+        };
+        text.push_str(&format!("{}  ·  {}", rule.exe, mode));
+    }
+    if text.is_empty() {
+        text.push_str("暂无应用例外");
+    }
+    set_button_text(ui.apps_rules, &text);
+}
+
 fn create() -> Option<SettingsUi> {
     let module = unsafe { GetModuleHandleW(None) }.ok()?;
     let instance = HINSTANCE(module.0);
@@ -1588,6 +1810,41 @@ fn create() -> Option<SettingsUi> {
     let import_data = create_button("导入…", hwnd, ID_IMPORT_DATA, instance, false);
     let restore_backup = create_button("恢复备份…", hwnd, ID_RESTORE_BACKUP, instance, false);
     let sort_mode = create_button("排序：最近使用", hwnd, ID_SORT_MODE, instance, false);
+    let apps_exe = create_input(
+        w!("EDIT"),
+        hwnd,
+        ID_APPS_EXE,
+        WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        instance,
+    );
+    let apps_mode = create_input(
+        w!("COMBOBOX"),
+        hwnd,
+        ID_APPS_MODE,
+        WINDOW_STYLE((CBS_DROPDOWNLIST | WS_VSCROLL.0 as i32) as u32),
+        instance,
+    );
+    for label in ["Unicode 输入", "粘贴兼容"] {
+        let wide = platform::wide(label);
+        unsafe {
+            SendMessageW(
+                apps_mode,
+                CB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(wide.as_ptr() as isize)),
+            );
+            let _ = SendMessageW(apps_mode, CB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+        }
+    }
+    let apps_rules = create_input(
+        w!("EDIT"),
+        hwnd,
+        ID_APPS_RULES,
+        WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+        instance,
+    );
+    let apps_add = create_button("添加/更新", hwnd, ID_APPS_ADD, instance, false);
+    let apps_remove = create_button("删除此应用", hwnd, ID_APPS_REMOVE, instance, false);
     let save = create_button("保存设置", hwnd, ID_SAVE, instance, true);
     let cancel = create_button("取消", hwnd, ID_CANCEL, instance, true);
 
@@ -1600,6 +1857,11 @@ fn create() -> Option<SettingsUi> {
         import_data,
         restore_backup,
         sort_mode,
+        apps_exe,
+        apps_mode,
+        apps_rules,
+        apps_add,
+        apps_remove,
         save,
         cancel,
     ] {
@@ -1613,6 +1875,7 @@ fn create() -> Option<SettingsUi> {
         }
     }
 
+    let field_brush = unsafe { CreateSolidBrush(palette.field) };
     let mut ui = SettingsUi {
         hwnd,
         hotkey_record,
@@ -1623,6 +1886,12 @@ fn create() -> Option<SettingsUi> {
         import_data,
         restore_backup,
         sort_mode,
+        apps_exe,
+        apps_mode,
+        apps_rules,
+        apps_add,
+        apps_remove,
+        field_brush,
         save,
         cancel,
         font,
@@ -1645,6 +1914,14 @@ fn create() -> Option<SettingsUi> {
         status_text: "就绪".to_string(),
         data_dir: platform::data_dir().display().to_string(),
     };
+    ui::theme_control(ui.apps_exe, ui.palette.dark);
+    ui::theme_control(ui.apps_rules, ui.palette.dark);
+    ui::theme_combo(ui.apps_mode, ui.palette.dark);
+    ui::install_smooth_edit(ui.apps_rules);
+    ui::theme_scrollbar(ui.apps_rules, ui.palette.dark);
+    ui::install_combo(ui.apps_mode);
+    ui::cue_banner(ui.apps_exe, "例如 chrome.exe");
+    reload_apps_rules(&ui);
 
     load(&mut ui);
     relayout(&mut ui);
@@ -1664,6 +1941,7 @@ fn load(ui: &mut SettingsUi) {
     set_button_text(ui.sort_mode, sort_label(&ui.panel_sort));
     ui.startup = settings.startup;
     ui.data_dir = platform::data_dir().display().to_string();
+    reload_apps_rules(ui);
     apply_live_theme(ui, &ui.theme_pref.clone());
 }
 
@@ -1671,6 +1949,15 @@ fn apply_live_theme(ui: &mut SettingsUi, pref: &str) {
     let palette = theme::resolve(pref);
     if palette != ui.palette {
         ui.palette = palette;
+        theme::preview(palette);
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
+        }
+        ui.field_brush = unsafe { CreateSolidBrush(palette.field) };
+        ui::theme_control(ui.apps_exe, palette.dark);
+        ui::theme_control(ui.apps_rules, palette.dark);
+        ui::theme_combo(ui.apps_mode, palette.dark);
+        ui::theme_scrollbar(ui.apps_rules, palette.dark);
         ui::apply_window_style_for(ui.hwnd, palette, true);
     }
     unsafe {
@@ -1734,12 +2021,14 @@ pub fn shutdown() {
             None
         }
     });
+    theme::clear_preview();
     let Some(ui) = ui else {
         return;
     };
     unsafe {
         let _ = DestroyWindow(ui.hwnd);
         let _ = DeleteObject(HGDIOBJ(ui.font.0));
+        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
     }
 }
 
@@ -1954,6 +2243,7 @@ fn focus_items(ui: &SettingsUi) -> Vec<FocusItem> {
         FocusItem::Custom(Hover::Nav(1)),
         FocusItem::Custom(Hover::Nav(2)),
         FocusItem::Custom(Hover::Nav(3)),
+        FocusItem::Custom(Hover::Nav(4)),
     ];
     match ui.tab {
         Tab::General => {
@@ -1982,6 +2272,13 @@ fn focus_items(ui: &SettingsUi) -> Vec<FocusItem> {
             items.push(FocusItem::ImportData);
             items.push(FocusItem::RestoreBackup);
         }
+        Tab::Apps => {
+            items.push(FocusItem::AppsExe);
+            items.push(FocusItem::AppsMode);
+            items.push(FocusItem::AppsRules);
+            items.push(FocusItem::AppsAdd);
+            items.push(FocusItem::AppsRemove);
+        }
     }
     items.push(FocusItem::Save);
     items.push(FocusItem::Cancel);
@@ -1998,6 +2295,11 @@ fn native_focus_hwnd(ui: &SettingsUi, item: FocusItem) -> Option<HWND> {
         FocusItem::ImportData => ui.import_data,
         FocusItem::RestoreBackup => ui.restore_backup,
         FocusItem::SortMode => ui.sort_mode,
+        FocusItem::AppsExe => ui.apps_exe,
+        FocusItem::AppsMode => ui.apps_mode,
+        FocusItem::AppsRules => ui.apps_rules,
+        FocusItem::AppsAdd => ui.apps_add,
+        FocusItem::AppsRemove => ui.apps_remove,
         FocusItem::Save => ui.save,
         FocusItem::Cancel => ui.cancel,
         FocusItem::Custom(_) => return None,
@@ -2093,7 +2395,8 @@ fn activate_hover(ui: &mut SettingsUi, target: Hover) -> bool {
                 0 => Tab::General,
                 1 => Tab::Input,
                 2 => Tab::Appearance,
-                _ => Tab::Data,
+                3 => Tab::Data,
+                _ => Tab::Apps,
             };
             if ui.tab != next {
                 ui.tab = next;
@@ -2179,7 +2482,7 @@ fn hit_hover(ui: &SettingsUi, x: i32, y: i32) -> Hover {
                 }
             }
         }
-        Tab::Data => {}
+        Tab::Data | Tab::Apps => {}
     }
     Hover::None
 }
@@ -2248,6 +2551,17 @@ fn set_data_status(hwnd: HWND, text: &str) {
             }
         }
     });
+}
+
+fn rule_error_text(code: &str) -> &'static str {
+    match code {
+        "read_only" => "只读模式，无法修改应用例外",
+        "rule_exe" => "请输入有效的可执行文件名",
+        "rule_action" => "输入模式无效",
+        "rule_limit" => "应用例外数量已达上限",
+        "rule_missing" => "该应用没有例外规则",
+        _ => "应用例外操作失败，请查看日志",
+    }
 }
 
 fn data_error_text(code: &str) -> &'static str {
@@ -2443,6 +2757,11 @@ unsafe extern "system" fn window_proc(
                             ui.import_data,
                             ui.restore_backup,
                             ui.sort_mode,
+                            ui.apps_exe,
+                            ui.apps_mode,
+                            ui.apps_rules,
+                            ui.apps_add,
+                            ui.apps_remove,
                             ui.save,
                             ui.cancel,
                         ] {
@@ -2709,6 +3028,45 @@ unsafe extern "system" fn window_proc(
                     ID_RESTORE_BACKUP if notification == BN_CLICKED => {
                         data_action = Some(DataAction::RestoreBackup)
                     }
+                    ID_APPS_ADD if notification == BN_CLICKED => {
+                        let exe = control_text(ui.apps_exe);
+                        let index = unsafe {
+                            SendMessageW(
+                                ui.apps_mode,
+                                CB_GETCURSEL,
+                                Some(WPARAM(0)),
+                                Some(LPARAM(0)),
+                            )
+                        }
+                        .0;
+                        let action = if index == 1 { "paste" } else { "unicode" };
+                        logging::info(&format!(
+                            "settings: app rule add exe={exe:?} action={action}"
+                        ));
+                        match storage::set_rule(&exe, action) {
+                            Ok(()) => {
+                                set_status(ui, "应用例外已保存");
+                                reload_apps_rules(ui);
+                            }
+                            Err(code) => {
+                                logging::warn(&format!("settings: app rule add failed: {code}"));
+                                set_status(ui, rule_error_text(&code));
+                            }
+                        }
+                    }
+                    ID_APPS_REMOVE if notification == BN_CLICKED => {
+                        let exe = control_text(ui.apps_exe);
+                        match storage::remove_rule(&exe) {
+                            Ok(()) => {
+                                set_status(ui, "应用例外已删除");
+                                reload_apps_rules(ui);
+                            }
+                            Err(code) => {
+                                logging::warn(&format!("settings: app rule remove failed: {code}"));
+                                set_status(ui, rule_error_text(&code));
+                            }
+                        }
+                    }
                     ID_SORT_MODE if notification == BN_CLICKED => {
                         ui.panel_sort = if ui.panel_sort == "most_used" {
                             "recent".to_string()
@@ -2733,6 +3091,28 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+            let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+            let (heading, field, brush) = UI.with(|slot| match slot.try_borrow() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(ui) => (ui.palette.heading, ui.palette.field, ui.field_brush),
+                    None => {
+                        let palette = theme::current();
+                        (palette.heading, palette.field, HBRUSH::default())
+                    }
+                },
+                Err(_) => {
+                    let palette = theme::current();
+                    (palette.heading, palette.field, HBRUSH::default())
+                }
+            });
+            unsafe {
+                SetBkMode(hdc, OPAQUE);
+                SetBkColor(hdc, field);
+                SetTextColor(hdc, heading);
+            }
+            LRESULT(brush.0 as isize)
+        }
         WM_DRAWITEM => {
             let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
             UI.with(|slot| {
@@ -2799,6 +3179,7 @@ unsafe extern "system" fn window_proc(
                 let _ = DestroyWindow(hwnd);
             } else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
+                theme::clear_preview();
             }
             LRESULT(0)
         }
@@ -2807,12 +3188,14 @@ unsafe extern "system" fn window_proc(
                 if let Ok(mut guard) = slot.try_borrow_mut() {
                     if let Some(ui) = guard.take() {
                         let _ = DeleteObject(HGDIOBJ(ui.font.0));
+                        let _ = DeleteObject(HGDIOBJ(ui.field_brush.0));
                     }
                 }
             });
             if QUIT_ON_CLOSE.load(Ordering::Relaxed) {
                 PostQuitMessage(0);
             }
+            theme::clear_preview();
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),

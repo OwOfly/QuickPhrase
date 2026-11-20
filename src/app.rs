@@ -521,12 +521,15 @@ fn open_panel() {
     // Install the foreground monitor before capturing, so a switch between the
     // hotkey and the panel becoming visible is still observed by G3.
     let monitor = foreground::start();
-    let paste_mode = paste_mode_setting();
+    let default_paste_mode = paste_mode_setting();
 
     match capture::once() {
         Some(report) => {
             logging::info(&format!("capture: {}", report.summary()));
             let capture_total = report.timings_ms.total;
+            let paste_mode = storage::action_for_exe(&report.target.exe)
+                .map(|action| action == "paste")
+                .unwrap_or(default_paste_mode);
             let copy_only = copy_only_reason(&report, paste_mode);
             if let Some(reason) = &copy_only {
                 logging::info(&format!("panel opens copy-only: {reason}"));
@@ -548,7 +551,7 @@ fn open_panel() {
         None => {
             logging::warn("capture returned no usable foreground window");
             // Per PRD 14.3 the panel still opens; Enter copies instead of typing.
-            let data = panel_data(Some("未捕获到目标窗口".to_string()), paste_mode);
+            let data = panel_data(Some("未捕获到目标窗口".to_string()), default_paste_mode);
             let micros = panel::show_copy_only(main, data);
             if micros == 0 {
                 logging::warn("copy-only panel show failed");
