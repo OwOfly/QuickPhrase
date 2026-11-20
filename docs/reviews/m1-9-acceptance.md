@@ -94,6 +94,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代阶段一的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 127/127，panel-smoke 10/10，tray-smoke 19/19。
 
+## 阶段二快速新增后重打包（2026-11-20）
+
+托盘“新增短语”入口（见 `docs/reviews/stage2-quickadd-20261120.md`）进入发布包：
+
+```
+exe bytes=780800
+zip bytes=476473
+sha256=cb46ec689e307fc4804c0e9438e7a408112a0080abc83a4b459d1200005c08f6
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代阶段二排序的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 127/127，panel-smoke 10/10，tray-smoke 19/19。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

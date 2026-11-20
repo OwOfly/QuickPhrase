@@ -2198,6 +2198,37 @@ pub fn show(owner: HWND) {
     });
 }
 
+/// Open management with a blank editor, used by the tray "quick add" entry.
+pub fn show_new(owner: HWND) {
+    show(owner);
+    MANAGE.with(|slot| {
+        let mut guard = match slot.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Some(manage) = guard.as_mut() else {
+            return;
+        };
+        if manage.dirty && !confirm_discard(manage.hwnd) {
+            return;
+        }
+        manage.view = View::All;
+        reload_left(manage);
+        reload_categories(manage);
+        reload_list(manage);
+        manage.selected = None;
+        unsafe {
+            let _ = SendMessageW(manage.list, LB_SETCURSEL, usize::MAX, 0);
+        }
+        load_editor(manage, None);
+        relayout(manage);
+        unsafe {
+            let _ = SetFocus(Some(manage.title_edit));
+            let _ = InvalidateRect(Some(manage.hwnd), None, false);
+        }
+    });
+}
+
 pub fn show_test(owner: HWND) -> bool {
     QUIT_ON_CLOSE.store(true, Ordering::Relaxed);
     show(owner);

@@ -19,6 +19,7 @@ const ID_SETTINGS: u32 = 1004;
 const ID_ABOUT: u32 = 1005;
 const ID_EXIT: u32 = 1006;
 const ID_RESTORE_CLIP: u32 = 1007;
+const ID_QUICK_ADD: u32 = 1008;
 
 const SELFTEST_TIMER: usize = 1;
 
@@ -375,6 +376,7 @@ unsafe fn show_menu(hwnd: HWND) {
         hotkey_ok,
         cmd_open: ID_OPEN,
         cmd_manage: ID_MANAGE,
+        cmd_quick_add: ID_QUICK_ADD,
         cmd_pause: ID_PAUSE,
         cmd_settings: ID_SETTINGS,
         cmd_restore_clip: ID_RESTORE_CLIP,
@@ -392,6 +394,10 @@ fn handle_command(id: u32) {
         }
         ID_PAUSE => toggle_hotkey(),
         ID_SETTINGS => settings_ui::show(),
+        ID_QUICK_ADD => {
+            let hwnd = STATE.with(|state| state.borrow().hwnd);
+            manage::show_new(hwnd);
+        }
         ID_RESTORE_CLIP => {
             let hwnd = STATE.with(|state| state.borrow().hwnd);
             match clipboard::last_snapshot() {
