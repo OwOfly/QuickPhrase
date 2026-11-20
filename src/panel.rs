@@ -859,7 +859,7 @@ fn commit() {
             item_index,
             item.id.clone(),
             item.category_id.clone().unwrap_or_default(),
-            item.content.clone(),
+            crate::template::render(&item.content),
         ))
     });
 
@@ -1616,7 +1616,8 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
     let selected = draw.itemState.0 & ODS_SELECTED.0 != 0;
     let title_hl = panel.title_highlights.get(idx).copied().flatten();
     let content_hl = panel.content_highlights.get(idx).copied().flatten();
-    let preview = item.content.replace("\r\n", " ↵ ").replace('\n', " ↵ ");
+    let rendered = crate::template::render(&item.content);
+    let preview = rendered.replace("\r\n", " ↵ ").replace('\n', " ↵ ");
 
     let right_pad = if ui::listbox_scrollable(draw.hwndItem) {
         scaled(13, dpi)
@@ -1766,9 +1767,10 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             right: pill.right - scaled(12, dpi),
             bottom: pill.bottom - scaled(6, dpi),
         };
-        // Note: highlight byte offsets were computed against `item.content`;
-        // only highlight directly when no CRLF replacement shifted offsets.
-        let safe_hl = if item.content == preview {
+        // Highlight offsets were computed against the original `item.content`;
+        // only reuse them when neither template rendering nor CRLF replacement
+        // changed the text.
+        let safe_hl = if rendered == item.content && rendered == preview {
             content_hl
         } else {
             None
@@ -1912,7 +1914,7 @@ fn selected_paste_ok(panel: &Panel) -> Option<bool> {
     let item_index = *panel.filtered.get(index)?;
     let item = panel.items.get(item_index)?;
     Some(crate::inject::paste_preview_ok(
-        &item.content,
+        &crate::template::render(&item.content),
         panel.keep_tabs,
     ))
 }

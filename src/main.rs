@@ -17,6 +17,7 @@ mod search;
 mod settings_ui;
 mod single_instance;
 mod storage;
+mod template;
 mod theme;
 mod tray;
 mod tray_menu;
