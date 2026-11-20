@@ -138,7 +138,21 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     });
 
     storage::init();
-    let tray_ok = tray::add(hwnd, icon, TIP_NORMAL);
+    // Diagnostic runs always exercise hotkey registration, even when the user
+    // left the app paused; the smoke scripts assert that path.
+    let paused_at_start = !(selftest || bench)
+        && storage::settings_clone()
+            .map(|settings| settings.paused)
+            .unwrap_or(false);
+    let tray_ok = tray::add(
+        hwnd,
+        icon,
+        if paused_at_start {
+            TIP_PAUSED
+        } else {
+            TIP_NORMAL
+        },
+    );
     STATE.with(|state| state.borrow_mut().tray_ok = tray_ok);
     if tray_ok {
         logging::info("tray icon added");
@@ -149,32 +163,41 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
 
     let mut hotkey_registered = false;
     let hotkey_text = current_hotkey();
-    match hotkey::register_text(hwnd, &hotkey_text) {
-        Ok(_) => {
-            hotkey_registered = true;
-            STATE.with(|state| {
-                let mut state = state.borrow_mut();
-                state.hotkey_ok = true;
-                state.paused = false;
-            });
-            logging::info(&format!("hotkey registered: {hotkey_text}"));
-        }
-        Err(code) => {
-            logging::error(&format!("RegisterHotKey failed: {code}"));
-            if tray_ok {
-                tray::balloon(
-                    hwnd,
-                    "快捷键注册失败",
-                    &format!("{hotkey_text} 已被其他程序占用。"),
+    if paused_at_start {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            state.paused = true;
+            state.hotkey_ok = false;
+        });
+        logging::info("startup paused by settings");
+    } else {
+        match hotkey::register_text(hwnd, &hotkey_text) {
+            Ok(_) => {
+                hotkey_registered = true;
+                STATE.with(|state| {
+                    let mut state = state.borrow_mut();
+                    state.hotkey_ok = true;
+                    state.paused = false;
+                });
+                logging::info(&format!("hotkey registered: {hotkey_text}"));
+            }
+            Err(code) => {
+                logging::error(&format!("RegisterHotKey failed: {code}"));
+                if tray_ok {
+                    tray::balloon(
+                        hwnd,
+                        "快捷键注册失败",
+                        &format!("{hotkey_text} 已被其他程序占用。"),
+                    );
+                }
+                platform::error_box(
+                    "快捷键冲突",
+                    &format!(
+                        "无法注册 {hotkey_text}（错误码 {code}）。\n\
+                         请关闭占用该快捷键的程序，或在设置中修改。"
+                    ),
                 );
             }
-            platform::error_box(
-                "快捷键冲突",
-                &format!(
-                    "无法注册 {hotkey_text}（错误码 {code}）。\n\
-                     请关闭占用该快捷键的程序，或在设置中修改。"
-                ),
-            );
         }
     }
 
@@ -592,6 +615,18 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
     }
 }
 
+fn persist_paused(paused: bool) {
+    match storage::settings_clone() {
+        Some(mut settings) => {
+            settings.paused = paused;
+            if let Err(err) = storage::save_settings(settings) {
+                logging::warn(&format!("persist paused state failed: {err}"));
+            }
+        }
+        None => logging::warn("persist paused state skipped: storage unavailable"),
+    }
+}
+
 fn toggle_hotkey() {
     let (hwnd, paused, hotkey_ok) = STATE.with(|state| {
         let state = state.borrow();
@@ -608,6 +643,7 @@ fn toggle_hotkey() {
                     state.paused = false;
                     state.hotkey_ok = true;
                 });
+                persist_paused(false);
                 tray::set_tip(hwnd, TIP_NORMAL);
                 logging::info(if paused {
                     "hotkey resumed"
@@ -630,6 +666,7 @@ fn toggle_hotkey() {
             state.paused = true;
             state.hotkey_ok = false;
         });
+        persist_paused(true);
         tray::set_tip(hwnd, TIP_PAUSED);
         tray::balloon(hwnd, "QuickPhrase", "快捷键已暂停，可通过托盘菜单恢复。");
         logging::info("hotkey paused");

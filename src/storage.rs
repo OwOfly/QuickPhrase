@@ -5,8 +5,9 @@
 //! (existing file), with a `MoveFileExW` fallback. Any failure keeps the
 //! original file and removes the temp file.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -66,6 +67,19 @@ impl Snippet {
             self.content.to_lowercase()
         );
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportMode {
+    Merge,
+    Replace,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportSummary {
+    pub categories_added: usize,
+    pub snippets_added: usize,
+    pub snippets_skipped: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,7 +172,14 @@ static STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock
 
 /// Load the store once at startup and log its state.
 pub fn init() {
-    let store = Store::load();
+    let mut store = Store::load();
+    match store.purge_expired(30) {
+        Ok(removed) if removed > 0 => {
+            logging::info(&format!("storage: purged {removed} recycle-bin snippet(s)"))
+        }
+        Ok(_) => {}
+        Err(err) => logging::warn(&format!("storage: recycle-bin purge skipped: {err}")),
+    }
     logging::info(&format!(
         "storage: dir={} revision={} snippets={} read_only={} notice={:?}",
         store.dir().display(),
@@ -246,6 +267,10 @@ pub fn categories() -> Vec<(String, String)> {
     .unwrap_or_default()
 }
 
+pub fn storage_notice() -> Option<String> {
+    with_store(|store| store.notice().map(str::to_string)).flatten()
+}
+
 pub fn read_only_notice() -> Option<String> {
     with_store(|store| {
         if store.is_read_only() {
@@ -259,6 +284,53 @@ pub fn read_only_notice() -> Option<String> {
 
 pub fn data_clone() -> Option<DataFile> {
     with_store(|store| store.data().clone())
+}
+
+pub fn active_count() -> usize {
+    with_store(|store| {
+        store
+            .data()
+            .snippets
+            .iter()
+            .filter(|snippet| snippet.deleted_at.is_none())
+            .count()
+    })
+    .unwrap_or(0)
+}
+
+pub fn export_json() -> Result<String, String> {
+    with_store(|store| store.export_json())
+        .unwrap_or_else(|| Err("storage_unavailable".to_string()))
+}
+
+pub fn import_bytes(bytes: &[u8], mode: ImportMode) -> Result<ImportSummary, String> {
+    match with_store(|store| store.import_bytes(bytes, mode)) {
+        Some(result) => result,
+        None => Err("storage_unavailable".to_string()),
+    }
+}
+
+/// Read an import/backup file with the size limit applied before allocating
+/// the whole payload. Metadata is checked first, then the read itself is
+/// capped so a file that grows between the two checks still cannot exceed it.
+pub fn read_import_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+    if metadata.len() > IMPORT_MAX_BYTES as u64 {
+        return Err("import_too_large".to_string());
+    }
+    let file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(IMPORT_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| err.to_string())?;
+    if bytes.len() > IMPORT_MAX_BYTES {
+        return Err("import_too_large".to_string());
+    }
+    Ok(bytes)
+}
+
+pub fn backups_dir() -> Option<PathBuf> {
+    with_store(|store| store.dir().join("backups"))
 }
 
 pub fn settings_clone() -> Option<Settings> {
@@ -302,6 +374,72 @@ fn validate_text(title: &str, content: &str) -> Result<(String, String), String>
     Ok((title, content.to_string()))
 }
 
+const IMPORT_MAX_BYTES: usize = 20 * 1024 * 1024;
+const IMPORT_MAX_SNIPPETS: usize = 10_000;
+const IMPORT_MAX_CATEGORIES: usize = 1_000;
+
+fn validate_import(mut data: DataFile) -> Result<DataFile, String> {
+    if data.schema_version == 0 || data.schema_version > SCHEMA_VERSION {
+        return Err("import_schema".to_string());
+    }
+    if data.snippets.len() > IMPORT_MAX_SNIPPETS || data.categories.len() > IMPORT_MAX_CATEGORIES {
+        return Err("import_too_large".to_string());
+    }
+
+    let mut category_ids = HashSet::new();
+    let mut category_names = HashSet::new();
+    for category in &mut data.categories {
+        category.name = category.name.trim().to_string();
+        if category.id.is_empty() || !category_ids.insert(category.id.clone()) {
+            return Err("import_category_id".to_string());
+        }
+        if category.name.is_empty()
+            || category.name.encode_utf16().count() > CATEGORY_NAME_MAX_UNITS
+            || !category_names.insert(category.name.to_lowercase())
+        {
+            return Err("import_category_name".to_string());
+        }
+        if category.created_at.is_empty() {
+            category.created_at = now_iso();
+        }
+        if category.updated_at.is_empty() {
+            category.updated_at = category.created_at.clone();
+        }
+    }
+
+    let mut snippet_ids = HashSet::new();
+    let mut active_titles = HashSet::new();
+    for snippet in &mut data.snippets {
+        if snippet.id.is_empty() || !snippet_ids.insert(snippet.id.clone()) {
+            return Err("import_snippet_id".to_string());
+        }
+        let (title, content) = validate_text(&snippet.title, &snippet.content)?;
+        snippet.title = title;
+        snippet.content = content;
+        if let Some(category_id) = snippet.category_id.as_deref() {
+            if !category_ids.contains(category_id) {
+                return Err("import_category_missing".to_string());
+            }
+        }
+        if snippet.deleted_at.is_none() && !active_titles.insert(snippet.title.to_lowercase()) {
+            return Err("duplicate_title".to_string());
+        }
+        if snippet.created_at.is_empty() {
+            snippet.created_at = now_iso();
+        }
+        if snippet.updated_at.is_empty() {
+            snippet.updated_at = snippet.created_at.clone();
+        }
+        snippet.rebuild_blob();
+    }
+    data.schema_version = SCHEMA_VERSION;
+    // The imported revision is not authoritative: the local high-water mark
+    // decides the next value. Reset it so a crafted `u64::MAX` cannot overflow
+    // the increment in `save_data_with`.
+    data.revision = 0;
+    Ok(data)
+}
+
 impl Store {
     #[allow(dead_code)] // used by tests and the M1-4 editor when reloading by id
     pub fn get(&self, id: &str) -> Option<&Snippet> {
@@ -315,6 +453,123 @@ impl Store {
             .iter()
             .filter(|item| item.deleted_at.is_some())
             .collect()
+    }
+
+    pub fn export_json(&self) -> Result<String, String> {
+        serde_json::to_string_pretty(&self.data).map_err(|err| err.to_string())
+    }
+
+    pub fn import_bytes(
+        &mut self,
+        bytes: &[u8],
+        mode: ImportMode,
+    ) -> Result<ImportSummary, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        if bytes.len() > IMPORT_MAX_BYTES {
+            return Err("import_too_large".to_string());
+        }
+        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+        let imported: DataFile =
+            serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
+        let imported = validate_import(imported)?;
+        match mode {
+            ImportMode::Replace => self.import_replace(imported),
+            ImportMode::Merge => self.import_merge(imported),
+        }
+    }
+
+    fn import_replace(&mut self, imported: DataFile) -> Result<ImportSummary, String> {
+        let summary = ImportSummary {
+            categories_added: imported.categories.len(),
+            snippets_added: imported.snippets.len(),
+            snippets_skipped: 0,
+        };
+        let previous = self.data.clone();
+        let mut imported = imported;
+        // Keep the local in-memory revision as a floor in case revision.hwm is
+        // missing or unreadable; the next write must never go backwards.
+        imported.revision = previous.revision;
+        self.data = imported;
+        match self.save_data() {
+            Ok(()) => Ok(summary),
+            Err(err) => {
+                self.data = previous;
+                Err(err)
+            }
+        }
+    }
+
+    fn import_merge(&mut self, imported: DataFile) -> Result<ImportSummary, String> {
+        let mut next = self.data.clone();
+        let previous = self.data.clone();
+        let mut summary = ImportSummary::default();
+        let mut category_map: HashMap<String, String> = HashMap::new();
+
+        for category in imported.categories {
+            let original_id = category.id.clone();
+            let imported_name = category.name.to_lowercase();
+            let existing = next
+                .categories
+                .iter()
+                .find(|item| item.name.to_lowercase() == imported_name)
+                .map(|item| item.id.clone());
+            let mapped = if let Some(id) = existing {
+                id
+            } else {
+                let mut id = original_id.clone();
+                if next.categories.iter().any(|item| item.id == id) {
+                    id = new_id();
+                }
+                next.categories.push(Category {
+                    id: id.clone(),
+                    name: category.name,
+                    sort_order: category.sort_order,
+                    created_at: category.created_at,
+                    updated_at: category.updated_at,
+                });
+                summary.categories_added += 1;
+                id
+            };
+            category_map.insert(original_id, mapped);
+        }
+
+        let mut active_titles: HashSet<String> = next
+            .snippets
+            .iter()
+            .filter(|snippet| snippet.deleted_at.is_none())
+            .map(|snippet| snippet.title.to_lowercase())
+            .collect();
+
+        for mut snippet in imported.snippets {
+            if snippet.deleted_at.is_none() && active_titles.contains(&snippet.title.to_lowercase())
+            {
+                summary.snippets_skipped += 1;
+                continue;
+            }
+            if next.snippets.iter().any(|item| item.id == snippet.id) {
+                snippet.id = new_id();
+            }
+            snippet.category_id = snippet
+                .category_id
+                .and_then(|category_id| category_map.get(&category_id).cloned());
+            snippet.rebuild_blob();
+            if snippet.deleted_at.is_none() {
+                active_titles.insert(snippet.title.to_lowercase());
+            }
+            next.snippets.push(snippet);
+            summary.snippets_added += 1;
+        }
+
+        self.data = next;
+        match self.save_data() {
+            Ok(()) => Ok(summary),
+            Err(err) => {
+                self.data = previous;
+                Err(err)
+            }
+        }
     }
 
     pub fn add_snippet(
@@ -432,6 +687,63 @@ impl Store {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn purge_expired(&mut self, days: i64) -> Result<usize, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let cutoff = utc_now_secs() - days.saturating_mul(86_400);
+        let previous = self.data.clone();
+        let before = self.data.snippets.len();
+        self.data.snippets.retain(|snippet| {
+            snippet
+                .deleted_at
+                .as_deref()
+                .map(|deleted| match parse_utc_stamp(deleted) {
+                    // Only trust the canonical `YYYY-MM-DDTHH:MM:SSZ` form the
+                    // app itself writes. Imported offsets, fractional seconds
+                    // or hand-edited values stay in the bin instead of being
+                    // purged early by a lexicographic comparison.
+                    Some(timestamp) => timestamp >= cutoff,
+                    None => true,
+                })
+                .unwrap_or(true)
+        });
+        let removed = before - self.data.snippets.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        match self.save_data() {
+            Ok(()) => Ok(removed),
+            Err(err) => {
+                self.data = previous;
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(dead_code)] // wired to the recycle toolbar in the manage follow-up
+    pub fn empty_recycle(&mut self) -> Result<usize, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let previous = self.data.clone();
+        let before = self.data.snippets.len();
+        self.data
+            .snippets
+            .retain(|snippet| snippet.deleted_at.is_none());
+        let removed = before - self.data.snippets.len();
+        if removed == 0 {
+            return Ok(0);
+        }
+        match self.save_data() {
+            Ok(()) => Ok(removed),
+            Err(err) => {
+                self.data = previous;
                 Err(err)
             }
         }
@@ -1132,9 +1444,12 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
         return Err(err);
     }
     sync_file(&target)?;
+    Ok(())
+}
 
-    // Keep the newest BACKUP_KEEP files. A failed delete must not loop: the
-    // list would not change and the write path holds the store lock.
+/// Prune only after the main file was replaced successfully, so a failed
+/// replace cannot consume the oldest restore point.
+fn prune_backups(dir: &Path, name: &str) {
     let mut existing = backups(dir, name);
     while existing.len() > BACKUP_KEEP {
         let oldest = existing.pop();
@@ -1149,7 +1464,6 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
             break;
         }
     }
-    Ok(())
 }
 
 fn backup_seq() -> u64 {
@@ -1212,6 +1526,9 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Re
         } else {
             move_file(&temp, &target, false)?;
         }
+        if rotate_backup {
+            prune_backups(dir, name);
+        }
         Ok(())
     })();
 
@@ -1265,6 +1582,70 @@ fn now_iso() -> String {
         (rest % 3600) / 60,
         rest % 60
     )
+}
+
+fn utc_now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+/// Parse exactly the canonical `YYYY-MM-DDTHH:MM:SSZ` form written by the app.
+/// Anything else (offsets, fractional seconds, empty strings) returns `None`
+/// so the recycle purge can leave it alone instead of comparing text.
+fn parse_utc_stamp(stamp: &str) -> Option<i64> {
+    let bytes = stamp.as_bytes();
+    if bytes.len() != 20
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return None;
+    }
+    // `parse()` accepts a leading sign; a time stamp is digits only.
+    const DIGITS: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18];
+    if DIGITS.iter().any(|index| !bytes[*index].is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = stamp.get(0..4)?.parse().ok()?;
+    let month: i64 = stamp.get(5..7)?.parse().ok()?;
+    let day: i64 = stamp.get(8..10)?.parse().ok()?;
+    let hour: i64 = stamp.get(11..13)?.parse().ok()?;
+    let minute: i64 = stamp.get(14..16)?.parse().ok()?;
+    let second: i64 = stamp.get(17..19)?.parse().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || !(0..=59).contains(&second)
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year as i32, month as u32, day as u32) {
+        return None;
+    }
+    // `parse()` accepts a leading `+`; require the canonical spelling instead
+    // of silently normalizing it. Anything else stays out of the purge.
+    let normalized = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z");
+    if normalized != stamp {
+        return None;
+    }
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn now_stamp() -> String {
@@ -1904,6 +2285,204 @@ mod tests {
         let mut store = Store::load_from(&dir);
         store.save_data().unwrap();
         assert!(!dir.join(format!("{DATA_FILE}.tmp")).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_import_roundtrip_and_invalid_schema() {
+        let dir = temp_dir("importrt");
+        let mut store = Store::load_from(&dir);
+        let category = store.add_category("导入测试分类").expect("category");
+        store
+            .add_snippet("导入测试短语", "导入正文\n第二行", Some(&category), true)
+            .expect("snippet");
+        let json = store.export_json().expect("export");
+        assert!(json.contains("导入测试短语"));
+        let exported: DataFile = serde_json::from_str(&json).expect("parse export");
+
+        let target_dir = temp_dir("importtarget");
+        let mut target = Store::load_from(&target_dir);
+        let summary = target
+            .import_bytes(json.as_bytes(), ImportMode::Replace)
+            .expect("replace import");
+        assert_eq!(summary.categories_added, exported.categories.len());
+        assert_eq!(summary.snippets_added, exported.snippets.len());
+        assert!(target
+            .snippets()
+            .iter()
+            .any(|snippet| snippet.title == "导入测试短语"));
+        assert!(target
+            .snippets()
+            .iter()
+            .find(|snippet| snippet.title == "导入测试短语")
+            .is_some_and(|snippet| snippet.pinned));
+
+        let invalid = br#"{"schemaVersion":99,"revision":0,"categories":[],"snippets":[]}"#;
+        assert_eq!(
+            target.import_bytes(invalid, ImportMode::Replace),
+            Err("import_schema".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn merge_import_skips_duplicate_titles_and_remaps_ids() {
+        let dir = temp_dir("importmerge");
+        let mut store = Store::load_from(&dir);
+        let mut imported = store.data().clone();
+        let mut category = imported.categories[0].clone();
+        category.id = "imported-category".to_string();
+        category.name = "导入分类".to_string();
+        imported.categories.push(category);
+        let mut extra = imported.snippets[0].clone();
+        extra.id = "imported-snippet".to_string();
+        extra.title = "导入短语".to_string();
+        extra.content = "导入正文".to_string();
+        extra.rebuild_blob();
+        imported.snippets.push(extra);
+        let before = store.snippets().len();
+        let summary = store
+            .import_bytes(&serde_json::to_vec(&imported).unwrap(), ImportMode::Merge)
+            .expect("merge import");
+        assert_eq!(summary.snippets_added, 1);
+        assert_eq!(summary.snippets_skipped, before);
+        assert_eq!(summary.categories_added, 1);
+        assert!(store
+            .snippets()
+            .iter()
+            .any(|snippet| snippet.title == "导入短语"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merge_matches_category_names_with_unicode_case_folding() {
+        let dir = temp_dir("importcase");
+        let mut store = Store::load_from(&dir);
+        let category = store.add_category("Équipe").expect("category");
+        store
+            .add_snippet("Équipe 短语", "正文", Some(&category), false)
+            .expect("snippet");
+        let mut imported = store.data().clone();
+        if let Some(category) = imported
+            .categories
+            .iter_mut()
+            .find(|category| category.name == "Équipe")
+        {
+            category.name = "éQUIPE".to_string();
+        }
+        let categories_before = store.data().categories.len();
+        let summary = store
+            .import_bytes(&serde_json::to_vec(&imported).unwrap(), ImportMode::Merge)
+            .expect("merge import");
+        assert_eq!(summary.categories_added, 0);
+        assert_eq!(store.data().categories.len(), categories_before);
+        assert_eq!(
+            store
+                .data()
+                .categories
+                .iter()
+                .filter(|category| category.name.to_lowercase() == "équipe")
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_import_resets_crafted_revision() {
+        let dir = temp_dir("importrev");
+        let store = Store::load_from(&dir);
+        let mut imported = store.data().clone();
+        imported.revision = u64::MAX;
+        let target_dir = temp_dir("importrevtarget");
+        let mut target = Store::load_from(&target_dir);
+        target
+            .import_bytes(&serde_json::to_vec(&imported).unwrap(), ImportMode::Replace)
+            .expect("replace import");
+        assert!(target.data().revision > 0);
+        assert!(target.data().revision < 1_000);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&target_dir);
+    }
+
+    #[test]
+    fn replace_import_keeps_local_revision_floor_without_hwm() {
+        let dir = temp_dir("importfloor");
+        let mut store = Store::load_from(&dir);
+        let _ = fs::remove_file(dir.join(HWM_FILE));
+        store.data.revision = 500;
+        let imported = store.data().clone();
+        store
+            .import_bytes(&serde_json::to_vec(&imported).unwrap(), ImportMode::Replace)
+            .expect("replace import");
+        assert!(store.data().revision > 500);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn purge_keeps_noncanonical_deleted_timestamps() {
+        let dir = temp_dir("purgefmt");
+        let mut store = Store::load_from(&dir);
+        let offset = store
+            .add_snippet("偏移时间", "正文", None, false)
+            .expect("offset");
+        let empty = store
+            .add_snippet("空时间", "正文", None, false)
+            .expect("empty");
+        let malformed = store
+            .add_snippet("畸形时间", "正文", None, false)
+            .expect("malformed");
+        let plus = store
+            .add_snippet("加号时间", "正文", None, false)
+            .expect("plus");
+        let negative = store
+            .add_snippet("负年份", "正文", None, false)
+            .expect("negative");
+        for id in [&offset, &empty, &malformed, &plus, &negative] {
+            store.soft_delete(id).expect("delete");
+        }
+        let values = [
+            (&offset, "2026-10-20T23:30:00-08:00"),
+            (&empty, ""),
+            (&malformed, "2026-13-40T00:00:00Z"),
+            (&plus, "2000-+1-01T00:00:00Z"),
+            (&negative, "-001-01-01T00:00:00Z"),
+        ];
+        for (id, value) in values {
+            if let Some(snippet) = store.data.snippets.iter_mut().find(|s| s.id == *id) {
+                snippet.deleted_at = Some(value.to_string());
+            }
+        }
+        assert_eq!(store.purge_expired(30), Ok(0));
+        assert!(store.get(&offset).is_some());
+        assert!(store.get(&empty).is_some());
+        assert!(store.get(&malformed).is_some());
+        assert!(store.get(&plus).is_some());
+        assert!(store.get(&negative).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recycle_purge_removes_only_old_deleted_rows() {
+        let dir = temp_dir("purge");
+        let mut store = Store::load_from(&dir);
+        let old = store
+            .add_snippet("旧回收项", "旧正文", None, false)
+            .expect("old");
+        let fresh = store
+            .add_snippet("新回收项", "新正文", None, false)
+            .expect("fresh");
+        store.soft_delete(&old).expect("delete old");
+        store.soft_delete(&fresh).expect("delete fresh");
+        if let Some(snippet) = store.data.snippets.iter_mut().find(|s| s.id == old) {
+            snippet.deleted_at = Some("2000-01-01T00:00:00Z".to_string());
+        }
+        assert_eq!(store.purge_expired(30), Ok(1));
+        assert!(store.get(&old).is_none());
+        assert!(store.get(&fresh).is_some());
+        assert_eq!(store.empty_recycle(), Ok(1));
+        assert!(store.get(&fresh).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

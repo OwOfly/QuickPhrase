@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
@@ -90,10 +90,48 @@ pub fn set_startup(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// A `portable.txt` or `portable` file next to the executable switches all
+/// writable state (data, backups, logs, captures) to `<exe>/data`.
+fn portable_data_dir(exe_dir: &Path) -> Option<PathBuf> {
+    let marker = exe_dir.join("portable.txt");
+    let legacy = exe_dir.join("portable");
+    if marker.is_file() || legacy.is_file() {
+        Some(exe_dir.join("data"))
+    } else {
+        None
+    }
+}
+
 pub fn data_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            if let Some(portable) = portable_data_dir(parent) {
+                return portable;
+            }
+        }
+    }
     match std::env::var_os("LOCALAPPDATA") {
         Some(base) => PathBuf::from(base).join("QuickPhrase"),
         None => PathBuf::from(".").join("QuickPhrase"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_marker_switches_data_dir_next_to_exe() {
+        let dir = std::env::temp_dir().join(format!("qp-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(portable_data_dir(&dir), None);
+        std::fs::write(dir.join("portable.txt"), b"").unwrap();
+        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
+        std::fs::remove_file(dir.join("portable.txt")).unwrap();
+        std::fs::write(dir.join("portable"), b"").unwrap();
+        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

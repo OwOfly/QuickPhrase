@@ -141,6 +141,7 @@ struct Manage {
     editing: Option<String>,
     editing_deleted: bool,
     pinned_state: bool,
+    draft_category: Option<String>,
     pin_hovered: bool,
     tracking_mouse: bool,
     selected: Option<usize>,
@@ -329,11 +330,10 @@ fn reload_left(manage: &mut Manage) {
     }
 }
 
-fn reload_categories(manage: &Manage) {
+fn reload_categories(manage: &mut Manage) {
     let Some(data) = data() else {
         return;
     };
-    let previous = unsafe { SendMessageW(manage.category, CB_GETCURSEL, 0, 0) }.0 as i32;
     unsafe {
         let _ = SendMessageW(manage.category, CB_RESETCONTENT, 0, 0);
     }
@@ -352,13 +352,22 @@ fn reload_categories(manage: &Manage) {
             let _ = SendMessageW(manage.category, CB_ADDSTRING, 0, wide.as_ptr() as isize);
         }
     }
-    let index = if previous >= 0 {
-        previous.min(data.categories.len() as i32)
-    } else {
-        0
-    };
+    // Restore by stable id, not by the old numeric index: an import can
+    // reorder or remove categories while an editor draft is still open.
+    let index = manage
+        .draft_category
+        .as_deref()
+        .and_then(|id| {
+            data.categories
+                .iter()
+                .position(|category| category.id == id)
+        })
+        .map(|position| position + 1);
+    if index.is_none() && manage.draft_category.is_some() {
+        manage.draft_category = None;
+    }
     unsafe {
-        let _ = SendMessageW(manage.category, CB_SETCURSEL, index as usize, 0);
+        let _ = SendMessageW(manage.category, CB_SETCURSEL, index.unwrap_or(0), 0);
     }
 }
 
@@ -425,6 +434,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
                 let _ = SendMessageW(manage.category, CB_SETCURSEL, index, 0);
             }
             manage.pinned_state = snippet.pinned;
+            manage.draft_category = snippet.category_id.clone();
             unsafe {
                 let _ = InvalidateRect(Some(manage.pinned), None, false);
                 let _ = InvalidateRect(Some(manage.hwnd), None, false);
@@ -470,6 +480,16 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
                 let _ = ShowWindow(manage.restore_button, SW_HIDE);
             }
             manage.pinned_state = false;
+            // A new snippet in a category view starts in that category. Keep
+            // the id in sync because save_editor now uses the stable id, not
+            // the combo index.
+            manage.draft_category = if default_cat > 0 {
+                data.as_ref()
+                    .and_then(|d| d.categories.get(default_cat - 1))
+                    .map(|category| category.id.clone())
+            } else {
+                None
+            };
             manage.editing = None;
             manage.editing_deleted = false;
             manage.dirty = false;
@@ -510,7 +530,7 @@ fn current_category(manage: &Manage) -> Option<String> {
 fn save_editor(manage: &mut Manage) {
     let title = wide_text(manage.title_edit);
     let content = wide_text(manage.content_edit);
-    let category = current_category(manage);
+    let category = manage.draft_category.clone();
     let pinned = manage.pinned_state;
 
     let result = storage::with_store(|store| match &manage.editing {
@@ -1606,7 +1626,7 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
             AlignV::Center,
         );
         c.draw_text(
-            "排序权重",
+            "置顶",
             &l.meta_pin_label,
             TextStyle::Label,
             dpi,
@@ -2018,6 +2038,7 @@ fn create(owner: HWND) -> Option<Manage> {
         pin_hovered: false,
         tracking_mouse: false,
         selected: None,
+        draft_category: None,
         dirty: false,
         loading: true,
         nav_rows: Vec::new(),
@@ -2053,7 +2074,7 @@ fn create(owner: HWND) -> Option<Manage> {
     }
 
     reload_left(&mut manage);
-    reload_categories(&manage);
+    reload_categories(&mut manage);
     reload_list(&mut manage);
     let first_id = manage.phrase_rows.first().map(|r| r.id.clone());
     load_editor(&mut manage, first_id.as_deref());
@@ -2139,6 +2160,32 @@ pub fn show(owner: HWND) {
         reload_left(manage);
         reload_categories(manage);
         reload_list(manage);
+        // Reopen a clean editor from the store, so an import or restore cannot
+        // leave stale text that overwrites a new snippet on save. An unsaved
+        // draft is left untouched: silently replacing it here would lose the
+        // user's edits, and other navigation paths already ask before
+        // discarding.
+        if !manage.dirty {
+            let editing = manage.editing.clone();
+            let still_exists = editing
+                .as_deref()
+                .map(|id| manage.phrase_rows.iter().any(|row| row.id == id))
+                .unwrap_or(false);
+            let next = if still_exists {
+                editing
+            } else {
+                manage.phrase_rows.first().map(|row| row.id.clone())
+            };
+            if let Some(id) = next.as_deref() {
+                if let Some(position) = manage.phrase_rows.iter().position(|row| row.id == id) {
+                    manage.selected = Some(position);
+                    unsafe {
+                        let _ = SendMessageW(manage.list, LB_SETCURSEL, position, 0);
+                    }
+                }
+            }
+            load_editor(manage, next.as_deref());
+        }
         relayout(manage);
         unsafe {
             let _ = InvalidateRect(Some(manage.hwnd), None, true);
@@ -2620,6 +2667,7 @@ unsafe extern "system" fn window_proc(
                             manage.error_message = None;
                         }
                         if !manage.loading {
+                            manage.draft_category = current_category(manage);
                             manage.dirty = true;
                             manage.status_text = "未保存修改".to_string();
                             let _ = InvalidateRect(Some(hwnd), None, false);

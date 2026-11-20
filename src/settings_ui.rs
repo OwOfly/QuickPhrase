@@ -1,14 +1,19 @@
 //! QuickPhrase 2.0 two-pane Fluent settings center (Direct2D + DirectWrite).
 
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, DeleteObject, EndPaint, InvalidateRect, HBRUSH, HDC, HFONT, HGDIOBJ, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
+};
 use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -31,6 +36,9 @@ const ID_SAVE: i32 = 307;
 const ID_CANCEL: i32 = 308;
 const ID_COPY_DIR: i32 = 320;
 const ID_OPEN_DIR: i32 = 321;
+const ID_EXPORT_DATA: i32 = 322;
+const ID_IMPORT_DATA: i32 = 323;
+const ID_RESTORE_BACKUP: i32 = 324;
 
 const WIDTH: i32 = 740;
 // The Input page needs 430 logical px of body plus the 52 px footer; keep
@@ -67,6 +75,9 @@ enum FocusItem {
     RestoreClip,
     CopyDir,
     OpenDir,
+    ExportData,
+    ImportData,
+    RestoreBackup,
     Save,
     Cancel,
 }
@@ -105,6 +116,9 @@ struct SettingsUi {
     restore_clip: HWND,
     copy_dir: HWND,
     open_dir: HWND,
+    export_data: HWND,
+    import_data: HWND,
+    restore_backup: HWND,
     save: HWND,
     cancel: HWND,
     font: HFONT,
@@ -348,30 +362,42 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
     }
 
     // --- Tab 3: Data ---
-    let data_card = RECT {
-        left: cl,
-        top: body_top,
-        right: cr,
-        bottom: body_top + scaled(196, dpi),
-    };
     let dpad = scaled(16, dpi);
     let btn_sm_w = scaled(76, dpi);
-    let path_top = data_card.top + scaled(42, dpi);
+    let data_left = cl;
+    let data_right = cr;
+    let data_top = body_top;
+    let path_top = data_top + scaled(42, dpi);
     let path_h = scaled(34, dpi);
     let data_path_box = RECT {
-        left: data_card.left + dpad,
+        left: data_left + dpad,
         top: path_top,
-        right: (data_card.right - dpad - btn_sm_w * 2 - scaled(14, dpi))
-            .max(data_card.left + dpad + 60),
+        right: data_right - dpad,
         bottom: path_top + path_h,
     };
-    let stat_top = path_top + path_h + scaled(18, dpi);
+    let copy_open_top = path_top + path_h + scaled(10, dpi);
+    let action_top = copy_open_top + scaled(30, dpi) + scaled(8, dpi);
+    let action_h = scaled(30, dpi);
+    let action_gap = scaled(8, dpi);
+    let action_w = scaled(80, dpi);
+    let action_x = data_left + dpad;
+    let mut data_actions = [RECT::default(); 3];
+    for (index, action) in data_actions.iter_mut().enumerate() {
+        let left = action_x + (action_w + action_gap) * index as i32;
+        *action = RECT {
+            left,
+            top: action_top,
+            right: left + action_w,
+            bottom: action_top + action_h,
+        };
+    }
+    let stat_top = action_top + action_h + scaled(12, dpi);
     let stat_h = scaled(72, dpi);
     let stat_gap = scaled(10, dpi);
     let stat_w = ((cw - dpad * 2 - stat_gap * 2) / 3).max(scaled(64, dpi));
     let mut stat_boxes = [RECT::default(); 3];
     for (i, sb) in stat_boxes.iter_mut().enumerate() {
-        let x = data_card.left + dpad + (stat_w + stat_gap) * i as i32;
+        let x = data_left + dpad + (stat_w + stat_gap) * i as i32;
         *sb = RECT {
             left: x,
             top: stat_top,
@@ -379,6 +405,12 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
             bottom: stat_top + stat_h,
         };
     }
+    let data_card = RECT {
+        left: data_left,
+        top: data_top,
+        right: data_right,
+        bottom: stat_top + stat_h + scaled(14, dpi),
+    };
 
     // Footer buttons
     let save_w = scaled(92, dpi);
@@ -404,20 +436,34 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
         );
         let _ = MoveWindow(
             ui.copy_dir,
-            data_path_box.right + scaled(8, dpi),
-            path_top,
+            data_left + dpad,
+            copy_open_top,
             btn_sm_w,
             path_h,
             true,
         );
         let _ = MoveWindow(
             ui.open_dir,
-            data_path_box.right + scaled(8, dpi) + btn_sm_w + scaled(6, dpi),
-            path_top,
+            data_left + dpad + btn_sm_w + scaled(6, dpi),
+            copy_open_top,
             btn_sm_w,
             path_h,
             true,
         );
+        for (control, rect) in [
+            (ui.export_data, data_actions[0]),
+            (ui.import_data, data_actions[1]),
+            (ui.restore_backup, data_actions[2]),
+        ] {
+            let _ = MoveWindow(
+                control,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                true,
+            );
+        }
         let _ = MoveWindow(ui.save, cr - save_w, fbtn_y, save_w, fbtn_h, true);
         let _ = MoveWindow(
             ui.cancel,
@@ -460,6 +506,16 @@ fn layout(ui: &mut SettingsUi, width: i32, height: i32) {
                 SW_HIDE
             },
         );
+        for control in [ui.export_data, ui.import_data, ui.restore_backup] {
+            let _ = ShowWindow(
+                control,
+                if ui.tab == Tab::Data {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
+        }
     }
 
     ui.rects = Rects {
@@ -1324,21 +1380,26 @@ fn paint_tab_data(ui: &SettingsUi, c: &mut d2d::Canvas<'_>, p: theme::Palette, r
         AlignV::Center,
     );
 
-    let active_count = storage::data_clone()
-        .map(|d| d.snippets.iter().filter(|s| s.deleted_at.is_none()).count())
-        .unwrap_or(0);
+    let active_count = storage::active_count();
     let read_only = storage::read_only_notice().is_some();
+    let has_notice = storage::storage_notice().is_some();
     let stats = [
         (format!("{active_count}"), "有效短语", p.heading),
         ("5 份".to_string(), "滚动备份", p.heading),
         (
             if read_only {
                 "只读".to_string()
+            } else if has_notice {
+                "异常".to_string()
             } else {
                 "正常".to_string()
             },
             "存储状态",
-            if read_only { p.warning } else { p.success },
+            if read_only || has_notice {
+                p.warning
+            } else {
+                p.success
+            },
         ),
     ];
 
@@ -1458,6 +1519,9 @@ fn create() -> Option<SettingsUi> {
     let restore_clip = create_button("恢复上次剪贴板内容", hwnd, ID_RESTORE_CLIP, instance, false);
     let copy_dir = create_button("复制路径", hwnd, ID_COPY_DIR, instance, false);
     let open_dir = create_button("打开目录", hwnd, ID_OPEN_DIR, instance, false);
+    let export_data = create_button("导出…", hwnd, ID_EXPORT_DATA, instance, false);
+    let import_data = create_button("导入…", hwnd, ID_IMPORT_DATA, instance, false);
+    let restore_backup = create_button("恢复备份…", hwnd, ID_RESTORE_BACKUP, instance, false);
     let save = create_button("保存设置", hwnd, ID_SAVE, instance, true);
     let cancel = create_button("取消", hwnd, ID_CANCEL, instance, true);
 
@@ -1466,6 +1530,9 @@ fn create() -> Option<SettingsUi> {
         restore_clip,
         copy_dir,
         open_dir,
+        export_data,
+        import_data,
+        restore_backup,
         save,
         cancel,
     ] {
@@ -1485,6 +1552,9 @@ fn create() -> Option<SettingsUi> {
         restore_clip,
         copy_dir,
         open_dir,
+        export_data,
+        import_data,
+        restore_backup,
         save,
         cancel,
         font,
@@ -1827,6 +1897,9 @@ fn focus_items(ui: &SettingsUi) -> Vec<FocusItem> {
         Tab::Data => {
             items.push(FocusItem::CopyDir);
             items.push(FocusItem::OpenDir);
+            items.push(FocusItem::ExportData);
+            items.push(FocusItem::ImportData);
+            items.push(FocusItem::RestoreBackup);
         }
     }
     items.push(FocusItem::Save);
@@ -1840,6 +1913,9 @@ fn native_focus_hwnd(ui: &SettingsUi, item: FocusItem) -> Option<HWND> {
         FocusItem::RestoreClip => ui.restore_clip,
         FocusItem::CopyDir => ui.copy_dir,
         FocusItem::OpenDir => ui.open_dir,
+        FocusItem::ExportData => ui.export_data,
+        FocusItem::ImportData => ui.import_data,
+        FocusItem::RestoreBackup => ui.restore_backup,
         FocusItem::Save => ui.save,
         FocusItem::Cancel => ui.cancel,
         FocusItem::Custom(_) => return None,
@@ -2026,6 +2102,192 @@ fn hit_hover(ui: &SettingsUi, x: i32, y: i32) -> Hover {
     Hover::None
 }
 
+#[derive(Clone, Copy)]
+enum DataAction {
+    Export,
+    Import,
+    RestoreBackup,
+}
+
+fn pick_data_file(hwnd: HWND, save: bool, initial_dir: &Path, title: &str) -> Option<PathBuf> {
+    let mut filter: Vec<u16> = "QuickPhrase JSON".encode_utf16().collect();
+    filter.push(0);
+    filter.extend("*.json".encode_utf16());
+    filter.push(0);
+    filter.extend("所有文件".encode_utf16());
+    filter.push(0);
+    filter.extend("*.*".encode_utf16());
+    filter.push(0);
+    filter.push(0);
+    let title = platform::wide(title);
+    let initial = platform::wide(&initial_dir.display().to_string());
+    let mut buffer = [0u16; 1024];
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(buffer.as_mut_ptr()),
+        nMaxFile: buffer.len() as u32,
+        lpstrInitialDir: PCWSTR(initial.as_ptr()),
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        lpstrDefExt: w!("json"),
+        Flags: if save {
+            OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST
+        } else {
+            OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST
+        },
+        ..Default::default()
+    };
+    let ok = unsafe {
+        if save {
+            GetSaveFileNameW(&mut ofn)
+        } else {
+            GetOpenFileNameW(&mut ofn)
+        }
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let length = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    if length == 0 {
+        return None;
+    }
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+fn set_data_status(hwnd: HWND, text: &str) {
+    UI.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            if let Some(ui) = guard.as_mut() {
+                ui.status_text = text.to_string();
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+            }
+        }
+    });
+}
+
+fn data_error_text(code: &str) -> &'static str {
+    match code {
+        "read_only" => "只读模式，无法导入",
+        "import_too_large" => "导入文件过大或条目过多",
+        "import_invalid_json" => "文件不是有效的 QuickPhrase JSON",
+        "import_schema" => "文件版本不受支持",
+        "import_category_id" | "import_category_name" | "import_category_missing" => {
+            "导入分类数据无效"
+        }
+        "import_snippet_id" => "导入短语 ID 无效",
+        "duplicate_title" => "导入数据包含重复标题",
+        "title_empty" | "title_too_long" | "content_empty" | "content_too_long" => {
+            "导入短语内容不符合校验规则"
+        }
+        _ => "导入失败，请检查文件或日志",
+    }
+}
+
+fn handle_data_action(hwnd: HWND, action: DataAction) {
+    let (save, initial, title) = match action {
+        DataAction::Export => (true, platform::data_dir(), "导出 QuickPhrase 数据"),
+        DataAction::Import => (false, platform::data_dir(), "导入 QuickPhrase 数据"),
+        DataAction::RestoreBackup => {
+            let dir = storage::backups_dir().unwrap_or_else(platform::data_dir);
+            (false, dir, "恢复 QuickPhrase 备份")
+        }
+    };
+    let Some(path) = pick_data_file(hwnd, save, &initial, title) else {
+        return;
+    };
+
+    match action {
+        DataAction::Export => {
+            let result = storage::export_json()
+                .and_then(|json| std::fs::write(&path, json).map_err(|err| format!("write:{err}")));
+            match result {
+                Ok(()) => set_data_status(hwnd, &format!("已导出：{}", path.display())),
+                Err(err) => {
+                    logging::error(&format!("settings: export failed: {err}"));
+                    set_data_status(hwnd, "导出失败，请检查路径或权限");
+                }
+            }
+        }
+        DataAction::Import => {
+            let bytes = match storage::read_import_file(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err == "import_too_large" => {
+                    set_data_status(hwnd, "导入文件过大或条目过多");
+                    return;
+                }
+                Err(err) => {
+                    logging::error(&format!("settings: import read failed: {err}"));
+                    set_data_status(hwnd, "无法读取导入文件");
+                    return;
+                }
+            };
+            let choice = unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    w!("导入方式：\n\n是：合并到当前数据（按标题去重）\n否：替换当前全部数据\n取消：不导入"),
+                    w!("导入 QuickPhrase 数据"),
+                    MB_YESNOCANCEL | MB_ICONQUESTION,
+                )
+            };
+            let mode = if choice == IDYES {
+                storage::ImportMode::Merge
+            } else if choice == IDNO {
+                storage::ImportMode::Replace
+            } else {
+                return;
+            };
+            match storage::import_bytes(&bytes, mode) {
+                Ok(summary) => set_data_status(
+                    hwnd,
+                    &format!(
+                        "导入完成：分类 +{}，短语 +{}，跳过 {}；重开面板/管理窗口生效",
+                        summary.categories_added, summary.snippets_added, summary.snippets_skipped
+                    ),
+                ),
+                Err(err) => {
+                    logging::error(&format!("settings: import failed: {err}"));
+                    set_data_status(hwnd, data_error_text(&err));
+                }
+            }
+        }
+        DataAction::RestoreBackup => {
+            let bytes = match storage::read_import_file(&path) {
+                Ok(bytes) => bytes,
+                Err(err) if err == "import_too_large" => {
+                    set_data_status(hwnd, "备份文件过大，无法恢复");
+                    return;
+                }
+                Err(err) => {
+                    logging::error(&format!("settings: backup read failed: {err}"));
+                    set_data_status(hwnd, "无法读取备份文件");
+                    return;
+                }
+            };
+            let answer = unsafe {
+                MessageBoxW(
+                    Some(hwnd),
+                    w!("恢复备份会用备份内容替换当前数据，且无法撤销。继续吗？"),
+                    w!("恢复 QuickPhrase 备份"),
+                    MB_YESNO | MB_ICONWARNING,
+                )
+            };
+            if answer != IDYES {
+                return;
+            }
+            match storage::import_bytes(&bytes, storage::ImportMode::Replace) {
+                Ok(_) => set_data_status(hwnd, "备份已恢复；重开面板/管理窗口生效"),
+                Err(err) => {
+                    logging::error(&format!("settings: restore failed: {err}"));
+                    set_data_status(hwnd, data_error_text(&err));
+                }
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -2095,6 +2357,9 @@ unsafe extern "system" fn window_proc(
                             ui.restore_clip,
                             ui.copy_dir,
                             ui.open_dir,
+                            ui.export_data,
+                            ui.import_data,
+                            ui.restore_backup,
                             ui.save,
                             ui.cancel,
                         ] {
@@ -2289,6 +2554,7 @@ unsafe extern "system" fn window_proc(
         WM_COMMAND => {
             let id = (wparam.0 & 0xffff) as i32;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
+            let mut data_action = None;
             UI.with(|slot| {
                 let Ok(mut guard) = slot.try_borrow_mut() else {
                     return;
@@ -2351,12 +2617,24 @@ unsafe extern "system" fn window_proc(
                         );
                         set_status(ui, "已打开本地数据目录");
                     }
+                    ID_EXPORT_DATA if notification == BN_CLICKED => {
+                        data_action = Some(DataAction::Export)
+                    }
+                    ID_IMPORT_DATA if notification == BN_CLICKED => {
+                        data_action = Some(DataAction::Import)
+                    }
+                    ID_RESTORE_BACKUP if notification == BN_CLICKED => {
+                        data_action = Some(DataAction::RestoreBackup)
+                    }
                     _ if notification == BN_SETFOCUS || notification == BN_KILLFOCUS => unsafe {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     },
                     _ => {}
                 }
             });
+            if let Some(action) = data_action {
+                handle_data_action(hwnd, action);
+            }
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
