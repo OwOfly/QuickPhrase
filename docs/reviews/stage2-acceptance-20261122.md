@@ -41,7 +41,10 @@ clipboard untouched on accepted path
 - 设置页新增“应用输入例外”，规则写 `rules-user.json`，按 exe basename 匹配。
 - 已用脚本向 exe 编辑框发送键盘字符 `notepad.exe` 并点击添加，日志确认写入；测试规则已清理。
 - 规则模式已进入 `inject::Options`，与面板提示/copy-only 同源。
-- **未验证**：真实应用规则覆盖后的 Unicode/粘贴注入矩阵；需用 Chrome/记事本等实测。
+- 隔离数据实测（`host-probe.exe`）：
+  - 全局 `paste` + 规则 `unicode`：host-matrix 10/10，插入文本一致，剪贴板保持 sentinel，证明规则覆盖全局。
+  - 全局 `unicode` + 规则 `paste`：模式已切到粘贴（剪贴板出现待插入文本），但 host-matrix 的剪贴板 sentinel 触发 `clipboard_changed_before_paste` 安全拒绝，因此未完成粘贴注入；这是测试钩子与粘贴模式冲突，不是规则未生效。
+- **未验证**：真实 Chrome/Word/VS Code/终端/微信中的粘贴规则矩阵。
 
 ## 仍需交互桌面验收（阻断发布标签）
 
