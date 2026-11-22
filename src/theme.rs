@@ -230,7 +230,17 @@ fn luminance(color: COLORREF) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{contrast_ratio, resolve, COLORREF, DARK, LIGHT};
+    use super::{clear_preview, contrast_ratio, current, preview, resolve, COLORREF, DARK, LIGHT};
+
+    #[test]
+    fn preview_overrides_current_and_clear_is_idempotent() {
+        preview(DARK);
+        assert_eq!(current(), DARK);
+        clear_preview();
+        assert_eq!(current(), resolve("system"));
+        clear_preview();
+        assert_eq!(current(), resolve("system"));
+    }
 
     #[test]
     fn explicit_preferences_resolve() {
