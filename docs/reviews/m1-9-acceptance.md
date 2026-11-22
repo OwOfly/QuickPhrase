@@ -146,6 +146,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代变量模板的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 134/134，panel-smoke 10/10，tray-smoke 19/19。
 
+## 阶段三标签检索后重打包（2026-11-22）
+
+短语标签与检索（见 `docs/reviews/stage3-tags-20261122.md`）进入发布包：
+
+```
+exe bytes=1028608
+zip bytes=566684
+sha256=ec36f3652e6f9c07055a7ad5493a7a58ea4c77e443b69709b3fc046c78aa1a3f
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代按应用输入例外的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 136/136，panel-smoke 10/10，tray-smoke 19/19。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

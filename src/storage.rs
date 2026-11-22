@@ -56,25 +56,29 @@ pub struct Snippet {
     pub last_used_at: Option<String>,
     pub last_insert_status: Option<String>,
     pub deleted_at: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default, skip_serializing)]
     pub search_blob: String,
 }
 
 impl Snippet {
-    /// Rebuilds the five-part search blob via `build_search_blob`, per §6.2.
+    /// Rebuilds the six-part search blob via `build_search_blob`, per §6.2.
     pub fn rebuild_blob(&mut self) {
-        self.search_blob = build_search_blob(&self.title, &self.content);
+        self.search_blob = build_search_blob(&self.title, &self.content, &self.tags);
     }
 }
 
-/// Five-part search blob: lowercased title, lowercased content, spaced full
-/// pinyin, compact full pinyin and initials. Pinyin comes from the title only.
-pub(crate) fn build_search_blob(title: &str, content: &str) -> String {
+/// Six-part search blob: lowercased title, lowercased content, lowercased
+/// tags, spaced full pinyin, compact full pinyin and initials. Pinyin comes
+/// from the title only.
+pub(crate) fn build_search_blob(title: &str, content: &str, tags: &[String]) -> String {
     let (full, compact, initials) = pinyin_keys(title);
     format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
         title.to_lowercase(),
         content.to_lowercase(),
+        tags.join(" ").to_lowercase(),
         full,
         compact,
         initials
@@ -426,6 +430,32 @@ pub fn record_use(id: &str, status: &str) {
 const TITLE_MAX_UNITS: usize = 80;
 const CONTENT_MAX_UNITS: usize = 10_000;
 const CATEGORY_NAME_MAX_UNITS: usize = 40;
+const TAGS_MAX: usize = 10;
+const TAG_MAX_UNITS: usize = 24;
+
+fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            continue;
+        }
+        if tag.encode_utf16().count() > TAG_MAX_UNITS {
+            return Err("tag_too_long".to_string());
+        }
+        if tag.contains([',', '，']) {
+            return Err("tag_delimiter".to_string());
+        }
+        if seen.insert(tag.to_lowercase()) {
+            result.push(tag.to_string());
+        }
+    }
+    if result.len() > TAGS_MAX {
+        return Err("too_many_tags".to_string());
+    }
+    Ok(result)
+}
 
 fn validate_text(title: &str, content: &str) -> Result<(String, String), String> {
     let title = title.trim().to_string();
@@ -487,6 +517,7 @@ fn validate_import(mut data: DataFile) -> Result<DataFile, String> {
         let (title, content) = validate_text(&snippet.title, &snippet.content)?;
         snippet.title = title;
         snippet.content = content;
+        snippet.tags = validate_tags(&snippet.tags).map_err(|_| "import_tags".to_string())?;
         if let Some(category_id) = snippet.category_id.as_deref() {
             if !category_ids.contains(category_id) {
                 return Err("import_category_missing".to_string());
@@ -643,6 +674,7 @@ impl Store {
         }
     }
 
+    #[allow(dead_code)] // convenience wrapper for tag-less callers/tests
     pub fn add_snippet(
         &mut self,
         title: &str,
@@ -650,10 +682,22 @@ impl Store {
         category_id: Option<&str>,
         pinned: bool,
     ) -> Result<String, String> {
+        self.add_snippet_tagged(title, content, category_id, pinned, &[])
+    }
+
+    pub fn add_snippet_tagged(
+        &mut self,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+        tags: &[String],
+    ) -> Result<String, String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
         let (title, content) = validate_text(title, content)?;
+        let tags = validate_tags(tags)?;
         self.check_category(category_id)?;
         self.check_duplicate(&title, None)?;
 
@@ -672,6 +716,7 @@ impl Store {
             last_used_at: None,
             last_insert_status: None,
             deleted_at: None,
+            tags,
             search_blob: String::new(),
         };
         snippet.rebuild_blob();
@@ -685,6 +730,7 @@ impl Store {
         }
     }
 
+    #[allow(dead_code)] // convenience wrapper for tag-less callers/tests
     pub fn update_snippet(
         &mut self,
         id: &str,
@@ -693,10 +739,23 @@ impl Store {
         category_id: Option<&str>,
         pinned: bool,
     ) -> Result<(), String> {
+        self.update_snippet_tagged(id, title, content, category_id, pinned, &[])
+    }
+
+    pub fn update_snippet_tagged(
+        &mut self,
+        id: &str,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+        tags: &[String],
+    ) -> Result<(), String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
         let (title, content) = validate_text(title, content)?;
+        let tags = validate_tags(tags)?;
         self.check_category(category_id)?;
         self.check_duplicate(&title, Some(id))?;
 
@@ -711,6 +770,7 @@ impl Store {
             snippet.content = content;
             snippet.category_id = category_id.map(|value| value.to_string());
             snippet.pinned = pinned;
+            snippet.tags = tags;
             snippet.updated_at = now;
             snippet.rebuild_blob();
         }
@@ -1461,6 +1521,7 @@ fn snippet(
         last_used_at: None,
         last_insert_status: None,
         deleted_at: None,
+        tags: Vec::new(),
         search_blob: String::new(),
     }
 }
@@ -1883,6 +1944,85 @@ mod tests {
         assert!(!reloaded.is_read_only());
         assert_eq!(reloaded.settings().insertion_mode, "unicode");
         assert_eq!(reloaded.settings().panel_sort, "recent");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tags_are_normalized_and_searchable() {
+        let dir = temp_dir("tags");
+        let mut store = Store::load_from(&dir);
+        let tags = vec![
+            " 退款 ".to_string(),
+            "客服".to_string(),
+            "support".to_string(),
+            "退款".to_string(),
+        ];
+        store
+            .add_snippet_tagged("退款说明", "请按流程处理", None, false, &tags)
+            .expect("tagged snippet");
+        let snippets = store.snippets();
+        let snippet = snippets
+            .iter()
+            .find(|snippet| snippet.title == "退款说明")
+            .expect("stored snippet");
+        assert_eq!(snippet.tags, vec!["退款", "客服", "support"]);
+        let docs = vec![crate::search::Doc {
+            id: &snippet.id,
+            title: &snippet.title,
+            content: &snippet.content,
+            blob: &snippet.search_blob,
+            pinned: false,
+            last_used_at: None,
+            updated_at: &snippet.updated_at,
+            sort_order: snippet.sort_order,
+        }];
+        let tag_hits = crate::search::rank(&docs, "客服", 10);
+        assert_eq!(tag_hits.len(), 1);
+        assert_eq!(tag_hits[0].score, 85);
+        assert_eq!(crate::search::rank(&docs, "support", 10)[0].score, 85);
+        assert_eq!(crate::search::rank(&docs, "tui", 10)[0].score, 90);
+        assert_eq!(crate::search::rank(&docs, "流程", 10)[0].score, 100);
+        assert_eq!(
+            store.add_snippet_tagged("超长标签", "正文", None, false, &["x".repeat(25)]),
+            Err("tag_too_long".to_string())
+        );
+        assert_eq!(
+            store.add_snippet_tagged("逗号标签", "正文", None, false, &["a,b".to_string()]),
+            Err("tag_delimiter".to_string())
+        );
+        let mut imported = store.data().clone();
+        imported.snippets[0].tags = vec!["a,b".to_string()];
+        assert_eq!(
+            store.import_bytes(&serde_json::to_vec(&imported).unwrap(), ImportMode::Replace),
+            Err("import_tags".to_string())
+        );
+        let too_many: Vec<String> = (0..11).map(|index| format!("t{index}")).collect();
+        assert_eq!(
+            store.add_snippet_tagged("过多标签", "正文", None, false, &too_many),
+            Err("too_many_tags".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_data_without_tags_loads_with_empty_tags() {
+        let dir = temp_dir("oldtags");
+        let mut store = Store::load_from(&dir);
+        store
+            .add_snippet_tagged("旧格式", "正文", None, false, &["tag".to_string()])
+            .expect("snippet");
+        let path = dir.join(DATA_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for snippet in value["snippets"].as_array_mut().unwrap() {
+            snippet.as_object_mut().unwrap().remove("tags");
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = Store::load_from(&dir);
+        assert!(reloaded
+            .snippets()
+            .iter()
+            .all(|snippet| snippet.tags.is_empty()));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2548,7 +2688,13 @@ mod tests {
         let mut store = Store::load_from(&dir);
         let category = store.add_category("导入测试分类").expect("category");
         store
-            .add_snippet("导入测试短语", "导入正文\n第二行", Some(&category), true)
+            .add_snippet_tagged(
+                "导入测试短语",
+                "导入正文\n第二行",
+                Some(&category),
+                true,
+                &["support".to_string(), "refund".to_string()],
+            )
             .expect("snippet");
         let json = store.export_json().expect("export");
         assert!(json.contains("导入测试短语"));
@@ -2573,7 +2719,9 @@ mod tests {
             .snippets()
             .iter()
             .find(|snippet| snippet.title == "导入测试短语")
-            .is_some_and(|snippet| snippet.pinned));
+            .is_some_and(|snippet| {
+                snippet.pinned && snippet.tags == vec!["support".to_string(), "refund".to_string()]
+            }));
 
         let invalid = br#"{"schemaVersion":99,"revision":0,"categories":[],"snippets":[]}"#;
         assert_eq!(

@@ -1,9 +1,9 @@
 //! Snippet retrieval (M1-2): blob match, D16 scoring and ordering.
 //!
 //! Score: title exact 400, title prefix 300, title contains 200,
-//! body contains 100, title-pinyin blob-only 90 (no highlight). Ties break
-//! by pinned, lastUsedAt, updatedAt, sortOrder, id. At most `limit` hits are
-//! returned.
+//! body contains 100, title-pinyin blob-only 90, tag-only 85 (no highlight).
+//! Ties break by pinned, lastUsedAt, updatedAt, sortOrder, id. At most
+//! `limit` hits are returned.
 
 use std::time::Instant;
 
@@ -45,7 +45,7 @@ pub struct Hit {
 }
 
 pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
-    let allow_pinyin = !query.contains(['\n', '\r']);
+    let allow_blob_fallback = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
     let mut scored: Vec<(u32, usize)> = Vec::new();
 
@@ -68,16 +68,28 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
             200
         } else if doc.content.to_lowercase().contains(&needle) {
             100
-        } else if allow_pinyin
-            && needle.chars().count() >= 2
-            && needle
-                .chars()
-                .all(|ch| ch.is_ascii_alphabetic() || ch == ' ')
-        {
-            // Blob-only matches come from the pinyin keys; rank them below
+        } else if allow_blob_fallback && needle.chars().count() >= 2 {
+            // Blob-only matches come from pinyin keys or tags. Rank them below
             // literal title/content hits and skip highlighting. A single
-            // letter would match too many initials, so keep the old behavior.
-            90
+            // character would match too many initials/tags.
+            let pinyin_hit = allow_blob_fallback
+                && needle
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphabetic() || ch == ' ')
+                && {
+                    let mut tail = doc.blob.rsplit('\n');
+                    let initials = tail.next().unwrap_or("");
+                    let compact = tail.next().unwrap_or("");
+                    let full = tail.next().unwrap_or("");
+                    full.contains(&needle)
+                        || compact.contains(&needle)
+                        || initials.contains(&needle)
+                };
+            if pinyin_hit {
+                90
+            } else {
+                85
+            }
         } else {
             continue;
         };
@@ -172,7 +184,7 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
     let blobs: Vec<String> = titles
         .iter()
         .zip(&contents)
-        .map(|(title, content)| crate::storage::build_search_blob(title, content))
+        .map(|(title, content)| crate::storage::build_search_blob(title, content, &[]))
         .collect();
 
     let patterns = [
@@ -447,8 +459,8 @@ mod tests {
     fn pinyin_match_ranks_below_literal_content() {
         let pinyin_title = "退款说明";
         let literal_title = "其他";
-        let pinyin_blob = build_search_blob(pinyin_title, "");
-        let literal_blob = build_search_blob(literal_title, "tk");
+        let pinyin_blob = build_search_blob(pinyin_title, "", &[]);
+        let literal_blob = build_search_blob(literal_title, "tk", &[]);
         let docs = vec![
             Doc {
                 id: "pinyin",

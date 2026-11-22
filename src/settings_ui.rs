@@ -2573,6 +2573,7 @@ fn data_error_text(code: &str) -> &'static str {
         "import_category_id" | "import_category_name" | "import_category_missing" => {
             "导入分类数据无效"
         }
+        "import_tags" => "导入标签不合规（不能含逗号、单个不超 24 字、最多 10 个）",
         "import_snippet_id" => "导入短语 ID 无效",
         "duplicate_title" => "导入数据包含重复标题",
         "title_empty" | "title_too_long" | "content_empty" | "content_too_long" => {

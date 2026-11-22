@@ -36,6 +36,7 @@ const ID_CATEGORY: i32 = 207;
 const ID_PINNED: i32 = 208;
 const ID_SAVE: i32 = 209;
 const ID_CANCEL: i32 = 210;
+const ID_TAGS: i32 = 211;
 const ID_CAT_NAME: i32 = 212;
 const ID_CAT_ADD: i32 = 213;
 const ID_CAT_DELETE: i32 = 214;
@@ -102,6 +103,8 @@ struct Layout {
     title_shell: RECT,
     content_label: RECT,
     content_shell: RECT,
+    tags_label: RECT,
+    tags_shell: RECT,
     meta_cat_label: RECT,
     meta_pin_label: RECT,
     pin_card: RECT,
@@ -123,6 +126,7 @@ struct Manage {
     restore_button: HWND,
     title_edit: HWND,
     content_edit: HWND,
+    tags_edit: HWND,
     category: HWND,
     pinned: HWND,
     save_button: HWND,
@@ -161,6 +165,14 @@ fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
 }
 
+fn parse_tags(text: &str) -> Vec<String> {
+    text.split([',', '，'])
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 fn wide_text(control: HWND) -> String {
     let length = unsafe { GetWindowTextLengthW(control) };
     if length <= 0 {
@@ -196,6 +208,9 @@ fn error_text(code: &str) -> &'static str {
         "category_empty" => "分类名不能为空",
         "category_too_long" => "分类名不能超过 40 个字符",
         "category_duplicate" => "已存在同名分类",
+        "tag_too_long" => "单个标签不能超过 24 个字符",
+        "too_many_tags" => "标签最多 10 个",
+        "tag_delimiter" => "标签不能包含逗号",
         "read_only" => "存储为只读，无法保存",
         "snippet_missing" => "短语不存在",
         _ => "操作失败",
@@ -411,6 +426,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
     unsafe {
         let _ = EnableWindow(manage.title_edit, true);
         let _ = EnableWindow(manage.content_edit, true);
+        let _ = EnableWindow(manage.tags_edit, true);
         let _ = ShowWindow(manage.content_edit, SW_SHOW);
     }
     manage.error_field = None;
@@ -424,6 +440,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
         Some(snippet) => {
             set_text(manage.title_edit, &snippet.title);
             set_text(manage.content_edit, &snippet.content);
+            set_text(manage.tags_edit, &snippet.tags.join(", "));
             let index = data
                 .as_ref()
                 .and_then(|data| {
@@ -471,6 +488,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
         None => {
             set_text(manage.title_edit, "");
             set_text(manage.content_edit, "");
+            set_text(manage.tags_edit, "");
             let default_cat = match &manage.view {
                 View::Category(cat_id) => data
                     .as_ref()
@@ -535,14 +553,15 @@ fn current_category(manage: &Manage) -> Option<String> {
 fn save_editor(manage: &mut Manage) {
     let title = wide_text(manage.title_edit);
     let content = wide_text(manage.content_edit);
+    let tags = parse_tags(&wide_text(manage.tags_edit));
     let category = manage.draft_category.clone();
     let pinned = manage.pinned_state;
 
     let result = storage::with_store(|store| match &manage.editing {
         Some(id) => store
-            .update_snippet(id, &title, &content, category.as_deref(), pinned)
+            .update_snippet_tagged(id, &title, &content, category.as_deref(), pinned, &tags)
             .map(|_| id.clone()),
-        None => store.add_snippet(&title, &content, category.as_deref(), pinned),
+        None => store.add_snippet_tagged(&title, &content, category.as_deref(), pinned, &tags),
     });
 
     match result {
@@ -563,6 +582,7 @@ fn save_editor(manage: &mut Manage) {
             manage.error_field = match code.as_str() {
                 "title_empty" | "title_too_long" | "duplicate_title" => Some(ID_TITLE),
                 "content_empty" | "content_too_long" => Some(ID_CONTENT),
+                "tag_too_long" | "too_many_tags" | "tag_delimiter" => Some(ID_TAGS),
                 "category_missing" => Some(ID_CATEGORY),
                 _ => None,
             };
@@ -1173,7 +1193,20 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         );
     }
 
-    // Metadata row anchored above footer
+    // Tags row above metadata, metadata anchored above footer
+    let tags_h = scaled(32, dpi);
+    let tags_label = RECT {
+        left: rl,
+        top: footer.top - scaled(18, dpi) - scaled(38, dpi) - scaled(22, dpi) - scaled(58, dpi),
+        right: rr,
+        bottom: footer.top - scaled(18, dpi) - scaled(38, dpi) - scaled(22, dpi) - scaled(38, dpi),
+    };
+    let tags_shell = RECT {
+        left: rl,
+        top: tags_label.bottom + scaled(4, dpi),
+        right: rr,
+        bottom: tags_label.bottom + scaled(4, dpi) + tags_h,
+    };
     let meta_h = scaled(38, dpi);
     let meta_top = footer.top - scaled(18, dpi) - meta_h;
     let meta_label_top = meta_top - scaled(22, dpi);
@@ -1224,6 +1257,15 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
             (pin_switch.bottom - pin_switch.top).max(1),
             true,
         );
+        let tpad = scaled(10, dpi);
+        let _ = MoveWindow(
+            manage.tags_edit,
+            tags_shell.left + tpad,
+            tags_shell.top + scaled(5, dpi),
+            (tags_shell.right - tags_shell.left - tpad * 2).max(1),
+            (tags_shell.bottom - tags_shell.top - scaled(10, dpi)).max(1),
+            true,
+        );
     }
 
     // Content field fills space between title and metadata
@@ -1237,7 +1279,7 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         left: rl,
         top: content_label.bottom + scaled(6, dpi),
         right: rr,
-        bottom: (meta_label_top - scaled(14, dpi)).max(content_label.bottom + scaled(60, dpi)),
+        bottom: (tags_label.top - scaled(10, dpi)).max(content_label.bottom + scaled(60, dpi)),
     };
     let cpad_x = scaled(12, dpi);
     let cpad_y = scaled(10, dpi);
@@ -1265,6 +1307,8 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         title_shell,
         content_label,
         content_shell,
+        tags_label,
+        tags_shell,
         meta_cat_label,
         meta_pin_label,
         pin_card,
@@ -1620,6 +1664,38 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
             },
         );
 
+        c.draw_text(
+            "标签（逗号分隔）",
+            &l.tags_label,
+            TextStyle::Label,
+            dpi,
+            if manage.error_field == Some(ID_TAGS) {
+                palette.danger
+            } else {
+                palette.secondary
+            },
+            AlignH::Left,
+            AlignV::Center,
+        );
+        let tags_focus = focus == manage.tags_edit;
+        c.fill_stroke_round(
+            &l.tags_shell,
+            d2d::scaled_f(10.0, dpi),
+            palette.field,
+            if manage.error_field == Some(ID_TAGS) {
+                palette.error
+            } else if tags_focus {
+                palette.primary
+            } else {
+                palette.border
+            },
+            if manage.error_field == Some(ID_TAGS) || tags_focus {
+                d2d::scaled_f(1.5, dpi)
+            } else {
+                1.0
+            },
+        );
+
         // 8. Metadata Labels + Tactile Pin Switch Card
         c.draw_text(
             "所属分类",
@@ -1928,6 +2004,14 @@ fn create(owner: HWND) -> Option<Manage> {
         ID_CONTENT,
         instance,
     );
+    let tags_edit = create_control(
+        w!("EDIT"),
+        "",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        hwnd,
+        ID_TAGS,
+        instance,
+    );
     let category = create_control(
         w!("COMBOBOX"),
         "",
@@ -1983,6 +2067,7 @@ fn create(owner: HWND) -> Option<Manage> {
         search,
         title_edit,
         content_edit,
+        tags_edit,
     ] {
         ui::theme_control(control, palette.dark);
     }
@@ -1992,10 +2077,11 @@ fn create(owner: HWND) -> Option<Manage> {
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
     ui::install_smooth_edit(content_edit);
     ui::theme_scrollbar(content_edit, palette.dark);
-    ui::cue_banner(search, "搜索标题、正文或拼音…");
+    ui::cue_banner(search, "搜索标题、正文、标签或拼音…");
     ui::cue_banner(title_edit, "例如：项目进度回复、会议纪要模板…");
     ui::cue_banner(cat_name, "新分类名称…");
     ui::cue_banner(content_edit, "在此输入短语正文，支持多行文本…");
+    ui::cue_banner(tags_edit, "多个标签用逗号分隔，如：退款, 客服");
 
     unsafe {
         let _ = SendMessageW(left, LB_SETITEMHEIGHT, 0, scaled(36, dpi) as isize);
@@ -2022,6 +2108,7 @@ fn create(owner: HWND) -> Option<Manage> {
         restore_button,
         title_edit,
         content_edit,
+        tags_edit,
         category,
         pinned,
         save_button,
@@ -2061,6 +2148,7 @@ fn create(owner: HWND) -> Option<Manage> {
         delete_button,
         restore_button,
         content_edit,
+        tags_edit,
         category,
         pinned,
         save_button,
@@ -2152,6 +2240,7 @@ pub fn show(owner: HWND) {
                 manage.search,
                 manage.title_edit,
                 manage.content_edit,
+                manage.tags_edit,
             ] {
                 ui::theme_control(control, palette.dark);
             }
@@ -2361,6 +2450,7 @@ unsafe extern "system" fn window_proc(
                             manage.delete_button,
                             manage.restore_button,
                             manage.content_edit,
+                            manage.tags_edit,
                             manage.category,
                             manage.pinned,
                             manage.save_button,
@@ -2486,6 +2576,8 @@ unsafe extern "system" fn window_proc(
                             let _ = SetFocus(Some(manage.title_edit));
                         } else if point_in(&manage.layout.content_shell, x, y) {
                             let _ = SetFocus(Some(manage.content_edit));
+                        } else if point_in(&manage.layout.tags_shell, x, y) {
+                            let _ = SetFocus(Some(manage.tags_edit));
                         } else if point_in(&manage.layout.cat_input_shell, x, y) {
                             let _ = SetFocus(Some(manage.cat_name));
                         }
@@ -2505,7 +2597,7 @@ unsafe extern "system" fn window_proc(
                     return;
                 };
                 match id as i32 {
-                    ID_SEARCH | ID_TITLE | ID_CONTENT | ID_CAT_NAME
+                    ID_SEARCH | ID_TITLE | ID_CONTENT | ID_TAGS | ID_CAT_NAME
                         if notification == EN_SETFOCUS || notification == EN_KILLFOCUS =>
                     {
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2675,7 +2767,7 @@ unsafe extern "system" fn window_proc(
                         load_editor(manage, id.as_deref());
                         status_message(manage, "已重置修改");
                     }
-                    ID_TITLE | ID_CONTENT if notification == EN_CHANGE => {
+                    ID_TITLE | ID_CONTENT | ID_TAGS if notification == EN_CHANGE => {
                         if manage.error_field == Some(id as i32) {
                             manage.error_field = None;
                             manage.error_message = None;
@@ -2841,6 +2933,7 @@ unsafe extern "system" fn window_proc(
                             unsafe {
                                 let _ = EnableWindow(manage.title_edit, true);
                                 let _ = EnableWindow(manage.content_edit, true);
+                                let _ = EnableWindow(manage.tags_edit, true);
                                 let _ = InvalidateRect(Some(manage.content_edit), None, true);
                             }
                         }
