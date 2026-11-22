@@ -10,7 +10,9 @@ use windows::Win32::Graphics::Gdi::{
     SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE};
+use windows::Win32::UI::Controls::{
+    DRAWITEMSTRUCT, EM_SETLIMITTEXT, ODS_FOCUS, ODS_SELECTED, WM_MOUSELEAVE,
+};
 use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
@@ -41,6 +43,7 @@ const ID_CAT_NAME: i32 = 212;
 const ID_CAT_ADD: i32 = 213;
 const ID_CAT_DELETE: i32 = 214;
 const ID_RESTORE: i32 = 215;
+const ID_HOTKEY: i32 = 216;
 
 const MIN_WIDTH: i32 = 800;
 const MIN_HEIGHT: i32 = 540;
@@ -105,6 +108,8 @@ struct Layout {
     content_shell: RECT,
     tags_label: RECT,
     tags_shell: RECT,
+    hotkey_label: RECT,
+    hotkey_shell: RECT,
     meta_cat_label: RECT,
     meta_pin_label: RECT,
     pin_card: RECT,
@@ -127,6 +132,7 @@ struct Manage {
     title_edit: HWND,
     content_edit: HWND,
     tags_edit: HWND,
+    hotkey_edit: HWND,
     category: HWND,
     pinned: HWND,
     save_button: HWND,
@@ -211,6 +217,9 @@ fn error_text(code: &str) -> &'static str {
         "tag_too_long" => "单个标签不能超过 24 个字符",
         "too_many_tags" => "标签最多 10 个",
         "tag_delimiter" => "标签不能包含逗号",
+        "hotkey_invalid" => "快捷键格式无效，例如 Ctrl+Alt+1",
+        "hotkey_duplicate" => "该快捷键已被其他短语使用",
+        "hotkey_panel_conflict" => "与全局唤起快捷键冲突",
         "read_only" => "存储为只读，无法保存",
         "snippet_missing" => "短语不存在",
         _ => "操作失败",
@@ -427,6 +436,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
         let _ = EnableWindow(manage.title_edit, true);
         let _ = EnableWindow(manage.content_edit, true);
         let _ = EnableWindow(manage.tags_edit, true);
+        let _ = EnableWindow(manage.hotkey_edit, true);
         let _ = ShowWindow(manage.content_edit, SW_SHOW);
     }
     manage.error_field = None;
@@ -441,6 +451,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
             set_text(manage.title_edit, &snippet.title);
             set_text(manage.content_edit, &snippet.content);
             set_text(manage.tags_edit, &snippet.tags.join(", "));
+            set_text(manage.hotkey_edit, snippet.hotkey.as_deref().unwrap_or(""));
             let index = data
                 .as_ref()
                 .and_then(|data| {
@@ -489,6 +500,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
             set_text(manage.title_edit, "");
             set_text(manage.content_edit, "");
             set_text(manage.tags_edit, "");
+            set_text(manage.hotkey_edit, "");
             let default_cat = match &manage.view {
                 View::Category(cat_id) => data
                     .as_ref()
@@ -556,12 +568,98 @@ fn save_editor(manage: &mut Manage) {
     let tags = parse_tags(&wide_text(manage.tags_edit));
     let category = manage.draft_category.clone();
     let pinned = manage.pinned_state;
+    let hotkey_text = wide_text(manage.hotkey_edit);
+    let hotkey = match storage::validate_hotkey(&hotkey_text) {
+        Ok(hotkey) => hotkey,
+        Err(code) => {
+            let message = error_text(&code);
+            manage.error_field = Some(ID_HOTKEY);
+            manage.error_message = Some(message.to_string());
+            status_message(manage, message);
+            unsafe {
+                let _ = InvalidateRect(Some(manage.hwnd), None, false);
+            }
+            return;
+        }
+    };
+
+    if let Some(candidate) = hotkey.as_deref() {
+        let parsed = crate::hotkey::parse(candidate);
+        if let Some(panel) =
+            storage::settings_clone().and_then(|settings| crate::hotkey::parse(&settings.hotkey))
+        {
+            if parsed == Some(panel) {
+                let message = "与全局唤起快捷键冲突";
+                manage.error_field = Some(ID_HOTKEY);
+                manage.error_message = Some(message.to_string());
+                status_message(manage, message);
+                unsafe {
+                    let _ = InvalidateRect(Some(manage.hwnd), None, false);
+                }
+                return;
+            }
+        }
+        let editing = manage.editing.clone();
+        let duplicate = storage::data_clone()
+            .map(|data| {
+                data.snippets.iter().any(|snippet| {
+                    Some(snippet.id.as_str()) != editing.as_deref()
+                        && snippet.hotkey.as_deref() == Some(candidate)
+                })
+            })
+            .unwrap_or(false);
+        if duplicate {
+            let message = "该快捷键已被其他短语使用";
+            manage.error_field = Some(ID_HOTKEY);
+            manage.error_message = Some(message.to_string());
+            status_message(manage, message);
+            unsafe {
+                let _ = InvalidateRect(Some(manage.hwnd), None, false);
+            }
+            return;
+        }
+        let stored = editing
+            .as_deref()
+            .and_then(|id| {
+                storage::with_store(|store| {
+                    store.get(id).and_then(|snippet| snippet.hotkey.clone())
+                })
+            })
+            .flatten();
+        if stored.as_deref() != Some(candidate)
+            && !crate::hotkey::is_available(manage.hwnd, candidate)
+        {
+            let message = "该快捷键已被其他程序占用";
+            manage.error_field = Some(ID_HOTKEY);
+            manage.error_message = Some(message.to_string());
+            status_message(manage, message);
+            unsafe {
+                let _ = InvalidateRect(Some(manage.hwnd), None, false);
+            }
+            return;
+        }
+    }
 
     let result = storage::with_store(|store| match &manage.editing {
         Some(id) => store
-            .update_snippet_tagged(id, &title, &content, category.as_deref(), pinned, &tags)
+            .update_snippet_full(
+                id,
+                &title,
+                &content,
+                category.as_deref(),
+                pinned,
+                &tags,
+                hotkey.as_deref(),
+            )
             .map(|_| id.clone()),
-        None => store.add_snippet_tagged(&title, &content, category.as_deref(), pinned, &tags),
+        None => store.add_snippet_full(
+            &title,
+            &content,
+            category.as_deref(),
+            pinned,
+            &tags,
+            hotkey.as_deref(),
+        ),
     });
 
     match result {
@@ -575,6 +673,7 @@ fn save_editor(manage: &mut Manage) {
             reload_categories(manage);
             reload_list(manage);
             load_editor(manage, Some(&id));
+            crate::app::refresh_snippet_hotkeys();
             status_message(manage, "已原子写入本地存储");
         }
         Some(Err(code)) => {
@@ -583,6 +682,7 @@ fn save_editor(manage: &mut Manage) {
                 "title_empty" | "title_too_long" | "duplicate_title" => Some(ID_TITLE),
                 "content_empty" | "content_too_long" => Some(ID_CONTENT),
                 "tag_too_long" | "too_many_tags" | "tag_delimiter" => Some(ID_TAGS),
+                "hotkey_invalid" | "hotkey_duplicate" | "hotkey_panel_conflict" => Some(ID_HOTKEY),
                 "category_missing" => Some(ID_CATEGORY),
                 _ => None,
             };
@@ -634,6 +734,7 @@ fn delete_selected(manage: &mut Manage) {
             manage.dirty = false;
             reload_left(manage);
             reload_list(manage);
+            crate::app::refresh_snippet_hotkeys();
             let next_id = manage.phrase_rows.first().map(|r| r.id.clone());
             load_editor(manage, next_id.as_deref());
             status_message(
@@ -1193,19 +1294,36 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         );
     }
 
-    // Tags row above metadata, metadata anchored above footer
+    // Tags and per-snippet hotkey share one row above metadata.
     let tags_h = scaled(32, dpi);
+    let row_gap = scaled(14, dpi);
+    let tags_w = (((rw - row_gap) * 60 / 100).max(scaled(120, dpi)))
+        .min((rw - row_gap - scaled(96, dpi)).max(scaled(120, dpi)));
+    let tags_right = rl + tags_w;
     let tags_label = RECT {
         left: rl,
         top: footer.top - scaled(18, dpi) - scaled(38, dpi) - scaled(22, dpi) - scaled(58, dpi),
-        right: rr,
+        right: tags_right,
         bottom: footer.top - scaled(18, dpi) - scaled(38, dpi) - scaled(22, dpi) - scaled(38, dpi),
     };
     let tags_shell = RECT {
         left: rl,
         top: tags_label.bottom + scaled(4, dpi),
-        right: rr,
+        right: tags_right,
         bottom: tags_label.bottom + scaled(4, dpi) + tags_h,
+    };
+    let hotkey_left = tags_right + row_gap;
+    let hotkey_label = RECT {
+        left: hotkey_left,
+        top: tags_label.top,
+        right: rr,
+        bottom: tags_label.bottom,
+    };
+    let hotkey_shell = RECT {
+        left: hotkey_left,
+        top: tags_shell.top,
+        right: rr,
+        bottom: tags_shell.bottom,
     };
     let meta_h = scaled(38, dpi);
     let meta_top = footer.top - scaled(18, dpi) - meta_h;
@@ -1266,6 +1384,14 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
             (tags_shell.bottom - tags_shell.top - scaled(10, dpi)).max(1),
             true,
         );
+        let _ = MoveWindow(
+            manage.hotkey_edit,
+            hotkey_shell.left + tpad,
+            hotkey_shell.top + scaled(5, dpi),
+            (hotkey_shell.right - hotkey_shell.left - tpad * 2).max(1),
+            (hotkey_shell.bottom - hotkey_shell.top - scaled(10, dpi)).max(1),
+            true,
+        );
     }
 
     // Content field fills space between title and metadata
@@ -1309,6 +1435,8 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         content_shell,
         tags_label,
         tags_shell,
+        hotkey_label,
+        hotkey_shell,
         meta_cat_label,
         meta_pin_label,
         pin_card,
@@ -1665,7 +1793,7 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
         );
 
         c.draw_text(
-            "标签（逗号分隔）",
+            "标签",
             &l.tags_label,
             TextStyle::Label,
             dpi,
@@ -1690,6 +1818,37 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
                 palette.border
             },
             if manage.error_field == Some(ID_TAGS) || tags_focus {
+                d2d::scaled_f(1.5, dpi)
+            } else {
+                1.0
+            },
+        );
+        c.draw_text(
+            "专属快捷键",
+            &l.hotkey_label,
+            TextStyle::Label,
+            dpi,
+            if manage.error_field == Some(ID_HOTKEY) {
+                palette.danger
+            } else {
+                palette.secondary
+            },
+            AlignH::Left,
+            AlignV::Center,
+        );
+        let hotkey_focus = focus == manage.hotkey_edit;
+        c.fill_stroke_round(
+            &l.hotkey_shell,
+            d2d::scaled_f(10.0, dpi),
+            palette.field,
+            if manage.error_field == Some(ID_HOTKEY) {
+                palette.error
+            } else if hotkey_focus {
+                palette.primary
+            } else {
+                palette.border
+            },
+            if manage.error_field == Some(ID_HOTKEY) || hotkey_focus {
                 d2d::scaled_f(1.5, dpi)
             } else {
                 1.0
@@ -2012,6 +2171,14 @@ fn create(owner: HWND) -> Option<Manage> {
         ID_TAGS,
         instance,
     );
+    let hotkey_edit = create_control(
+        w!("EDIT"),
+        "",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
+        hwnd,
+        ID_HOTKEY,
+        instance,
+    );
     let category = create_control(
         w!("COMBOBOX"),
         "",
@@ -2068,6 +2235,7 @@ fn create(owner: HWND) -> Option<Manage> {
         title_edit,
         content_edit,
         tags_edit,
+        hotkey_edit,
     ] {
         ui::theme_control(control, palette.dark);
     }
@@ -2082,6 +2250,10 @@ fn create(owner: HWND) -> Option<Manage> {
     ui::cue_banner(cat_name, "新分类名称…");
     ui::cue_banner(content_edit, "在此输入短语正文，支持多行文本…");
     ui::cue_banner(tags_edit, "多个标签用逗号分隔，如：退款, 客服");
+    ui::cue_banner(hotkey_edit, "如 Ctrl+Alt+1");
+    unsafe {
+        let _ = SendMessageW(hotkey_edit, EM_SETLIMITTEXT, 64, 0);
+    }
 
     unsafe {
         let _ = SendMessageW(left, LB_SETITEMHEIGHT, 0, scaled(36, dpi) as isize);
@@ -2109,6 +2281,7 @@ fn create(owner: HWND) -> Option<Manage> {
         title_edit,
         content_edit,
         tags_edit,
+        hotkey_edit,
         category,
         pinned,
         save_button,
@@ -2149,6 +2322,7 @@ fn create(owner: HWND) -> Option<Manage> {
         restore_button,
         content_edit,
         tags_edit,
+        hotkey_edit,
         category,
         pinned,
         save_button,
@@ -2241,6 +2415,7 @@ pub fn show(owner: HWND) {
                 manage.title_edit,
                 manage.content_edit,
                 manage.tags_edit,
+                manage.hotkey_edit,
             ] {
                 ui::theme_control(control, palette.dark);
             }
@@ -2451,6 +2626,7 @@ unsafe extern "system" fn window_proc(
                             manage.restore_button,
                             manage.content_edit,
                             manage.tags_edit,
+                            manage.hotkey_edit,
                             manage.category,
                             manage.pinned,
                             manage.save_button,
@@ -2578,6 +2754,8 @@ unsafe extern "system" fn window_proc(
                             let _ = SetFocus(Some(manage.content_edit));
                         } else if point_in(&manage.layout.tags_shell, x, y) {
                             let _ = SetFocus(Some(manage.tags_edit));
+                        } else if point_in(&manage.layout.hotkey_shell, x, y) {
+                            let _ = SetFocus(Some(manage.hotkey_edit));
                         } else if point_in(&manage.layout.cat_input_shell, x, y) {
                             let _ = SetFocus(Some(manage.cat_name));
                         }
@@ -2597,7 +2775,7 @@ unsafe extern "system" fn window_proc(
                     return;
                 };
                 match id as i32 {
-                    ID_SEARCH | ID_TITLE | ID_CONTENT | ID_TAGS | ID_CAT_NAME
+                    ID_SEARCH | ID_TITLE | ID_CONTENT | ID_TAGS | ID_HOTKEY | ID_CAT_NAME
                         if notification == EN_SETFOCUS || notification == EN_KILLFOCUS =>
                     {
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -2747,6 +2925,7 @@ unsafe extern "system" fn window_proc(
                             Some(Ok(())) => {
                                 reload_left(manage);
                                 reload_list(manage);
+                                crate::app::refresh_snippet_hotkeys();
                                 let first = manage.phrase_rows.first().map(|r| r.id.clone());
                                 load_editor(manage, first.as_deref());
                                 status_message(manage, "已恢复短语");
@@ -2767,7 +2946,7 @@ unsafe extern "system" fn window_proc(
                         load_editor(manage, id.as_deref());
                         status_message(manage, "已重置修改");
                     }
-                    ID_TITLE | ID_CONTENT | ID_TAGS if notification == EN_CHANGE => {
+                    ID_TITLE | ID_CONTENT | ID_TAGS | ID_HOTKEY if notification == EN_CHANGE => {
                         if manage.error_field == Some(id as i32) {
                             manage.error_field = None;
                             manage.error_message = None;
@@ -2934,6 +3113,7 @@ unsafe extern "system" fn window_proc(
                                 let _ = EnableWindow(manage.title_edit, true);
                                 let _ = EnableWindow(manage.content_edit, true);
                                 let _ = EnableWindow(manage.tags_edit, true);
+                                let _ = EnableWindow(manage.hotkey_edit, true);
                                 let _ = InvalidateRect(Some(manage.content_edit), None, true);
                             }
                         }

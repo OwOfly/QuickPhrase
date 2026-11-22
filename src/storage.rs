@@ -58,6 +58,9 @@ pub struct Snippet {
     pub deleted_at: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Optional per-snippet global hotkey, normalized to `Ctrl+Alt+1` form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotkey: Option<String>,
     #[serde(default, skip_serializing)]
     pub search_blob: String,
 }
@@ -283,6 +286,50 @@ pub fn panel_items() -> Vec<PanelRow> {
     .unwrap_or_default()
 }
 
+/// Active snippets that carry a hotkey, in data order. Used by the app to
+/// rebuild global registrations after data changes.
+pub fn hotkey_bindings() -> Vec<(String, String)> {
+    with_store(|store| {
+        store
+            .snippets()
+            .into_iter()
+            .filter(|snippet| snippet.deleted_at.is_none())
+            .filter_map(|snippet| {
+                snippet
+                    .hotkey
+                    .clone()
+                    .map(|hotkey| (snippet.id.clone(), hotkey))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Every stored hotkey, including recycle-bin entries. The recycle bin keeps
+/// its combos reserved so restore cannot silently lose one.
+pub fn all_hotkeys() -> Vec<String> {
+    with_store(|store| {
+        store
+            .data
+            .snippets
+            .iter()
+            .filter_map(|snippet| snippet.hotkey.clone())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Content of an active snippet for direct hotkey injection.
+pub fn active_content(id: &str) -> Option<String> {
+    with_store(|store| {
+        store
+            .get(id)
+            .filter(|snippet| snippet.deleted_at.is_none())
+            .map(|snippet| snippet.content.clone())
+    })
+    .flatten()
+}
+
 pub fn categories() -> Vec<(String, String)> {
     with_store(|store| {
         let mut categories: Vec<(i32, String, String)> = store
@@ -457,6 +504,19 @@ fn validate_tags(tags: &[String]) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
+/// Canonicalizes a per-snippet hotkey. Empty means "no hotkey".
+pub(crate) fn validate_hotkey(raw: &str) -> Result<Option<String>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.encode_utf16().count() > 64 {
+        return Err("hotkey_invalid".to_string());
+    }
+    let spec = crate::hotkey::parse(raw).ok_or_else(|| "hotkey_invalid".to_string())?;
+    Ok(Some(spec.text()))
+}
+
 fn validate_text(title: &str, content: &str) -> Result<(String, String), String> {
     let title = title.trim().to_string();
     if title.is_empty() {
@@ -518,6 +578,8 @@ fn validate_import(mut data: DataFile) -> Result<DataFile, String> {
         snippet.title = title;
         snippet.content = content;
         snippet.tags = validate_tags(&snippet.tags).map_err(|_| "import_tags".to_string())?;
+        snippet.hotkey = validate_hotkey(snippet.hotkey.as_deref().unwrap_or(""))
+            .map_err(|_| "import_hotkey".to_string())?;
         if let Some(category_id) = snippet.category_id.as_deref() {
             if !category_ids.contains(category_id) {
                 return Err("import_category_missing".to_string());
@@ -576,6 +638,58 @@ impl Store {
         let imported: DataFile =
             serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
         let imported = validate_import(imported)?;
+        {
+            // Merge skips active title duplicates; their hotkeys must not block
+            // the import. Everything actually inserted is then checked for
+            // internal and cross-data uniqueness.
+            let existing_active_titles: HashSet<String> = self
+                .data
+                .snippets
+                .iter()
+                .filter(|snippet| snippet.deleted_at.is_none())
+                .map(|snippet| snippet.title.to_lowercase())
+                .collect();
+            let effective: Vec<&Snippet> = imported
+                .snippets
+                .iter()
+                .filter(|snippet| {
+                    mode == ImportMode::Replace
+                        || snippet.deleted_at.is_some()
+                        || !existing_active_titles.contains(&snippet.title.to_lowercase())
+                })
+                .collect();
+
+            let mut seen = HashSet::new();
+            for snippet in &effective {
+                if let Some(hotkey) = snippet.hotkey.as_deref() {
+                    if !seen.insert(hotkey.to_string()) {
+                        return Err("import_hotkey".to_string());
+                    }
+                }
+            }
+            if let Some(panel) = crate::hotkey::parse(&self.settings.hotkey) {
+                if effective.iter().any(|snippet| {
+                    snippet.hotkey.as_deref().and_then(crate::hotkey::parse) == Some(panel)
+                }) {
+                    return Err("import_hotkey".to_string());
+                }
+            }
+            if mode == ImportMode::Merge {
+                let existing: HashSet<&str> = self
+                    .data
+                    .snippets
+                    .iter()
+                    .filter_map(|snippet| snippet.hotkey.as_deref())
+                    .collect();
+                if effective
+                    .iter()
+                    .filter_map(|snippet| snippet.hotkey.as_deref())
+                    .any(|hotkey| existing.contains(hotkey))
+                {
+                    return Err("import_hotkey".to_string());
+                }
+            }
+        }
         match mode {
             ImportMode::Replace => self.import_replace(imported),
             ImportMode::Merge => self.import_merge(imported),
@@ -693,13 +807,28 @@ impl Store {
         pinned: bool,
         tags: &[String],
     ) -> Result<String, String> {
+        self.add_snippet_full(title, content, category_id, pinned, tags, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_snippet_full(
+        &mut self,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+        tags: &[String],
+        hotkey: Option<&str>,
+    ) -> Result<String, String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
         let (title, content) = validate_text(title, content)?;
         let tags = validate_tags(tags)?;
+        let hotkey = validate_hotkey(hotkey.unwrap_or(""))?;
         self.check_category(category_id)?;
         self.check_duplicate(&title, None)?;
+        self.check_hotkey(hotkey.as_deref(), None)?;
 
         let now = now_iso();
         let id = new_id();
@@ -717,6 +846,7 @@ impl Store {
             last_insert_status: None,
             deleted_at: None,
             tags,
+            hotkey,
             search_blob: String::new(),
         };
         snippet.rebuild_blob();
@@ -751,13 +881,45 @@ impl Store {
         pinned: bool,
         tags: &[String],
     ) -> Result<(), String> {
+        // Compatibility wrapper: changing title/content/tags must not silently
+        // drop a per-snippet hotkey.
+        let hotkey = self
+            .data
+            .snippets
+            .iter()
+            .find(|snippet| snippet.id == id)
+            .and_then(|snippet| snippet.hotkey.clone());
+        self.update_snippet_full(
+            id,
+            title,
+            content,
+            category_id,
+            pinned,
+            tags,
+            hotkey.as_deref(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_snippet_full(
+        &mut self,
+        id: &str,
+        title: &str,
+        content: &str,
+        category_id: Option<&str>,
+        pinned: bool,
+        tags: &[String],
+        hotkey: Option<&str>,
+    ) -> Result<(), String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
         let (title, content) = validate_text(title, content)?;
         let tags = validate_tags(tags)?;
+        let hotkey = validate_hotkey(hotkey.unwrap_or(""))?;
         self.check_category(category_id)?;
         self.check_duplicate(&title, Some(id))?;
+        self.check_hotkey(hotkey.as_deref(), Some(id))?;
 
         let Some(position) = self.data.snippets.iter().position(|item| item.id == id) else {
             return Err("snippet_missing".to_string());
@@ -771,6 +933,7 @@ impl Store {
             snippet.category_id = category_id.map(|value| value.to_string());
             snippet.pinned = pinned;
             snippet.tags = tags;
+            snippet.hotkey = hotkey;
             snippet.updated_at = now;
             snippet.rebuild_blob();
         }
@@ -811,6 +974,8 @@ impl Store {
         {
             return Err("duplicate_title".to_string());
         }
+        let restore_hotkey = self.data.snippets[position].hotkey.clone();
+        self.check_hotkey(restore_hotkey.as_deref(), Some(id))?;
         let previous = self.data.snippets[position].clone();
         self.data.snippets[position].deleted_at = None;
         self.data.snippets[position].updated_at = now_iso();
@@ -1033,6 +1198,25 @@ impl Store {
                 && snippet.title.to_lowercase() == needle
         }) {
             return Err("duplicate_title".to_string());
+        }
+        Ok(())
+    }
+
+    /// Hotkeys are unique across all snippets, including the recycle bin, so a
+    /// restore can never silently produce two snippets fighting for one combo.
+    fn check_hotkey(&self, hotkey: Option<&str>, skip: Option<&str>) -> Result<(), String> {
+        let Some(hotkey) = hotkey else {
+            return Ok(());
+        };
+        if self.data.snippets.iter().any(|snippet| {
+            Some(snippet.id.as_str()) != skip && snippet.hotkey.as_deref() == Some(hotkey)
+        }) {
+            return Err("hotkey_duplicate".to_string());
+        }
+        if let Some(panel) = crate::hotkey::parse(&self.settings.hotkey) {
+            if crate::hotkey::parse(hotkey) == Some(panel) {
+                return Err("hotkey_panel_conflict".to_string());
+            }
         }
         Ok(())
     }
@@ -1522,6 +1706,7 @@ fn snippet(
         last_insert_status: None,
         deleted_at: None,
         tags: Vec::new(),
+        hotkey: None,
         search_blob: String::new(),
     }
 }
@@ -2023,6 +2208,250 @@ mod tests {
             .snippets()
             .iter()
             .all(|snippet| snippet.tags.is_empty()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkeys_are_normalized_unique_and_exported() {
+        let dir = temp_dir("hotkeys");
+        let mut store = Store::load_from(&dir);
+        let first = store
+            .add_snippet_full("快捷键短语", "正文", None, false, &[], Some(" ctrl+alt+1 "))
+            .expect("snippet with hotkey");
+        assert_eq!(
+            store.get(&first).unwrap().hotkey.as_deref(),
+            Some("Ctrl+Alt+1")
+        );
+        store
+            .update_snippet_tagged(&first, "快捷键短语", "正文", None, false, &[])
+            .expect("tagged wrapper");
+        assert_eq!(
+            store.get(&first).unwrap().hotkey.as_deref(),
+            Some("Ctrl+Alt+1")
+        );
+        assert_eq!(
+            store.add_snippet_full("重复快捷键", "正文", None, false, &[], Some("CTRL+ALT+1")),
+            Err("hotkey_duplicate".to_string())
+        );
+        assert_eq!(
+            store.add_snippet_full("无效快捷键", "正文", None, false, &[], Some("Q")),
+            Err("hotkey_invalid".to_string())
+        );
+        assert_eq!(
+            store.add_snippet_full("全局冲突", "正文", None, false, &[], Some("Ctrl+Alt+Q")),
+            Err("hotkey_panel_conflict".to_string())
+        );
+        store
+            .update_snippet_full(
+                &first,
+                "快捷键短语",
+                "正文",
+                None,
+                false,
+                &[],
+                Some("Ctrl+Alt+1"),
+            )
+            .expect("same hotkey on update");
+        store
+            .update_snippet_full(
+                &first,
+                "快捷键短语",
+                "正文",
+                None,
+                false,
+                &[],
+                Some("Ctrl+Shift+F2"),
+            )
+            .expect("change hotkey");
+        assert_eq!(
+            store.get(&first).unwrap().hotkey.as_deref(),
+            Some("Ctrl+Shift+F2")
+        );
+        let exported = store.export_json().unwrap();
+        assert!(exported.contains("\"hotkey\": \"Ctrl+Shift+F2\""));
+        store
+            .update_snippet_full(&first, "快捷键短语", "正文", None, false, &[], None)
+            .expect("clear hotkey");
+        assert!(store.get(&first).unwrap().hotkey.is_none());
+        assert!(!store.export_json().unwrap().contains("\"hotkey\""));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hotkey_survives_recycle_and_restore() {
+        let dir = temp_dir("hotkeyrecycle");
+        let mut store = Store::load_from(&dir);
+        let id = store
+            .add_snippet_full("快捷键短语", "正文", None, false, &[], Some("Ctrl+Alt+9"))
+            .expect("snippet");
+        store.soft_delete(&id).expect("delete");
+        assert_eq!(
+            store.deleted_snippets()[0].hotkey.as_deref(),
+            Some("Ctrl+Alt+9")
+        );
+        store.restore(&id).expect("restore");
+        assert_eq!(
+            store.get(&id).unwrap().hotkey.as_deref(),
+            Some("Ctrl+Alt+9")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rejects_panel_hotkey_conflict() {
+        let dir = temp_dir("hotkeypanelrestore");
+        let mut store = Store::load_from(&dir);
+        let id = store
+            .add_snippet_full("快捷键短语", "正文", None, false, &[], Some("Ctrl+Alt+9"))
+            .expect("snippet");
+        store.soft_delete(&id).expect("delete");
+        let settings_path = dir.join(SETTINGS_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        value["hotkey"] = serde_json::json!("Ctrl+Alt+9");
+        fs::write(&settings_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut reloaded = Store::load_from(&dir);
+        assert_eq!(
+            reloaded.restore(&id),
+            Err("hotkey_panel_conflict".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_rejects_hotkey_collision_between_recycle_bin_entries() {
+        let dir = temp_dir("hotkeyrecycledup");
+        let mut store = Store::load_from(&dir);
+        let first = store
+            .add_snippet_full("第一个", "正文", None, false, &[], Some("Ctrl+Alt+8"))
+            .expect("first");
+        let second = store
+            .add_snippet_full("第二个", "正文", None, false, &[], Some("Ctrl+Alt+7"))
+            .expect("second");
+        store.soft_delete(&first).expect("delete first");
+        store.soft_delete(&second).expect("delete second");
+        let path = dir.join(DATA_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for snippet in value["snippets"].as_array_mut().unwrap() {
+            if snippet["id"] == serde_json::json!(second) {
+                snippet["hotkey"] = serde_json::json!("Ctrl+Alt+8");
+            }
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut reloaded = Store::load_from(&dir);
+        assert_eq!(
+            reloaded.restore(&first),
+            Err("hotkey_duplicate".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_rejects_invalid_conflicting_or_duplicate_hotkeys() {
+        let dir = temp_dir("hotkeyimport");
+        let mut store = Store::load_from(&dir);
+        store
+            .add_snippet_full("已有", "正文", None, false, &[], Some("Ctrl+Alt+2"))
+            .expect("snippet");
+
+        let mut data = store.data().clone();
+        data.snippets[0].hotkey = Some("Q".to_string());
+        assert_eq!(
+            store.import_bytes(&serde_json::to_vec(&data).unwrap(), ImportMode::Replace),
+            Err("import_hotkey".to_string())
+        );
+
+        let mut data = store.data().clone();
+        let mut second = data.snippets[0].clone();
+        second.id = "second".to_string();
+        second.title = "第二个".to_string();
+        second.hotkey = Some("Ctrl+Alt+2".to_string());
+        data.snippets.push(second);
+        assert_eq!(
+            store.import_bytes(&serde_json::to_vec(&data).unwrap(), ImportMode::Replace),
+            Err("import_hotkey".to_string())
+        );
+
+        let mut data = store.data().clone();
+        data.snippets[0].hotkey = Some("Ctrl+Alt+Q".to_string());
+        assert_eq!(
+            store.import_bytes(&serde_json::to_vec(&data).unwrap(), ImportMode::Replace),
+            Err("import_hotkey".to_string())
+        );
+
+        let mut data = store.data().clone();
+        data.snippets[0].hotkey = Some("Ctrl+Alt+3".to_string());
+        store
+            .import_bytes(&serde_json::to_vec(&data).unwrap(), ImportMode::Replace)
+            .expect("valid hotkey import");
+        assert_eq!(store.snippets()[0].hotkey.as_deref(), Some("Ctrl+Alt+3"));
+
+        let mut merge = store.data().clone();
+        merge.snippets[0].id = "merge".to_string();
+        merge.snippets[0].title = "合并短语".to_string();
+        assert_eq!(
+            store.import_bytes(&serde_json::to_vec(&merge).unwrap(), ImportMode::Merge),
+            Err("import_hotkey".to_string())
+        );
+
+        let mut skipped = store.data().clone();
+        skipped.snippets[0].id = "skipped".to_string();
+        skipped.snippets[0].hotkey = Some("Ctrl+Alt+3".to_string());
+        let summary = store
+            .import_bytes(&serde_json::to_vec(&skipped).unwrap(), ImportMode::Merge)
+            .expect("skipped title duplicate must not block merge");
+        assert_eq!(summary.snippets_added, 0);
+
+        let mut pair = store.data().clone();
+        let mut skipped_pair = pair.snippets[0].clone();
+        skipped_pair.id = "skip-a".to_string();
+        skipped_pair.hotkey = Some("Ctrl+Alt+5".to_string());
+        let mut inserted_pair = pair.snippets[0].clone();
+        inserted_pair.id = "insert-b".to_string();
+        inserted_pair.title = "新条目".to_string();
+        inserted_pair.hotkey = Some("Ctrl+Alt+5".to_string());
+        pair.snippets = vec![skipped_pair, inserted_pair];
+        let summary = store
+            .import_bytes(&serde_json::to_vec(&pair).unwrap(), ImportMode::Merge)
+            .expect("skipped title duplicate must not cause internal hotkey rejection");
+        assert_eq!(summary.snippets_added, 1);
+
+        let existing_id = store.snippets()[0].id.clone();
+        store.soft_delete(&existing_id).expect("soft delete");
+        let mut deleted_conflict = store.data().clone();
+        deleted_conflict.snippets[0].id = "deleted-conflict".to_string();
+        deleted_conflict.snippets[0].title = "回收站冲突".to_string();
+        deleted_conflict.snippets[0].deleted_at = None;
+        assert_eq!(
+            store.import_bytes(
+                &serde_json::to_vec(&deleted_conflict).unwrap(),
+                ImportMode::Merge
+            ),
+            Err("import_hotkey".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_data_without_hotkey_loads_as_none() {
+        let dir = temp_dir("oldhotkey");
+        let mut store = Store::load_from(&dir);
+        store
+            .add_snippet_full("旧格式", "正文", None, false, &[], Some("Ctrl+Alt+4"))
+            .expect("snippet");
+        let path = dir.join(DATA_FILE);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for snippet in value["snippets"].as_array_mut().unwrap() {
+            snippet.as_object_mut().unwrap().remove("hotkey");
+        }
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let reloaded = Store::load_from(&dir);
+        assert!(reloaded
+            .snippets()
+            .iter()
+            .all(|snippet| snippet.hotkey.is_none()));
         let _ = fs::remove_dir_all(&dir);
     }
 

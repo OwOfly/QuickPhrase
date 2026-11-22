@@ -159,6 +159,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代按应用输入例外的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 136/136，panel-smoke 10/10，tray-smoke 19/19。
 
+## 阶段三短语专属快捷键后重打包（2026-11-22）
+
+短语专属快捷键（FR-15，见 `docs/reviews/stage3-hotkeys-20261122.md`）进入发布包：
+
+```
+exe bytes=1049088
+zip bytes=578064
+sha256=7f8c0f933b2d3d350a6b72a4c3d090d55632a874be6802c7f252d6b63c9ea516
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代标签检索的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 144/144，panel-smoke 10/10，tray-smoke 19/19，host-matrix（隔离数据）10/10，snippet-hotkey-smoke 16/16。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

@@ -5,6 +5,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 pub const HOTKEY_ID: i32 = 1;
+/// Registration ids for per-snippet hotkeys. The Win32 range ends at 0xBFFF.
+pub const SNIPPET_ID_BASE: i32 = 1000;
 pub const DEFAULT_HOTKEY: &str = "Ctrl+Alt+Q";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,12 +69,17 @@ fn key_from_name(name: &str) -> Option<u32> {
 }
 
 pub fn parse(text: &str) -> Option<Spec> {
+    if text.trim().is_empty() {
+        return None;
+    }
     let mut modifiers = 0u32;
     let mut key = None;
     for part in text.split('+') {
         let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
         match part.to_ascii_lowercase().as_str() {
-            "" => {}
             "ctrl" | "control" => modifiers |= MOD_CONTROL.0,
             "alt" => modifiers |= MOD_ALT.0,
             "shift" => modifiers |= MOD_SHIFT.0,
@@ -100,16 +107,24 @@ pub fn register_text(hwnd: HWND, text: &str) -> Result<Spec, String> {
 }
 
 pub fn register_spec(hwnd: HWND, spec: Spec) -> Result<(), String> {
+    register_spec_id(hwnd, HOTKEY_ID, spec)
+}
+
+pub fn register_spec_id(hwnd: HWND, id: i32, spec: Spec) -> Result<(), String> {
     let modifiers = HOT_KEY_MODIFIERS(spec.modifiers) | MOD_NOREPEAT;
     unsafe {
-        RegisterHotKey(Some(hwnd), HOTKEY_ID, modifiers, spec.vk)
+        RegisterHotKey(Some(hwnd), id, modifiers, spec.vk)
             .map_err(|err| crate::platform::win32_code(err.code().0 as u32).to_string())
     }
 }
 
 pub fn unregister(hwnd: HWND) {
+    unregister_id(hwnd, HOTKEY_ID);
+}
+
+pub fn unregister_id(hwnd: HWND, id: i32) {
     unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+        let _ = UnregisterHotKey(Some(hwnd), id);
     }
 }
 
@@ -119,15 +134,10 @@ pub fn is_available(hwnd: HWND, text: &str) -> bool {
         return false;
     };
     unsafe {
-        let ok = RegisterHotKey(
-            Some(hwnd),
-            0x7F01,
-            HOT_KEY_MODIFIERS(spec.modifiers),
-            spec.vk,
-        )
-        .is_ok();
+        let ok =
+            RegisterHotKey(Some(hwnd), 999, HOT_KEY_MODIFIERS(spec.modifiers), spec.vk).is_ok();
         if ok {
-            let _ = UnregisterHotKey(Some(hwnd), 0x7F01);
+            let _ = UnregisterHotKey(Some(hwnd), 999);
         }
         ok
     }
@@ -162,5 +172,13 @@ mod tests {
     fn rejects_multiple_keys() {
         assert!(parse("Ctrl+A+B").is_none());
         assert!(parse("Ctrl+Nope+Q").is_none());
+    }
+
+    #[test]
+    fn rejects_empty_segments() {
+        assert!(parse("Ctrl++A").is_none());
+        assert!(parse("+Ctrl+A").is_none());
+        assert!(parse("Ctrl+A+").is_none());
+        assert!(parse("Ctrl + Alt + Q").is_some());
     }
 }

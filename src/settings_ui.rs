@@ -2156,6 +2156,14 @@ fn capture_key(ui: &mut SettingsUi, vk: u32) {
         return;
     }
     let same_as_current = hotkey::parse(&ui.original_hotkey) == Some(spec);
+    if !same_as_current
+        && storage::all_hotkeys()
+            .iter()
+            .any(|binding| hotkey::parse(binding) == Some(spec))
+    {
+        set_status(ui, "该快捷键已被短语专属快捷键占用");
+        return;
+    }
     if !same_as_current && !hotkey::is_available(ui.hwnd, &text) {
         set_status(ui, "该快捷键已被其他程序占用");
         return;
@@ -2206,7 +2214,12 @@ fn save(ui: &mut SettingsUi) {
         let rewrite = storage::save_settings(original.clone()).is_ok();
         ui.hotkey_candidate = original.hotkey.clone();
         if reapply && rewrite {
-            set_status(ui, &format!("快捷键注册失败（{code}），已恢复原设置"));
+            let reason = if code == "snippet_hotkey_conflict" {
+                "已被短语专属快捷键占用"
+            } else {
+                code.as_str()
+            };
+            set_status(ui, &format!("快捷键注册失败（{reason}），已恢复原设置"));
         } else {
             set_status(ui, "回滚失败：请重启程序并检查热键设置");
         }
@@ -2574,6 +2587,7 @@ fn data_error_text(code: &str) -> &'static str {
             "导入分类数据无效"
         }
         "import_tags" => "导入标签不合规（不能含逗号、单个不超 24 字、最多 10 个）",
+        "import_hotkey" => "导入快捷键不合规（格式错误、重复或与全局热键冲突）",
         "import_snippet_id" => "导入短语 ID 无效",
         "duplicate_title" => "导入数据包含重复标题",
         "title_empty" | "title_too_long" | "content_empty" | "content_too_long" => {
@@ -2637,13 +2651,18 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
                 return;
             };
             match storage::import_bytes(&bytes, mode) {
-                Ok(summary) => set_data_status(
-                    hwnd,
-                    &format!(
-                        "导入完成：分类 +{}，短语 +{}，跳过 {}；重开面板/管理窗口生效",
-                        summary.categories_added, summary.snippets_added, summary.snippets_skipped
-                    ),
-                ),
+                Ok(summary) => {
+                    crate::app::refresh_snippet_hotkeys();
+                    set_data_status(
+                        hwnd,
+                        &format!(
+                            "导入完成：分类 +{}，短语 +{}，跳过 {}；重开面板/管理窗口生效",
+                            summary.categories_added,
+                            summary.snippets_added,
+                            summary.snippets_skipped
+                        ),
+                    )
+                }
                 Err(err) => {
                     logging::error(&format!("settings: import failed: {err}"));
                     set_data_status(hwnd, data_error_text(&err));
@@ -2675,7 +2694,10 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
                 return;
             }
             match storage::import_bytes(&bytes, storage::ImportMode::Replace) {
-                Ok(_) => set_data_status(hwnd, "备份已恢复；重开面板/管理窗口生效"),
+                Ok(_) => {
+                    crate::app::refresh_snippet_hotkeys();
+                    set_data_status(hwnd, "备份已恢复；重开面板/管理窗口生效")
+                }
                 Err(err) => {
                     logging::error(&format!("settings: restore failed: {err}"));
                     set_data_status(hwnd, data_error_text(&err));

@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
@@ -8,8 +10,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::{
-    capture, clipboard, foreground, hotkey, logging, manage, panel, platform, search, settings_ui,
-    single_instance, storage, tray, uia,
+    capture, clipboard, foreground, hotkey, inject, logging, manage, panel, platform, search,
+    settings_ui, single_instance, storage, template, tray, uia,
 };
 
 const ID_OPEN: u32 = 1001;
@@ -36,7 +38,14 @@ struct State {
     selftest: bool,
     activate_message: u32,
     taskbar_message: u32,
+    /// Active per-snippet registrations: registration id, snippet id, hotkey text.
+    snippet_hotkeys: Vec<(i32, String, String)>,
+    /// Monotonic allocator; an id is never reused for another snippet, so a
+    /// queued WM_HOTKEY can never be routed to the wrong phrase after a refresh.
+    next_snippet_hotkey_id: i32,
 }
+
+static DIRECT_INJECTING: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
@@ -134,6 +143,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             selftest,
             activate_message,
             taskbar_message,
+            next_snippet_hotkey_id: hotkey::SNIPPET_ID_BASE,
             ..State::default()
         };
     });
@@ -207,6 +217,8 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     } else {
         logging::warn("uia warmup failed; captures will be copy-only");
     }
+
+    refresh_snippet_hotkeys();
 
     panel::precreate();
 
@@ -302,9 +314,27 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_HOTKEY => {
-            if wparam.0 as i32 == hotkey::HOTKEY_ID {
+            let id = wparam.0 as i32;
+            if id == hotkey::HOTKEY_ID {
                 logging::info("hotkey fired");
                 hotkey_panel();
+            } else if id >= hotkey::SNIPPET_ID_BASE {
+                let snippet_id = STATE.with(|state| {
+                    state
+                        .borrow()
+                        .snippet_hotkeys
+                        .iter()
+                        .find(|(registered, _, _)| *registered == id)
+                        .map(|(_, snippet_id, _)| snippet_id.clone())
+                });
+                if let Some(snippet_id) = snippet_id {
+                    logging::info(&format!(
+                        "snippet hotkey fired id={id} snippet={snippet_id}"
+                    ));
+                    hotkey_snippet(&snippet_id);
+                } else {
+                    logging::warn(&format!("snippet hotkey fired for stale id={id}"));
+                }
             }
             LRESULT(0)
         }
@@ -350,6 +380,11 @@ unsafe extern "system" fn window_proc(
             }
             if hotkey_ok {
                 hotkey::unregister(hwnd);
+            }
+            let snippet_hotkeys =
+                STATE.with(|state| std::mem::take(&mut state.borrow_mut().snippet_hotkeys));
+            for (id, _, _) in snippet_hotkeys {
+                hotkey::unregister_id(hwnd, id);
             }
             STATE.with(|state| {
                 let mut state = state.borrow_mut();
@@ -423,7 +458,7 @@ fn handle_command(id: u32) {
         }
         ID_ABOUT => about(),
         ID_EXIT => {
-            if panel::is_injecting() {
+            if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
                 logging::warn("exit deferred: injection in flight");
                 let hwnd = STATE.with(|state| state.borrow().hwnd);
                 if !hwnd.0.is_null() {
@@ -449,6 +484,77 @@ pub fn current_hotkey() -> String {
         .unwrap_or_else(|| hotkey::DEFAULT_HOTKEY.to_string())
 }
 
+/// Rebuild every per-snippet registration from storage. Safe to call after any
+/// data change; a conflict is logged and only that snippet's hotkey is left
+/// inactive until the user picks another combo.
+pub fn refresh_snippet_hotkeys() {
+    let (hwnd, paused) = STATE.with(|state| {
+        let state = state.borrow();
+        (state.hwnd, state.paused)
+    });
+    if hwnd.0.is_null() {
+        return;
+    }
+
+    let previous = STATE.with(|state| std::mem::take(&mut state.borrow_mut().snippet_hotkeys));
+    if paused {
+        for (id, _, _) in previous {
+            hotkey::unregister_id(hwnd, id);
+        }
+        return;
+    }
+
+    let bindings: HashMap<String, String> = storage::hotkey_bindings().into_iter().collect();
+    let mut active: Vec<(i32, String, String)> = Vec::new();
+    let mut keep: HashMap<String, (i32, String)> = HashMap::new();
+
+    // Preserve ids for unchanged snippets; drop and free changed registrations.
+    for (id, snippet_id, text) in previous {
+        if bindings.get(&snippet_id) == Some(&text) {
+            keep.insert(snippet_id.clone(), (id, text.clone()));
+            active.push((id, snippet_id, text));
+        } else {
+            hotkey::unregister_id(hwnd, id);
+        }
+    }
+
+    for (snippet_id, text) in bindings {
+        if keep.contains_key(&snippet_id) {
+            continue;
+        }
+        let id = STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let id = state.next_snippet_hotkey_id;
+            if id <= 0xBFFF {
+                state.next_snippet_hotkey_id = id + 1;
+            }
+            id
+        });
+        if id > 0xBFFF {
+            logging::warn("snippet hotkey id space exhausted");
+            break;
+        }
+        let Some(spec) = hotkey::parse(&text) else {
+            logging::warn(&format!(
+                "snippet hotkey skipped (invalid) snippet={snippet_id} combo={text}"
+            ));
+            continue;
+        };
+        match hotkey::register_spec_id(hwnd, id, spec) {
+            Ok(()) => {
+                logging::info(&format!(
+                    "snippet hotkey registered id={id} snippet={snippet_id} combo={text}"
+                ));
+                active.push((id, snippet_id, text));
+            }
+            Err(code) => logging::warn(&format!(
+                "snippet hotkey failed id={id} snippet={snippet_id} combo={text} code={code}"
+            )),
+        }
+    }
+    STATE.with(|state| state.borrow_mut().snippet_hotkeys = active);
+}
+
 /// Re-register the global hotkey on the main window.
 pub fn apply_hotkey(text: &str) -> Result<(), String> {
     let (hwnd, paused) = STATE.with(|state| {
@@ -457,6 +563,14 @@ pub fn apply_hotkey(text: &str) -> Result<(), String> {
     });
     if hwnd.0.is_null() {
         return Err("no_main_window".to_string());
+    }
+    if let Some(spec) = hotkey::parse(text) {
+        if storage::all_hotkeys()
+            .iter()
+            .any(|binding| hotkey::parse(binding) == Some(spec))
+        {
+            return Err("snippet_hotkey_conflict".to_string());
+        }
     }
     hotkey::unregister(hwnd);
     if paused {
@@ -469,6 +583,7 @@ pub fn apply_hotkey(text: &str) -> Result<(), String> {
         Ok(_) => {
             STATE.with(|state| state.borrow_mut().hotkey_ok = true);
             logging::info(&format!("hotkey changed: {text}"));
+            refresh_snippet_hotkeys();
             Ok(())
         }
         Err(code) => {
@@ -479,6 +594,14 @@ pub fn apply_hotkey(text: &str) -> Result<(), String> {
 }
 
 fn hotkey_panel() {
+    if DIRECT_INJECTING.load(Ordering::Relaxed) {
+        logging::warn("panel activation ignored: snippet injection in flight");
+        let main = STATE.with(|state| state.borrow().hwnd);
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "正在输入，请稍候");
+        }
+        return;
+    }
     if panel::is_injecting() {
         logging::warn("panel activation ignored: injection in flight");
         let main = STATE.with(|state| state.borrow().hwnd);
@@ -497,9 +620,160 @@ fn hotkey_panel() {
     open_panel();
 }
 
+/// Direct injection for a per-snippet hotkey. The panel is deliberately skipped,
+/// so the same capture/report/guard pipeline must still run: the hotkey press is
+/// the confirmation, and an uncertain target is copied instead of typed.
+fn hotkey_snippet(snippet_id: &str) {
+    let paused = STATE.with(|state| state.borrow().paused);
+    if paused {
+        logging::warn("snippet hotkey ignored: hotkeys are paused");
+        return;
+    }
+    if DIRECT_INJECTING.load(Ordering::Relaxed) || panel::is_injecting() {
+        logging::warn("snippet hotkey ignored: injection already in flight");
+        let main = STATE.with(|state| state.borrow().hwnd);
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "正在输入，请稍候");
+        }
+        return;
+    }
+    if panel::is_visible() {
+        logging::warn("snippet hotkey ignored: panel is open");
+        let main = STATE.with(|state| state.borrow().hwnd);
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "面板已打开，请先关闭面板");
+        }
+        return;
+    }
+
+    let Some(raw) = storage::active_content(snippet_id) else {
+        logging::warn(&format!(
+            "snippet hotkey skipped: snippet missing or deleted id={snippet_id}"
+        ));
+        refresh_snippet_hotkeys();
+        return;
+    };
+    let content = template::render(&raw);
+    let main = STATE.with(|state| state.borrow().hwnd);
+    if foreground_is_self() {
+        logging::warn("snippet hotkey ignored: foreground is QuickPhrase itself");
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "请在目标应用中使用短语快捷键");
+        }
+        return;
+    }
+
+    let settings = storage::settings_clone().unwrap_or_default();
+    let keep_tabs = settings.tab_policy == "tab";
+    let default_paste_mode = settings.insertion_mode == "paste";
+
+    let started = Instant::now();
+    let monitor = foreground::start();
+    let report = match capture::once() {
+        Some(report) => report,
+        None => {
+            if foreground_is_self() {
+                logging::warn("snippet hotkey ignored: foreground is QuickPhrase itself");
+                if !main.0.is_null() {
+                    tray::balloon(main, "QuickPhrase", "请在目标应用中使用短语快捷键");
+                }
+                return;
+            }
+            logging::warn("snippet hotkey capture returned no usable foreground window");
+            copy_only_direct(main, snippet_id, &content, "未捕获到目标窗口");
+            return;
+        }
+    };
+    logging::info(&format!("snippet hotkey capture: {}", report.summary()));
+    if report.target.pid == std::process::id() {
+        logging::warn("snippet hotkey ignored: target is QuickPhrase itself");
+        if !main.0.is_null() {
+            tray::balloon(main, "QuickPhrase", "请在目标应用中使用短语快捷键");
+        }
+        return;
+    }
+    let paste_mode = storage::action_for_exe(&report.target.exe)
+        .map(|action| action == "paste")
+        .unwrap_or(default_paste_mode);
+    let monitor_ok = monitor.is_some();
+
+    DIRECT_INJECTING.store(true, Ordering::Relaxed);
+    let notify_raw = main.0 as isize;
+    let item_id = snippet_id.to_string();
+    let spawned = std::thread::Builder::new()
+        .name("quickphrase-snippet-inject".into())
+        .spawn(move || {
+            let options = inject::Options {
+                mode: if paste_mode {
+                    inject::InsertionMode::Paste
+                } else {
+                    inject::InsertionMode::Unicode
+                },
+                keep_tabs,
+            };
+            let outcome = inject::run(&report, &content, monitor_ok, options);
+            let message = outcome.describe();
+            logging::info(&format!(
+                "snippet hotkey inject outcome: {message} ({} ms)",
+                started.elapsed().as_millis()
+            ));
+            storage::record_use(&item_id, outcome.status());
+            if notify_raw != 0 {
+                tray::balloon(
+                    HWND(notify_raw as *mut core::ffi::c_void),
+                    "QuickPhrase",
+                    &message,
+                );
+            }
+            drop(monitor);
+            DIRECT_INJECTING.store(false, Ordering::Relaxed);
+        });
+
+    if spawned.is_err() {
+        logging::error("failed to spawn snippet injection thread");
+        DIRECT_INJECTING.store(false, Ordering::Relaxed);
+    }
+}
+
+fn foreground_is_self() -> bool {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.0.is_null() {
+        return false;
+    }
+    let mut pid = 0u32;
+    unsafe {
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    }
+    pid == std::process::id()
+}
+
+fn copy_only_direct(main: HWND, snippet_id: &str, content: &str, reason: &str) {
+    let (copied, snapshot) = clipboard::set_text_with_snapshot(content);
+    storage::record_use(snippet_id, "rejected");
+    logging::info(&format!(
+        "snippet hotkey copy-only: reason={reason} copied={copied} non_text={} read_ok={}",
+        snapshot.had_non_text, snapshot.read_ok
+    ));
+    if main.0.is_null() {
+        return;
+    }
+    let message = if !copied {
+        format!("复制失败（{reason}）")
+    } else if !snapshot.read_ok {
+        format!("已复制（{reason}；原剪贴板内容无法确认，可能不可恢复）")
+    } else if snapshot.had_non_text {
+        format!("已复制（{reason}；原剪贴板含非文本内容，仅文本可恢复）")
+    } else if snapshot.text.is_some() {
+        format!("已复制（{reason}；原剪贴板内容已被替换）")
+    } else {
+        format!("已复制（{reason}）")
+    };
+    tray::balloon(main, "QuickPhrase", &message);
+}
+
 /// Menu, tray and second-instance entry: open (or focus) the panel, never close it.
 fn open_panel() {
-    if panel::is_injecting() {
+    if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
         logging::warn("panel activation ignored: injection in flight");
         let main = STATE.with(|state| state.borrow().hwnd);
         if !main.0.is_null() {
@@ -646,7 +920,24 @@ fn toggle_hotkey() {
     if paused || !hotkey_ok {
         // Either the user is resuming, or startup registration failed and this
         // entry retries it instead of pretending to pause an inactive hotkey.
-        match hotkey::register_text(hwnd, &current_hotkey()) {
+        let text = current_hotkey();
+        if let Some(spec) = hotkey::parse(&text) {
+            if storage::all_hotkeys()
+                .iter()
+                .any(|binding| hotkey::parse(binding) == Some(spec))
+            {
+                logging::error("resume blocked: global hotkey is used by a snippet");
+                platform::error_box(
+                    "快捷键冲突",
+                    &format!(
+                        "无法恢复 {text}：该组合已被某个短语的专属快捷键占用。\n\
+                         请先在管理窗口修改该短语的快捷键，再恢复。"
+                    ),
+                );
+                return;
+            }
+        }
+        match hotkey::register_text(hwnd, &text) {
             Ok(_) => {
                 STATE.with(|state| {
                     let mut state = state.borrow_mut();
@@ -655,6 +946,7 @@ fn toggle_hotkey() {
                 });
                 persist_paused(false);
                 tray::set_tip(hwnd, TIP_NORMAL);
+                refresh_snippet_hotkeys();
                 logging::info(if paused {
                     "hotkey resumed"
                 } else {
@@ -678,6 +970,7 @@ fn toggle_hotkey() {
         });
         persist_paused(true);
         tray::set_tip(hwnd, TIP_PAUSED);
+        refresh_snippet_hotkeys();
         tray::balloon(hwnd, "QuickPhrase", "快捷键已暂停，可通过托盘菜单恢复。");
         logging::info("hotkey paused");
     }
