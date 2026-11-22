@@ -879,6 +879,7 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
             content: row.content,
             category: row.category,
             category_id: row.category_id,
+            tags: row.tags,
             blob: row.blob,
             pinned: row.pinned,
             last_used_at: row.last_used_at,

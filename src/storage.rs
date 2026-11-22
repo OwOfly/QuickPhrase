@@ -255,6 +255,7 @@ pub struct PanelRow {
     pub content: String,
     pub category: String,
     pub category_id: Option<String>,
+    pub tags: Vec<String>,
     pub blob: String,
     pub pinned: bool,
     pub sort_order: i32,
@@ -274,6 +275,7 @@ pub fn panel_items() -> Vec<PanelRow> {
                 content: snippet.content.clone(),
                 category: store.category_name(snippet.category_id.as_deref()),
                 category_id: snippet.category_id.clone(),
+                tags: snippet.tags.clone(),
                 blob: snippet.search_blob.clone(),
                 pinned: snippet.pinned,
                 sort_order: snippet.sort_order,
@@ -328,6 +330,16 @@ pub fn active_content(id: &str) -> Option<String> {
             .map(|snippet| snippet.content.clone())
     })
     .flatten()
+}
+
+pub fn add_tags(ids: &[String], tags: &[String]) -> Result<usize, String> {
+    with_store(|store| store.add_tags(ids, tags))
+        .unwrap_or_else(|| Err("storage_unavailable".to_string()))
+}
+
+pub fn remove_tags(ids: &[String], tags: &[String]) -> Result<usize, String> {
+    with_store(|store| store.remove_tags(ids, tags))
+        .unwrap_or_else(|| Err("storage_unavailable".to_string()))
 }
 
 pub fn categories() -> Vec<(String, String)> {
@@ -941,6 +953,94 @@ impl Store {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.data.snippets[position] = previous;
+                Err(err)
+            }
+        }
+    }
+
+    /// Adds tags to every selected snippet in one atomic write. Returns the number
+    /// of snippets whose tags actually changed.
+    pub fn add_tags(&mut self, ids: &[String], tags: &[String]) -> Result<usize, String> {
+        self.change_tags(ids, tags, true)
+    }
+
+    /// Removes tags from every selected snippet in one atomic write.
+    pub fn remove_tags(&mut self, ids: &[String], tags: &[String]) -> Result<usize, String> {
+        self.change_tags(ids, tags, false)
+    }
+
+    fn change_tags(&mut self, ids: &[String], tags: &[String], add: bool) -> Result<usize, String> {
+        if self.read_only {
+            return Err("read_only".to_string());
+        }
+        let tags = validate_tags(tags)?;
+        if tags.is_empty() {
+            return Err("tag_empty".to_string());
+        }
+
+        let mut seen = HashSet::new();
+        let mut plans: Vec<(usize, Vec<String>)> = Vec::new();
+        for id in ids {
+            if !seen.insert(id.as_str()) {
+                continue;
+            }
+            let Some(position) = self.data.snippets.iter().position(|item| item.id == *id) else {
+                return Err("snippet_missing".to_string());
+            };
+            let previous = &self.data.snippets[position].tags;
+            let mut next = previous.clone();
+            if add {
+                for tag in &tags {
+                    if !next
+                        .iter()
+                        .any(|existing| existing.to_lowercase() == tag.to_lowercase())
+                    {
+                        next.push(tag.clone());
+                    }
+                }
+                next = validate_tags(&next)?;
+            } else {
+                next.retain(|existing| {
+                    !tags
+                        .iter()
+                        .any(|tag| tag.to_lowercase() == existing.to_lowercase())
+                });
+            }
+            if next != *previous {
+                plans.push((position, next));
+            }
+        }
+
+        if plans.is_empty() {
+            return Ok(0);
+        }
+
+        let now = now_iso();
+        let previous: Vec<(usize, Vec<String>, String)> = plans
+            .iter()
+            .map(|(position, _)| {
+                (
+                    *position,
+                    self.data.snippets[*position].tags.clone(),
+                    self.data.snippets[*position].updated_at.clone(),
+                )
+            })
+            .collect();
+        for (position, tags) in &plans {
+            let snippet = &mut self.data.snippets[*position];
+            snippet.tags = tags.clone();
+            snippet.updated_at = now.clone();
+            snippet.rebuild_blob();
+        }
+        match self.save_data() {
+            Ok(()) => Ok(plans.len()),
+            Err(err) => {
+                for (position, tags, updated_at) in previous {
+                    let snippet = &mut self.data.snippets[position];
+                    snippet.tags = tags;
+                    snippet.updated_at = updated_at;
+                    snippet.rebuild_blob();
+                }
                 Err(err)
             }
         }
@@ -2186,6 +2286,91 @@ mod tests {
             store.add_snippet_tagged("过多标签", "正文", None, false, &too_many),
             Err("too_many_tags".to_string())
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_tags_add_and_remove_are_atomic() {
+        let dir = temp_dir("batchtags");
+        let mut store = Store::load_from(&dir);
+        let first = store
+            .add_snippet_full("甲", "正文", None, false, &["x".to_string()], None)
+            .expect("first");
+        let second = store
+            .add_snippet_full("乙", "正文", None, false, &[], None)
+            .expect("second");
+
+        let before_revision = store.data().revision;
+        assert_eq!(
+            store.add_tags(&[first.clone(), second.clone()], &["y".to_string()]),
+            Ok(2)
+        );
+        assert_eq!(store.data().revision, before_revision + 1);
+        assert_eq!(
+            store.get(&first).unwrap().tags,
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert!(store.get(&first).unwrap().search_blob.contains("y"));
+        assert_eq!(store.get(&second).unwrap().tags, vec!["y".to_string()]);
+        assert_eq!(store.add_tags(&[second.clone()], &["Y".to_string()]), Ok(0));
+        assert_eq!(
+            store.remove_tags(&[first.clone()], &["x".to_string()]),
+            Ok(1)
+        );
+        assert_eq!(store.get(&first).unwrap().tags, vec!["y".to_string()]);
+
+        let too_many: Vec<String> = (0..10).map(|index| format!("z{index}")).collect();
+        assert_eq!(
+            store.add_tags(&[second.clone()], &too_many),
+            Err("too_many_tags".to_string())
+        );
+        assert_eq!(store.get(&second).unwrap().tags, vec!["y".to_string()]);
+        assert_eq!(
+            store.add_tags(&[first.clone()], &[]),
+            Err("tag_empty".to_string())
+        );
+        store.read_only = true;
+        assert_eq!(
+            store.remove_tags(&[second.clone()], &["y".to_string()]),
+            Err("read_only".to_string())
+        );
+        store.read_only = false;
+        assert_eq!(
+            store.add_tags(&[first.clone(), "missing".to_string()], &["z".to_string()]),
+            Err("snippet_missing".to_string())
+        );
+        assert!(!store.get(&first).unwrap().tags.contains(&"z".to_string()));
+        store.soft_delete(&first).expect("delete");
+        assert_eq!(
+            store.add_tags(&[first.clone()], &["deleted".to_string()]),
+            Ok(1)
+        );
+        assert!(store
+            .get(&first)
+            .unwrap()
+            .tags
+            .contains(&"deleted".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_tags_roll_back_on_write_failure() {
+        let dir = temp_dir("batchtagsfail");
+        let mut store = Store::load_from(&dir);
+        let first = store
+            .add_snippet_full("甲", "正文", None, false, &["x".to_string()], None)
+            .expect("first");
+        let second = store
+            .add_snippet_full("乙", "正文", None, false, &["y".to_string()], None)
+            .expect("second");
+        let before_first = store.get(&first).unwrap().tags.clone();
+        let before_second = store.get(&second).unwrap().tags.clone();
+        fs::create_dir_all(dir.join(format!("{DATA_FILE}.tmp"))).unwrap();
+        assert!(store
+            .add_tags(&[first.clone(), second.clone()], &["z".to_string()])
+            .is_err());
+        assert_eq!(store.get(&first).unwrap().tags, before_first);
+        assert_eq!(store.get(&second).unwrap().tags, before_second);
         let _ = fs::remove_dir_all(&dir);
     }
 

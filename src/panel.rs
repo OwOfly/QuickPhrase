@@ -63,6 +63,7 @@ pub struct Item {
     pub content: String,
     pub category: String,
     pub category_id: Option<String>,
+    pub tags: Vec<String>,
     pub blob: String,
     pub pinned: bool,
     pub last_used_at: Option<String>,
@@ -415,6 +416,7 @@ pub fn show_test() -> u128 {
             content: row.content,
             category: row.category,
             category_id: row.category_id,
+            tags: row.tags,
             blob: row.blob,
             pinned: row.pinned,
             last_used_at: row.last_used_at,
@@ -787,7 +789,7 @@ fn create() -> Option<Panel> {
     ui::theme_control(edit, palette.dark);
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
 
-    let cue = platform::wide("搜索标题、正文、标签或拼音…");
+    let cue = platform::wide("搜索标题、正文、标签、拼音；#标签 筛选");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         let _ = send(edit, EM_LIMITTEXT, 200, 0);
@@ -1812,12 +1814,35 @@ fn filter_items_mode(
     query: &str,
     sort_mode: crate::search::SortMode,
 ) -> FilterResult {
+    let trimmed = query.trim();
+    let (tag_filter, text_query) = if let Some(rest) = trimmed.strip_prefix('#') {
+        let rest = rest.trim_start();
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let tag = parts.next().unwrap_or("").trim().to_lowercase();
+        (
+            if tag.is_empty() { None } else { Some(tag) },
+            parts.next().unwrap_or("").trim(),
+        )
+    } else {
+        (None, trimmed)
+    };
+
     let subset: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| match category {
-            Some(id) => item.category_id.as_deref() == Some(id),
-            None => true,
+        .filter(|(_, item)| {
+            let category_ok = match category {
+                Some(id) => item.category_id.as_deref() == Some(id),
+                None => true,
+            };
+            let tag_ok = match &tag_filter {
+                Some(tag) => item
+                    .tags
+                    .iter()
+                    .any(|item_tag| item_tag.to_lowercase() == *tag),
+                None => true,
+            };
+            category_ok && tag_ok
         })
         .map(|(index, _)| index)
         .collect();
@@ -1844,7 +1869,7 @@ fn filter_items_mode(
     } else {
         crate::search::DEFAULT_LIMIT
     };
-    let hits = crate::search::rank(&docs, query, limit);
+    let hits = crate::search::rank(&docs, text_query, limit);
     let mut ordered: Vec<(crate::search::Hit, usize)> = hits
         .into_iter()
         .map(|hit| {
@@ -2531,6 +2556,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
             content: "这是第 {index} 条正文，包含接口、测试与发布计划。".to_string(),
             category: "工作沟通".to_string(),
             category_id: None,
+            tags: Vec::new(),
             blob: format!(
                 "项目更新说明 {index}\n这是第 {index} 条正文，包含接口、测试与发布计划。"
             ),
@@ -2611,6 +2637,7 @@ mod tests {
                 content: content.to_string(),
                 category: category.to_string(),
                 category_id: Some(category_id.to_string()),
+                tags: Vec::new(),
                 blob: format!("{}\n{}", title.to_lowercase(), content.to_lowercase()),
                 pinned: false,
                 last_used_at: None,
@@ -2694,6 +2721,21 @@ mod tests {
         assert_eq!(filtered, vec![0, 1]);
         let (filtered, _, _) = filter_items(&items, Some("c2"), "项目");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn tag_prefix_filters_by_tag_and_optional_text() {
+        let mut items = items();
+        items[0].tags = vec!["support".to_string()];
+        items[1].tags = vec!["refund".to_string()];
+        assert_eq!(rank_ids(&items, "#support"), vec![0]);
+        assert_eq!(rank_ids(&items, "# support"), vec![0]);
+        assert_eq!(rank_ids(&items, "#SUPPORT"), vec![0]);
+        assert_eq!(rank_ids(&items, "#support 项目"), vec![0]);
+        assert_eq!(rank_ids(&items, "#"), vec![0, 1, 2]);
+        let (filtered, _, _) = filter_items(&items, Some("c1"), "#support");
+        assert_eq!(filtered, vec![0]);
+        assert!(rank_ids(&items, "#missing").is_empty());
     }
 
     #[test]

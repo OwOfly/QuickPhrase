@@ -172,6 +172,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代标签检索的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 144/144，panel-smoke 10/10，tray-smoke 19/19，host-matrix（隔离数据）10/10，snippet-hotkey-smoke 16/16。
 
+## 阶段三标签筛选与批量标签后重打包（2026-11-22）
+
+标签筛选与管理列表批量标签（见 `docs/reviews/stage3-tagfilter-batch-20261122.md`）进入发布包：
+
+```
+exe bytes=1064960
+zip bytes=585869
+sha256=28f3a5847cd53c0e6a82e02bf1017cd38a3a5e6cfec7aa0d450378331bba8511
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代短语专属快捷键的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 147/147，panel-smoke 10/10，tray-smoke 19/19，host-matrix（隔离数据）10/10，snippet-hotkey-smoke 16/16，tag-batch-smoke 8/8。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

@@ -44,6 +44,7 @@ const ID_CAT_ADD: i32 = 213;
 const ID_CAT_DELETE: i32 = 214;
 const ID_RESTORE: i32 = 215;
 const ID_HOTKEY: i32 = 216;
+const ID_TAG_FILTER: i32 = 217;
 
 const MIN_WIDTH: i32 = 800;
 const MIN_HEIGHT: i32 = 540;
@@ -99,6 +100,7 @@ struct Layout {
     right_pane: RECT,
     cat_input_shell: RECT,
     search_shell: RECT,
+    tag_shell: RECT,
     middle_header_bottom: i32,
     recycle_banner: Option<RECT>,
     editor_header: RECT,
@@ -126,6 +128,10 @@ struct Manage {
     cat_delete: HWND,
     search: HWND,
     list: HWND,
+    tag_filter: HWND,
+    tag_filter_value: Option<String>,
+    tag_options: Vec<String>,
+    batch_ids: Vec<String>,
     new_button: HWND,
     delete_button: HWND,
     restore_button: HWND,
@@ -217,6 +223,8 @@ fn error_text(code: &str) -> &'static str {
         "tag_too_long" => "单个标签不能超过 24 个字符",
         "too_many_tags" => "标签最多 10 个",
         "tag_delimiter" => "标签不能包含逗号",
+        "tag_empty" => "请输入至少一个标签",
+        "storage_unavailable" => "存储未初始化",
         "hotkey_invalid" => "快捷键格式无效，例如 Ctrl+Alt+1",
         "hotkey_duplicate" => "该快捷键已被其他短语使用",
         "hotkey_panel_conflict" => "与全局唤起快捷键冲突",
@@ -230,7 +238,12 @@ fn data() -> Option<storage::DataFile> {
     storage::data_clone()
 }
 
-fn active_rows(category: Option<&str>, query: &str, recycle: bool) -> Vec<PhraseRow> {
+fn active_rows(
+    category: Option<&str>,
+    query: &str,
+    recycle: bool,
+    tag: Option<&str>,
+) -> Vec<PhraseRow> {
     let Some(data) = data() else {
         return Vec::new();
     };
@@ -256,6 +269,13 @@ fn active_rows(category: Option<&str>, query: &str, recycle: bool) -> Vec<Phrase
             (snippet.deleted_at.is_some()) == recycle
                 && match category {
                     Some(id) => snippet.category_id.as_deref() == Some(id),
+                    None => true,
+                }
+                && match tag {
+                    Some(tag) => {
+                        let tag = tag.to_lowercase();
+                        snippet.tags.iter().any(|item| item.to_lowercase() == tag)
+                    }
                     None => true,
                 }
         })
@@ -395,6 +415,57 @@ fn reload_categories(manage: &mut Manage) {
     }
 }
 
+fn reload_tag_filter(manage: &mut Manage) {
+    let Some(data) = data() else {
+        return;
+    };
+    let recycle = matches!(manage.view, View::Recycle);
+    let mut options: Vec<String> = Vec::new();
+    for snippet in &data.snippets {
+        if (snippet.deleted_at.is_some()) != recycle {
+            continue;
+        }
+        for tag in &snippet.tags {
+            if !options
+                .iter()
+                .any(|existing| existing.to_lowercase() == tag.to_lowercase())
+            {
+                options.push(tag.clone());
+            }
+        }
+    }
+    options.sort_by_key(|tag| tag.to_lowercase());
+
+    let selected = manage.tag_filter_value.clone();
+    manage.loading = true;
+    unsafe {
+        let _ = SendMessageW(manage.tag_filter, CB_RESETCONTENT, 0, 0);
+        let all = platform::wide("全部标签");
+        let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, all.as_ptr() as isize);
+        for tag in &options {
+            let wide = platform::wide(tag);
+            let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, wide.as_ptr() as isize);
+        }
+        let index = selected
+            .as_deref()
+            .and_then(|selected| {
+                options
+                    .iter()
+                    .position(|tag| tag.to_lowercase() == selected.to_lowercase())
+            })
+            .map(|position| position + 1)
+            .unwrap_or(0);
+        let _ = SendMessageW(manage.tag_filter, CB_SETCURSEL, index, 0);
+        manage.tag_filter_value = if index == 0 {
+            None
+        } else {
+            options.get(index - 1).cloned()
+        };
+    }
+    manage.tag_options = options;
+    manage.loading = false;
+}
+
 fn reload_list(manage: &mut Manage) {
     let query = wide_text(manage.search);
     let (category, recycle) = match &manage.view {
@@ -402,7 +473,12 @@ fn reload_list(manage: &mut Manage) {
         View::Category(id) => (Some(id.as_str()), false),
         View::Recycle => (None, true),
     };
-    let rows = active_rows(category, &query, recycle);
+    let rows = active_rows(
+        category,
+        &query,
+        recycle,
+        manage.tag_filter_value.as_deref(),
+    );
     unsafe {
         let _ = SendMessageW(manage.list, LB_RESETCONTENT, 0, 0);
     }
@@ -417,9 +493,7 @@ fn reload_list(manage: &mut Manage) {
     if let Some(editing) = manage.editing.as_deref() {
         if let Some(position) = manage.phrase_rows.iter().position(|r| r.id == editing) {
             manage.selected = Some(position);
-            unsafe {
-                let _ = SendMessageW(manage.list, LB_SETCURSEL, position, 0);
-            }
+            select_list_row(manage, position);
         }
     }
     if manage.phrase_rows.is_empty() {
@@ -432,11 +506,16 @@ fn reload_list(manage: &mut Manage) {
 
 fn load_editor(manage: &mut Manage, id: Option<&str>) {
     manage.loading = true;
+    manage.batch_ids.clear();
+    set_text(manage.save_button, "保存短语");
+    set_text(manage.cancel_button, "重置");
     unsafe {
         let _ = EnableWindow(manage.title_edit, true);
         let _ = EnableWindow(manage.content_edit, true);
         let _ = EnableWindow(manage.tags_edit, true);
         let _ = EnableWindow(manage.hotkey_edit, true);
+        let _ = EnableWindow(manage.category, true);
+        let _ = EnableWindow(manage.pinned, true);
         let _ = ShowWindow(manage.content_edit, SW_SHOW);
     }
     manage.error_field = None;
@@ -535,6 +614,160 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
     relayout(manage);
     unsafe {
         let _ = InvalidateRect(Some(manage.hwnd), None, false);
+    }
+}
+
+fn select_list_row(manage: &mut Manage, position: usize) {
+    unsafe {
+        let _ = SendMessageW(manage.list, LB_SETSEL, 0, -1);
+        let _ = SendMessageW(manage.list, LB_SETSEL, 1, position as isize);
+        let _ = SendMessageW(manage.list, LB_SETCURSEL, position, 0);
+    }
+}
+
+fn selected_indices(manage: &Manage) -> Vec<usize> {
+    let count = unsafe { SendMessageW(manage.list, LB_GETSELCOUNT, 0, 0) }.0;
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut buffer = vec![0i32; count as usize];
+    let got = unsafe {
+        SendMessageW(
+            manage.list,
+            LB_GETSELITEMS,
+            buffer.len(),
+            buffer.as_mut_ptr() as isize,
+        )
+    }
+    .0;
+    if got < 0 {
+        return Vec::new();
+    }
+    buffer.truncate((got as usize).min(buffer.len()));
+    buffer
+        .into_iter()
+        .filter_map(|index| usize::try_from(index).ok())
+        .collect()
+}
+
+fn restore_editor_selection(manage: &mut Manage) {
+    unsafe {
+        let _ = SendMessageW(manage.list, LB_SETSEL, 0, -1);
+        if let Some(position) = manage
+            .phrase_rows
+            .iter()
+            .position(|row| Some(row.id.as_str()) == manage.editing.as_deref())
+        {
+            let _ = SendMessageW(manage.list, LB_SETSEL, 1, position as isize);
+            let _ = SendMessageW(manage.list, LB_SETCURSEL, position, 0);
+        } else {
+            let _ = SendMessageW(manage.list, LB_SETCURSEL, usize::MAX, 0);
+        }
+    }
+}
+
+fn load_batch(manage: &mut Manage, ids: Vec<String>) {
+    if ids.is_empty() {
+        load_editor(manage, None);
+        return;
+    }
+    manage.loading = true;
+    manage.batch_ids = ids.clone();
+    manage.editing = None;
+    manage.editing_deleted = false;
+    manage.dirty = false;
+    manage.error_field = None;
+    manage.error_message = None;
+
+    let data = data();
+    if let Some(snippet) = data.as_ref().and_then(|data| {
+        ids.first()
+            .and_then(|id| data.snippets.iter().find(|snippet| &snippet.id == id))
+    }) {
+        set_text(manage.title_edit, &snippet.title);
+        set_text(manage.content_edit, &snippet.content);
+        manage.pinned_state = snippet.pinned;
+        manage.draft_category = snippet.category_id.clone();
+        let index = data
+            .as_ref()
+            .and_then(|data| {
+                snippet.category_id.as_ref().and_then(|id| {
+                    data.categories
+                        .iter()
+                        .position(|category| &category.id == id)
+                        .map(|position| position + 1)
+                })
+            })
+            .unwrap_or(0);
+        unsafe {
+            let _ = SendMessageW(manage.category, CB_SETCURSEL, index, 0);
+            let _ = InvalidateRect(Some(manage.pinned), None, false);
+        }
+    }
+    set_text(manage.tags_edit, "");
+    set_text(manage.hotkey_edit, "");
+    set_text(manage.save_button, "添加标签");
+    set_text(manage.cancel_button, "移除标签");
+    unsafe {
+        let _ = EnableWindow(manage.title_edit, false);
+        let _ = EnableWindow(manage.content_edit, false);
+        let _ = EnableWindow(manage.hotkey_edit, false);
+        let _ = EnableWindow(manage.category, false);
+        let _ = EnableWindow(manage.pinned, false);
+        let _ = EnableWindow(manage.tags_edit, true);
+        let _ = ShowWindow(manage.delete_button, SW_HIDE);
+        let _ = ShowWindow(manage.restore_button, SW_HIDE);
+    }
+    manage.status_text = format!("批量模式：标签将应用到 {} 个短语", ids.len());
+    manage.loading = false;
+    unsafe {
+        let _ = SetFocus(Some(manage.tags_edit));
+        let _ = InvalidateRect(Some(manage.hwnd), None, false);
+    }
+}
+
+fn batch_change_tags(manage: &mut Manage, add: bool) {
+    if manage.batch_ids.is_empty() {
+        status_message(manage, "请先选择多个短语");
+        return;
+    }
+    let ids = manage.batch_ids.clone();
+    let tags = parse_tags(&wide_text(manage.tags_edit));
+    let result = if add {
+        storage::add_tags(&ids, &tags)
+    } else {
+        storage::remove_tags(&ids, &tags)
+    };
+    match result {
+        Ok(changed) => {
+            let selected = ids.len();
+            manage.batch_ids.clear();
+            manage.editing = None;
+            manage.dirty = false;
+            reload_left(manage);
+            reload_tag_filter(manage);
+            reload_list(manage);
+            load_editor(manage, None);
+            unsafe {
+                let _ = SendMessageW(manage.list, LB_SETSEL, 0, -1);
+                let _ = SendMessageW(manage.list, LB_SETCURSEL, usize::MAX, 0);
+                let _ = InvalidateRect(Some(manage.hwnd), None, false);
+            }
+            let action = if add { "添加" } else { "移除" };
+            status_message(
+                manage,
+                &format!("已为 {selected} 个短语{action}标签（实际修改 {changed} 项）"),
+            );
+        }
+        Err(code) => {
+            let message = error_text(&code);
+            manage.error_field = Some(ID_TAGS);
+            manage.error_message = Some(message.to_string());
+            status_message(manage, message);
+            unsafe {
+                let _ = InvalidateRect(Some(manage.hwnd), None, false);
+            }
+        }
     }
 }
 
@@ -671,6 +904,7 @@ fn save_editor(manage: &mut Manage) {
             logging::info("manage: saved snippet");
             reload_left(manage);
             reload_categories(manage);
+            reload_tag_filter(manage);
             reload_list(manage);
             load_editor(manage, Some(&id));
             crate::app::refresh_snippet_hotkeys();
@@ -733,6 +967,7 @@ fn delete_selected(manage: &mut Manage) {
             manage.editing = None;
             manage.dirty = false;
             reload_left(manage);
+            reload_tag_filter(manage);
             reload_list(manage);
             crate::app::refresh_snippet_hotkeys();
             let next_id = manage.phrase_rows.first().map(|r| r.id.clone());
@@ -1153,7 +1388,13 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         scaled(30, dpi),
         scaled(8, dpi),
     );
-    let middle_header_bottom = search_shell.bottom + scaled(30, dpi);
+    let tag_shell = RECT {
+        left: mid_inner_l,
+        top: search_shell.bottom + scaled(8, dpi),
+        right: mid_inner_r,
+        bottom: search_shell.bottom + scaled(8, dpi) + scaled(28, dpi),
+    };
+    let middle_header_bottom = tag_shell.bottom + scaled(30, dpi);
 
     unsafe {
         let _ = MoveWindow(
@@ -1162,6 +1403,14 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
             search_edit_rect.top,
             (search_edit_rect.right - search_edit_rect.left).max(1),
             (search_edit_rect.bottom - search_edit_rect.top).max(1),
+            true,
+        );
+        let _ = MoveWindow(
+            manage.tag_filter,
+            tag_shell.left,
+            tag_shell.top,
+            (tag_shell.right - tag_shell.left).max(1),
+            ui::combo_height(manage.tag_filter, dpi),
             true,
         );
         let _ = MoveWindow(
@@ -1426,6 +1675,7 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
         right_pane,
         cat_input_shell,
         search_shell,
+        tag_shell,
         middle_header_bottom,
         recycle_banner,
         editor_header,
@@ -1471,6 +1721,10 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
             .find(|r| r.view == View::Category(id.clone()))
             .map(|r| r.label.clone())
             .unwrap_or_else(|| "分类".to_string()),
+    };
+    let mid_title = match &manage.tag_filter_value {
+        Some(tag) => format!("{mid_title} · #{tag}"),
+        None => mid_title,
     };
 
     d2d::paint_buffered(hdc, client, |c| {
@@ -1568,23 +1822,36 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
 
         let mid_sub = RECT {
             left: l.middle_pane.left + scaled(14, dpi),
-            top: l.search_shell.bottom + scaled(4, dpi),
+            top: l.tag_shell.bottom + scaled(4, dpi),
             right: l.middle_pane.right - scaled(14, dpi),
             bottom: l.middle_header_bottom,
         };
+        let count_str = format!("{} 项", manage.phrase_rows.len());
+        let (count_w, _) = c.measure_style(&count_str, TextStyle::Badge, dpi);
+        let count_rect = RECT {
+            left: (mid_sub.right - count_w.ceil() as i32 - scaled(2, dpi)).max(mid_sub.left),
+            top: mid_sub.top,
+            right: mid_sub.right,
+            bottom: mid_sub.bottom,
+        };
+        let title_rect = RECT {
+            left: mid_sub.left,
+            top: mid_sub.top,
+            right: (count_rect.left - scaled(8, dpi)).max(mid_sub.left + scaled(20, dpi)),
+            bottom: mid_sub.bottom,
+        };
         c.draw_text(
             &mid_title,
-            &mid_sub,
+            &title_rect,
             TextStyle::Badge,
             dpi,
             palette.muted,
             AlignH::Left,
             AlignV::Center,
         );
-        let count_str = format!("{} 项", manage.phrase_rows.len());
         c.draw_text(
             &count_str,
-            &mid_sub,
+            &count_rect,
             TextStyle::Badge,
             dpi,
             palette.muted,
@@ -1636,7 +1903,10 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
         }
 
         // 5. Editor Header
-        let mode_title = if manage.editing_deleted {
+        let batch = !manage.batch_ids.is_empty();
+        let mode_title = if batch {
+            "批量标签"
+        } else if manage.editing_deleted {
             "预览已删除短语"
         } else if manage.editing.is_some() {
             "编辑短语"
@@ -1660,8 +1930,16 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
             AlignV::Center,
         );
 
-        if manage.dirty {
-            let badge_w = scaled(76, dpi);
+        let badge_text = if batch {
+            Some(format!("已选 {} 项", manage.batch_ids.len()))
+        } else if manage.dirty {
+            Some("未保存".to_string())
+        } else {
+            None
+        };
+        if let Some(text) = badge_text {
+            let (text_w, _) = c.measure_style(&text, TextStyle::Badge, dpi);
+            let badge_w = (text_w.ceil() as i32 + scaled(24, dpi)).max(scaled(76, dpi));
             let badge_h = scaled(22, dpi);
             let badge = RECT {
                 left: hdr_rect.right + scaled(6, dpi),
@@ -1671,12 +1949,17 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
                 bottom: l.editor_header.top
                     + ((l.editor_header.bottom - l.editor_header.top) + badge_h) / 2,
             };
-            c.fill_round(&badge, d2d::scaled_f(11.0, dpi), palette.warning_soft);
+            let (badge_bg, badge_fg) = if batch {
+                (palette.primary_soft, palette.primary_text)
+            } else {
+                (palette.warning_soft, palette.warning)
+            };
+            c.fill_round(&badge, d2d::scaled_f(11.0, dpi), badge_bg);
             c.fill_circle(
                 (badge.left + scaled(10, dpi)) as f32,
                 (badge.top + badge.bottom) as f32 * 0.5,
                 d2d::scaled_f(3.0, dpi),
-                palette.warning,
+                badge_fg,
             );
             let btxt = RECT {
                 left: badge.left + scaled(16, dpi),
@@ -1685,11 +1968,11 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
                 bottom: badge.bottom,
             };
             c.draw_text(
-                "未保存",
+                &text,
                 &btxt,
                 TextStyle::Badge,
                 dpi,
-                palette.warning,
+                badge_fg,
                 AlignH::Center,
                 AlignV::Center,
             );
@@ -1793,7 +2076,11 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
         );
 
         c.draw_text(
-            "标签",
+            if batch {
+                "标签（批量）"
+            } else {
+                "标签"
+            },
             &l.tags_label,
             TextStyle::Label,
             dpi,
@@ -2109,13 +2396,27 @@ fn create(owner: HWND) -> Option<Manage> {
         ID_SEARCH,
         instance,
     );
+    let tag_filter = create_control(
+        w!("COMBOBOX"),
+        "",
+        WS_CHILD
+            | WS_VISIBLE
+            | WINDOW_STYLE((CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS) as u32),
+        hwnd,
+        ID_TAG_FILTER,
+        instance,
+    );
     let list = create_control(
         w!("LISTBOX"),
         "",
         WS_CHILD
             | WS_VISIBLE
             | WINDOW_STYLE(
-                (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS) as u32,
+                (LBS_NOTIFY
+                    | LBS_NOINTEGRALHEIGHT
+                    | LBS_OWNERDRAWFIXED
+                    | LBS_HASSTRINGS
+                    | LBS_EXTENDEDSEL) as u32,
             ),
         hwnd,
         ID_LIST,
@@ -2230,6 +2531,7 @@ fn create(owner: HWND) -> Option<Manage> {
         left,
         list,
         category,
+        tag_filter,
         cat_name,
         search,
         title_edit,
@@ -2240,7 +2542,9 @@ fn create(owner: HWND) -> Option<Manage> {
         ui::theme_control(control, palette.dark);
     }
     ui::theme_combo(category, palette.dark);
+    ui::theme_combo(tag_filter, palette.dark);
     ui::install_combo(category);
+    ui::install_combo(tag_filter);
     ui::install_smooth_listbox(left, ui::ListSurface::Sidebar);
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
     ui::install_smooth_edit(content_edit);
@@ -2265,6 +2569,13 @@ fn create(owner: HWND) -> Option<Manage> {
             scaled(34, dpi) as isize,
         );
         let _ = SendMessageW(category, CB_SETITEMHEIGHT, 0, scaled(30, dpi) as isize);
+        let _ = SendMessageW(
+            tag_filter,
+            CB_SETITEMHEIGHT,
+            usize::MAX,
+            scaled(28, dpi) as isize,
+        );
+        let _ = SendMessageW(tag_filter, CB_SETITEMHEIGHT, 0, scaled(26, dpi) as isize);
     }
 
     let mut manage = Manage {
@@ -2275,6 +2586,10 @@ fn create(owner: HWND) -> Option<Manage> {
         cat_delete,
         search,
         list,
+        tag_filter,
+        tag_filter_value: None,
+        tag_options: Vec::new(),
+        batch_ids: Vec::new(),
         new_button,
         delete_button,
         restore_button,
@@ -2317,6 +2632,7 @@ fn create(owner: HWND) -> Option<Manage> {
         cat_delete,
         search,
         list,
+        tag_filter,
         new_button,
         delete_button,
         restore_button,
@@ -2342,14 +2658,13 @@ fn create(owner: HWND) -> Option<Manage> {
 
     reload_left(&mut manage);
     reload_categories(&mut manage);
+    reload_tag_filter(&mut manage);
     reload_list(&mut manage);
     let first_id = manage.phrase_rows.first().map(|r| r.id.clone());
     load_editor(&mut manage, first_id.as_deref());
     if first_id.is_some() {
         manage.selected = Some(0);
-        unsafe {
-            let _ = SendMessageW(manage.list, LB_SETCURSEL, 0, 0);
-        }
+        select_list_row(&mut manage, 0);
     }
     relayout(&mut manage);
     manage.loading = false;
@@ -2410,6 +2725,7 @@ pub fn show(owner: HWND) {
                 manage.left,
                 manage.list,
                 manage.category,
+                manage.tag_filter,
                 manage.cat_name,
                 manage.search,
                 manage.title_edit,
@@ -2420,6 +2736,7 @@ pub fn show(owner: HWND) {
                 ui::theme_control(control, palette.dark);
             }
             ui::theme_combo(manage.category, palette.dark);
+            ui::theme_combo(manage.tag_filter, palette.dark);
             ui::theme_scrollbar(manage.content_edit, palette.dark);
             ui::apply_window_style(manage.hwnd);
         }
@@ -2428,6 +2745,7 @@ pub fn show(owner: HWND) {
         }
         reload_left(manage);
         reload_categories(manage);
+        reload_tag_filter(manage);
         reload_list(manage);
         // Reopen a clean editor from the store, so an import or restore cannot
         // leave stale text that overwrites a new snippet on save. An unsaved
@@ -2448,9 +2766,7 @@ pub fn show(owner: HWND) {
             if let Some(id) = next.as_deref() {
                 if let Some(position) = manage.phrase_rows.iter().position(|row| row.id == id) {
                     manage.selected = Some(position);
-                    unsafe {
-                        let _ = SendMessageW(manage.list, LB_SETCURSEL, position, 0);
-                    }
+                    select_list_row(manage, position);
                 }
             }
             load_editor(manage, next.as_deref());
@@ -2477,11 +2793,14 @@ pub fn show_new(owner: HWND) {
             return;
         }
         manage.view = View::All;
+        manage.tag_filter_value = None;
         reload_left(manage);
         reload_categories(manage);
+        reload_tag_filter(manage);
         reload_list(manage);
         manage.selected = None;
         unsafe {
+            let _ = SendMessageW(manage.list, LB_SETSEL, 0, -1);
             let _ = SendMessageW(manage.list, LB_SETCURSEL, usize::MAX, 0);
         }
         load_editor(manage, None);
@@ -2621,6 +2940,7 @@ unsafe extern "system" fn window_proc(
                             manage.cat_delete,
                             manage.search,
                             manage.list,
+                            manage.tag_filter,
                             manage.new_button,
                             manage.delete_button,
                             manage.restore_button,
@@ -2665,6 +2985,18 @@ unsafe extern "system" fn window_proc(
                             0,
                             scaled(30, dpi) as isize,
                         );
+                        let _ = SendMessageW(
+                            manage.tag_filter,
+                            CB_SETITEMHEIGHT,
+                            usize::MAX,
+                            scaled(28, dpi) as isize,
+                        );
+                        let _ = SendMessageW(
+                            manage.tag_filter,
+                            CB_SETITEMHEIGHT,
+                            0,
+                            scaled(26, dpi) as isize,
+                        );
                         layout(manage, width, height);
                     }
                 }
@@ -2696,7 +3028,7 @@ unsafe extern "system" fn window_proc(
                     };
                     let _ = TrackMouseEvent(&mut track);
                 }
-                let next = point_in(&manage.layout.pin_card, x, y);
+                let next = manage.batch_ids.is_empty() && point_in(&manage.layout.pin_card, x, y);
                 if next != manage.pin_hovered {
                     manage.pin_hovered = next;
                     unsafe {
@@ -2739,13 +3071,15 @@ unsafe extern "system" fn window_proc(
                 if let Ok(mut guard) = slot.try_borrow_mut() {
                     if let Some(manage) = guard.as_mut() {
                         if point_in(&manage.layout.pin_card, x, y) {
-                            manage.pinned_state = !manage.pinned_state;
-                            if !manage.loading {
-                                manage.dirty = true;
-                                manage.status_text = "未保存修改".to_string();
+                            if manage.batch_ids.is_empty() {
+                                manage.pinned_state = !manage.pinned_state;
+                                if !manage.loading {
+                                    manage.dirty = true;
+                                    manage.status_text = "未保存修改".to_string();
+                                }
+                                let _ = InvalidateRect(Some(manage.pinned), None, false);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
                             }
-                            let _ = InvalidateRect(Some(manage.pinned), None, false);
-                            let _ = InvalidateRect(Some(hwnd), None, false);
                         } else if point_in(&manage.layout.search_shell, x, y) {
                             let _ = SetFocus(Some(manage.search));
                         } else if point_in(&manage.layout.title_shell, x, y) {
@@ -2782,6 +3116,10 @@ unsafe extern "system" fn window_proc(
                     }
                     ID_SEARCH if notification == EN_CHANGE => {
                         if !manage.loading {
+                            if !manage.batch_ids.is_empty() {
+                                manage.batch_ids.clear();
+                                load_editor(manage, None);
+                            }
                             reload_list(manage);
                         }
                     }
@@ -2807,6 +3145,7 @@ unsafe extern "system" fn window_proc(
                         manage.view = next_view;
                         manage.editing = None;
                         manage.dirty = false;
+                        reload_tag_filter(manage);
                         let show_del_cat = matches!(manage.view, View::Category(_));
                         let _ = ShowWindow(
                             manage.cat_delete,
@@ -2817,36 +3156,50 @@ unsafe extern "system" fn window_proc(
                         load_editor(manage, first.as_deref());
                         if first.is_some() {
                             manage.selected = Some(0);
-                            let _ = SendMessageW(manage.list, LB_SETCURSEL, 0, 0);
+                            select_list_row(manage, 0);
                         }
                         relayout(manage);
                     }
                     ID_LIST if notification == LBN_SELCHANGE => {
-                        let index = SendMessageW(manage.list, LB_GETCURSEL, 0, 0).0;
-                        if index < 0 {
+                        let selected = selected_indices(manage);
+                        if selected.len() > 1 {
+                            if manage.dirty && !confirm_discard(hwnd) {
+                                restore_editor_selection(manage);
+                                return;
+                            }
+                            let ids: Vec<String> = selected
+                                .iter()
+                                .filter_map(|index| {
+                                    manage.phrase_rows.get(*index).map(|row| row.id.clone())
+                                })
+                                .collect();
+                            manage.selected = selected.first().copied();
+                            load_batch(manage, ids);
                             return;
                         }
-                        let Some(id) = manage.phrase_rows.get(index as usize).map(|r| r.id.clone())
-                        else {
+                        let Some(index) = selected.first().copied() else {
+                            if manage.dirty && !confirm_discard(hwnd) {
+                                restore_editor_selection(manage);
+                                return;
+                            }
+                            manage.selected = None;
+                            manage.batch_ids.clear();
+                            load_editor(manage, None);
                             return;
                         };
-                        if manage.editing.as_deref() == Some(id.as_str()) {
+                        let Some(id) = manage.phrase_rows.get(index).map(|r| r.id.clone()) else {
+                            return;
+                        };
+                        if manage.editing.as_deref() == Some(id.as_str())
+                            && manage.batch_ids.is_empty()
+                        {
                             return;
                         }
                         if manage.dirty && !confirm_discard(hwnd) {
-                            let previous = manage
-                                .phrase_rows
-                                .iter()
-                                .position(|r| Some(r.id.as_str()) == manage.editing.as_deref());
-                            let _ = SendMessageW(
-                                manage.list,
-                                LB_SETCURSEL,
-                                previous.unwrap_or(usize::MAX),
-                                0,
-                            );
+                            restore_editor_selection(manage);
                             return;
                         }
-                        manage.selected = Some(index as usize);
+                        manage.selected = Some(index);
                         load_editor(manage, Some(&id));
                     }
                     ID_CAT_ADD if notification == BN_CLICKED => {
@@ -2855,6 +3208,10 @@ unsafe extern "system" fn window_proc(
                             Some(Ok(_)) => {
                                 set_text(manage.cat_name, "");
                                 status_message(manage, "已添加分类");
+                                if !manage.batch_ids.is_empty() {
+                                    manage.batch_ids.clear();
+                                    load_editor(manage, None);
+                                }
                                 reload_left(manage);
                                 reload_categories(manage);
                                 reload_list(manage);
@@ -2908,6 +3265,7 @@ unsafe extern "system" fn window_proc(
                             return;
                         }
                         manage.selected = None;
+                        let _ = SendMessageW(manage.list, LB_SETSEL, 0, -1);
                         let _ = SendMessageW(manage.list, LB_SETCURSEL, usize::MAX, 0);
                         load_editor(manage, None);
                         let _ = SetFocus(Some(manage.title_edit));
@@ -2924,6 +3282,7 @@ unsafe extern "system" fn window_proc(
                         match storage::with_store(|store| store.restore(&id)) {
                             Some(Ok(())) => {
                                 reload_left(manage);
+                                reload_tag_filter(manage);
                                 reload_list(manage);
                                 crate::app::refresh_snippet_hotkeys();
                                 let first = manage.phrase_rows.first().map(|r| r.id.clone());
@@ -2935,6 +3294,10 @@ unsafe extern "system" fn window_proc(
                         }
                     }
                     ID_SAVE => {
+                        if !manage.batch_ids.is_empty() {
+                            batch_change_tags(manage, true);
+                            return;
+                        }
                         if manage.view == View::Recycle || manage.editing_deleted {
                             status_message(manage, "回收站内不能保存，请先恢复");
                             return;
@@ -2942,6 +3305,10 @@ unsafe extern "system" fn window_proc(
                         save_editor(manage);
                     }
                     ID_CANCEL => {
+                        if !manage.batch_ids.is_empty() {
+                            batch_change_tags(manage, false);
+                            return;
+                        }
                         let id = manage.editing.clone();
                         load_editor(manage, id.as_deref());
                         status_message(manage, "已重置修改");
@@ -2951,7 +3318,7 @@ unsafe extern "system" fn window_proc(
                             manage.error_field = None;
                             manage.error_message = None;
                         }
-                        if !manage.loading {
+                        if !manage.loading && manage.batch_ids.is_empty() {
                             manage.dirty = true;
                             manage.status_text = "未保存修改".to_string();
                         }
@@ -2977,6 +3344,23 @@ unsafe extern "system" fn window_proc(
                             manage.draft_category = current_category(manage);
                             manage.dirty = true;
                             manage.status_text = "未保存修改".to_string();
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
+                    ID_TAG_FILTER if notification == CBN_SELCHANGE => {
+                        if !manage.loading {
+                            let index =
+                                SendMessageW(manage.tag_filter, CB_GETCURSEL, 0, 0).0 as usize;
+                            manage.tag_filter_value = if index == 0 {
+                                None
+                            } else {
+                                manage.tag_options.get(index - 1).cloned()
+                            };
+                            if !manage.batch_ids.is_empty() {
+                                manage.batch_ids.clear();
+                                load_editor(manage, None);
+                            }
+                            reload_list(manage);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
@@ -3036,6 +3420,9 @@ unsafe extern "system" fn window_proc(
                     ID_LEFT => draw_nav_row(manage, draw),
                     ID_LIST => draw_phrase_row(manage, draw),
                     ID_CATEGORY => {
+                        ui::draw_combo_item(draw, manage.palette, manage.dpi, manage.fonts.body)
+                    }
+                    ID_TAG_FILTER => {
                         ui::draw_combo_item(draw, manage.palette, manage.dpi, manage.fonts.body)
                     }
                     ID_PINNED => draw_pin_switch(manage, draw),
@@ -3109,12 +3496,14 @@ unsafe extern "system" fn window_proc(
                 MANAGE.with(|slot| {
                     if let Ok(guard) = slot.try_borrow() {
                         if let Some(manage) = guard.as_ref() {
-                            unsafe {
-                                let _ = EnableWindow(manage.title_edit, true);
-                                let _ = EnableWindow(manage.content_edit, true);
-                                let _ = EnableWindow(manage.tags_edit, true);
-                                let _ = EnableWindow(manage.hotkey_edit, true);
-                                let _ = InvalidateRect(Some(manage.content_edit), None, true);
+                            if manage.batch_ids.is_empty() {
+                                unsafe {
+                                    let _ = EnableWindow(manage.title_edit, true);
+                                    let _ = EnableWindow(manage.content_edit, true);
+                                    let _ = EnableWindow(manage.tags_edit, true);
+                                    let _ = EnableWindow(manage.hotkey_edit, true);
+                                    let _ = InvalidateRect(Some(manage.content_edit), None, true);
+                                }
                             }
                         }
                     }
