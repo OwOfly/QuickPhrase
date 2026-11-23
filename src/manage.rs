@@ -472,6 +472,112 @@ fn reload_tag_filter(manage: &mut Manage) {
     manage.loading = false;
 }
 
+fn apply_tag_filter(manage: &mut Manage) {
+    if manage.loading {
+        return;
+    }
+    let index = unsafe { SendMessageW(manage.tag_filter, CB_GETCURSEL, 0, 0) }.0 as usize;
+    manage.tag_filter_value = if index == 0 {
+        None
+    } else {
+        manage.tag_options.get(index - 1).cloned()
+    };
+    if !manage.batch_ids.is_empty() {
+        manage.batch_ids.clear();
+        load_editor(manage, None);
+    }
+    reload_list(manage);
+    unsafe {
+        let _ = InvalidateRect(Some(manage.hwnd), None, false);
+    }
+}
+
+fn apply_category(manage: &mut Manage) {
+    if manage.error_field == Some(ID_CATEGORY) {
+        manage.error_field = None;
+        manage.error_message = None;
+    }
+    if !manage.loading {
+        manage.draft_category = current_category(manage);
+        manage.dirty = true;
+        manage.status_text = "未保存修改".to_string();
+        unsafe {
+            let _ = InvalidateRect(Some(manage.hwnd), None, false);
+        }
+    }
+}
+
+/// Open the custom picker for one of the two combo boxes.
+///
+/// Called from a queued message, not from the combo's own notification: the
+/// native box sets its "open" flag only after CBN_DROPDOWN returns, so running
+/// a modal picker inside that notification left the flag stuck and broke the
+/// next keyboard open.
+fn open_combo_picker(manage: &mut Manage, id: i32) {
+    match id {
+        ID_CATEGORY => {
+            reload_categories(manage);
+            let index = unsafe { SendMessageW(manage.category, CB_GETCURSEL, 0, 0) }.0;
+            let mut items = vec!["未分类".to_string()];
+            if let Some(file) = data() {
+                items.extend(file.categories.iter().map(|c| c.name.clone()));
+            }
+            if let Some(pick) = crate::dropmenu::show(
+                manage.hwnd,
+                manage.category,
+                &items,
+                if index >= 0 {
+                    Some(index as usize)
+                } else {
+                    None
+                },
+            ) {
+                if index < 0 || pick != index as usize {
+                    let _ = unsafe { SendMessageW(manage.category, CB_SETCURSEL, pick, 0) };
+                    apply_category(manage);
+                }
+            }
+        }
+        ID_TAG_FILTER => {
+            let previous_filter = manage
+                .tag_filter_value
+                .as_deref()
+                .map(|tag| tag.to_lowercase());
+            reload_tag_filter(manage);
+            if manage
+                .tag_filter_value
+                .as_deref()
+                .map(|tag| tag.to_lowercase())
+                != previous_filter
+            {
+                // The saved tag disappeared (e.g. an import removed it), so
+                // reload_tag_filter reset the combo to "all"; the middle list
+                // must follow even if the user cancels the picker.
+                apply_tag_filter(manage);
+            }
+            let index = unsafe { SendMessageW(manage.tag_filter, CB_GETCURSEL, 0, 0) }.0;
+            let mut items = vec!["全部标签".to_string()];
+            items.extend(manage.tag_options.iter().cloned());
+            if let Some(pick) = crate::dropmenu::show(
+                manage.hwnd,
+                manage.tag_filter,
+                &items,
+                if index >= 0 {
+                    Some(index as usize)
+                } else {
+                    None
+                },
+            ) {
+                if index < 0 || pick != index as usize {
+                    let _ = unsafe { SendMessageW(manage.tag_filter, CB_SETCURSEL, pick, 0) };
+                    apply_tag_filter(manage);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn reload_list(manage: &mut Manage) {
     let query = wide_text(manage.search);
     let (category, recycle) = match &manage.view {
@@ -808,16 +914,14 @@ fn select_all_filtered(manage: &mut Manage) {
 }
 
 fn confirm_discard(owner: HWND) -> bool {
-    let text = platform::wide("有未保存的修改，确定放弃吗？");
-    let caption = platform::wide("QuickPhrase");
-    unsafe {
-        MessageBoxW(
-            Some(owner),
-            PCWSTR(text.as_ptr()),
-            PCWSTR(caption.as_ptr()),
-            MB_YESNO | MB_ICONWARNING,
-        ) == IDYES
-    }
+    crate::confirm_ui::confirm(
+        owner,
+        "未保存的修改",
+        "确定放弃当前未保存的修改吗？",
+        "继续编辑可以保留这些内容。",
+        "放弃修改",
+        false,
+    )
 }
 
 fn current_category(manage: &Manage) -> Option<String> {
@@ -973,22 +1077,30 @@ fn delete_selected(manage: &mut Manage) {
         return;
     };
     let recycle = manage.view == View::Recycle || manage.editing_deleted;
-    let question = if recycle {
-        "彻底删除后无法恢复，继续吗？"
+    // The destructive action targets the saved snippet, so name it with the
+    // stored title; the editor may hold an unsaved rename.
+    let stored_title =
+        storage::with_store(|store| store.get(&id).map(|snippet| snippet.title.clone())).flatten();
+    let mut title = stored_title.unwrap_or_else(|| wide_text(manage.title_edit));
+    if title.trim().is_empty() {
+        title = "这条短语".to_string();
+    }
+    let (heading, message, hint, confirm_label) = if recycle {
+        (
+            "彻底删除",
+            format!("彻底删除「{title}」？"),
+            "删除后无法恢复。",
+            "彻底删除",
+        )
     } else {
-        "移入回收站？"
-    };
-    let text = platform::wide(question);
-    let caption = platform::wide("QuickPhrase");
-    let answer = unsafe {
-        MessageBoxW(
-            Some(manage.hwnd),
-            PCWSTR(text.as_ptr()),
-            PCWSTR(caption.as_ptr()),
-            MB_YESNO | MB_ICONQUESTION,
+        (
+            "移入回收站",
+            format!("将「{title}」移入回收站？"),
+            "可在回收站中恢复。",
+            "移入回收站",
         )
     };
-    if answer != IDYES {
+    if !crate::confirm_ui::confirm(manage.hwnd, heading, &message, hint, confirm_label, true) {
         return;
     }
     let result = storage::with_store(|store| {
@@ -2722,6 +2834,8 @@ fn create(owner: HWND) -> Option<Manage> {
         let _ = SendMessageW(title_edit, WM_SETFONT, manage.fonts.title.0 as usize, 1);
         let style = GetWindowLongW(title_edit, GWL_STYLE);
         let _ = SetWindowLongW(title_edit, GWL_STYLE, style | WS_TABSTOP.0 as i32);
+        crate::dropmenu::attach_combo(tag_filter, ID_TAG_FILTER);
+        crate::dropmenu::attach_combo(category, ID_CATEGORY);
     }
 
     reload_left(&mut manage);
@@ -2740,6 +2854,11 @@ fn create(owner: HWND) -> Option<Manage> {
 }
 
 pub fn show(owner: HWND) {
+    if crate::confirm_ui::is_open() || crate::dropmenu::is_open() {
+        // A modal confirmation/picker is active; tray activation must not
+        // steal its foreground or start a second window transition.
+        return;
+    }
     let needs_create = MANAGE.with(|slot| match slot.try_borrow() {
         Ok(guard) => guard.is_none(),
         Err(_) => false,
@@ -3175,6 +3294,18 @@ unsafe extern "system" fn window_proc(
             });
             LRESULT(0)
         }
+        crate::dropmenu::OPEN_PICKER => {
+            let id = wparam.0 as i32;
+            MANAGE.with(|slot| {
+                let Ok(mut guard) = slot.try_borrow_mut() else {
+                    return;
+                };
+                if let Some(manage) = guard.as_mut() {
+                    open_combo_picker(manage, id);
+                }
+            });
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             let notification = ((wparam.0 >> 16) & 0xffff) as u32;
@@ -3306,15 +3437,23 @@ unsafe extern "system" fn window_proc(
                         if manage.dirty && !confirm_discard(hwnd) {
                             return;
                         }
-                        let text = platform::wide("删除分类后，其短语会移到未分类。继续吗？");
-                        let caption = platform::wide("QuickPhrase");
-                        let answer = MessageBoxW(
-                            Some(manage.hwnd),
-                            PCWSTR(text.as_ptr()),
-                            PCWSTR(caption.as_ptr()),
-                            MB_YESNO | MB_ICONQUESTION,
-                        );
-                        if answer != IDYES {
+                        let name = data()
+                            .and_then(|file| {
+                                file.categories
+                                    .into_iter()
+                                    .find(|c| c.id == category)
+                                    .map(|c| c.name)
+                            })
+                            .unwrap_or_else(|| "该分类".to_string());
+                        let message = format!("删除「{name}」后，其短语会移到未分类。");
+                        if !crate::confirm_ui::confirm(
+                            manage.hwnd,
+                            "删除分类",
+                            &message,
+                            "此操作不可撤销。",
+                            "删除分类",
+                            true,
+                        ) {
                             return;
                         }
                         match storage::with_store(|store| store.delete_category(&category)) {
@@ -3413,35 +3552,8 @@ unsafe extern "system" fn window_proc(
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }
-                    ID_CATEGORY if notification == CBN_SELCHANGE => {
-                        if manage.error_field == Some(ID_CATEGORY) {
-                            manage.error_field = None;
-                            manage.error_message = None;
-                        }
-                        if !manage.loading {
-                            manage.draft_category = current_category(manage);
-                            manage.dirty = true;
-                            manage.status_text = "未保存修改".to_string();
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
-                    ID_TAG_FILTER if notification == CBN_SELCHANGE => {
-                        if !manage.loading {
-                            let index =
-                                SendMessageW(manage.tag_filter, CB_GETCURSEL, 0, 0).0 as usize;
-                            manage.tag_filter_value = if index == 0 {
-                                None
-                            } else {
-                                manage.tag_options.get(index - 1).cloned()
-                            };
-                            if !manage.batch_ids.is_empty() {
-                                manage.batch_ids.clear();
-                                load_editor(manage, None);
-                            }
-                            reload_list(manage);
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
-                    }
+                    ID_CATEGORY if notification == CBN_SELCHANGE => apply_category(manage),
+                    ID_TAG_FILTER if notification == CBN_SELCHANGE => apply_tag_filter(manage),
                     _ => {}
                 }
             });
@@ -3617,7 +3729,7 @@ unsafe extern "system" fn window_proc(
                     Some(manage) if manage.dirty => (confirm_discard(manage.hwnd), true),
                     _ => (true, false),
                 },
-                Err(_) => (true, false),
+                Err(_) => (false, false),
             });
             if should_close {
                 if had_dirty {
