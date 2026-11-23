@@ -996,6 +996,9 @@ struct SmoothListState {
     dragging: bool,
     drag_offset: i32,
     wheel_acc: i32,
+    /// Whether the overlay scrollbar lane currently holds painted pixels.
+    /// Used to clear a stale thumb when the list stops being scrollable.
+    thumb_painted: bool,
 }
 
 struct SmoothEditState {
@@ -1051,6 +1054,11 @@ fn paint_pill_scrollbar(
     if client.right - client.left <= strip_w || client.bottom - client.top <= 4 {
         return;
     }
+    // No thumb means no lane to clear. Painting the lane anyway would wipe the
+    // right edge of cards that are only padded for a visible scrollbar.
+    let Some(m) = metrics else {
+        return;
+    };
     let strip = RECT {
         left: client.right - strip_w,
         top: client.top,
@@ -1060,9 +1068,6 @@ fn paint_pill_scrollbar(
     let palette = crate::theme::current();
     d2d::paint_buffered(hdc, strip, |c| {
         c.fill_rect(&strip, bg);
-        let Some(m) = metrics else {
-            return;
-        };
         let active = hovered || dragging;
         if active {
             let track_w = scaled(6, dpi).max(4);
@@ -1131,6 +1136,35 @@ fn paint_listbox_scrollbar_on(hwnd: HWND, target_hdc: Option<HDC>) {
         ListSurface::Sidebar => palette.sidebar,
     };
     let metrics = listbox_metrics(hwnd).map(|(_, _, m)| m);
+    if metrics.is_none() {
+        // Only the on-screen paint owns the painted-thumb flag; a capture must
+        // not consume the pending cleanup for the real window.
+        let was_painted = if target_hdc.is_none() {
+            LIST_STATES.with(|map| {
+                map.borrow_mut()
+                    .get_mut(&key)
+                    .map(|s| std::mem::replace(&mut s.thumb_painted, false))
+                    .unwrap_or(false)
+            })
+        } else {
+            false
+        };
+        if was_painted {
+            // The list just stopped being scrollable: repaint the rows so the
+            // old thumb cannot leave a stripe over the last card.
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+        return;
+    }
+    if target_hdc.is_none() {
+        LIST_STATES.with(|map| {
+            if let Some(s) = map.borrow_mut().get_mut(&key) {
+                s.thumb_painted = true;
+            }
+        });
+    }
 
     if let Some(hdc) = target_hdc {
         if !hdc.0.is_null() {
@@ -1172,6 +1206,7 @@ pub fn install_smooth_listbox(hwnd: HWND, surface: ListSurface) {
                     dragging: false,
                     drag_offset: 0,
                     wheel_acc: 0,
+                    thumb_painted: false,
                 },
             );
         });

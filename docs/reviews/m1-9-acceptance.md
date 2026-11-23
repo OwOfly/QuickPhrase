@@ -198,6 +198,19 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代标签筛选与批量标签的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 150/150，panel-smoke 10/10，tray-smoke 19/19，tag-batch-smoke 10/10，host-matrix（隔离数据）10/10，snippet-hotkey-smoke 16/16。
 
+## 列表卡片右边框修复后重打包（2026-11-23）
+
+管理窗口“选中卡片右侧被白色车道刷掉”的修复（见 `docs/reviews/manage-card-right-edge-20261123.md`）进入发布包：
+
+```
+exe bytes=1075712
+zip bytes=590329
+sha256=4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a
+fileVersion=0.1.0 product=QuickPhrase 快语
+```
+
+本哈希取代标签云与全选的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 150/150，`cargo fmt --check` / `cargo clippy --release` PASS，panel-smoke 10/10，tag-batch-smoke 10/10。glm / kimi / qwen 复核 PASS（kimi/qwen 提出的截图路径状态边界已修复并 focused 复验）。未创建标签，待人工桌面矩阵。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

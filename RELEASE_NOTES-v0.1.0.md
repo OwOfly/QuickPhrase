@@ -3,9 +3,9 @@
 - 版本：`0.1.0`
 - 构建：Windows x64，Rust nightly MSVC
 - 产物：`QuickPhrase-0.1.0-win-x64.zip`
-- EXE：`1,074,688` bytes
-- ZIP：`590,171` bytes
-- SHA256：`20a1ea3f2da94b20295f35cfa93fd8e0fa4de477a80368839174d4701267980d`
+- EXE：`1,075,712` bytes
+- ZIP：`590,329` bytes
+- SHA256：`4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a`
 - 许可证：MIT
 - 发布状态：自动化门禁已通过；真实桌面矩阵待人工验收
 
@@ -49,8 +49,14 @@
 - `cargo clippy --release` 0 警告
 - `cargo test` 150/150
 - panel-smoke 10/10、tray-smoke 19/19、tag-batch-smoke 10/10
-- host-matrix 10/10、snippet-hotkey-smoke 16/16（本构建 `20a1ea…`）
+- host-matrix 10/10、snippet-hotkey-smoke 16/16（本构建 `4e89ba…`）
 - 复核记录：`docs/reviews/` 下阶段三各模块记录
+
+## 本次修复（2026-11-23）
+
+- 修复列表选中卡片右侧被滚动条车道背景刷掉的问题：列表不可滚动时不再绘制右侧车道，卡片右边框与圆角完整。
+- 影响范围：管理窗口短语列表、左侧分类列表、主面板列表共用同一滚动条绘制逻辑。
+- 复核：glm / kimi / qwen 三家 PASS（kimi/qwen 提出的截图路径状态边界已修复并复验）；细节见 `docs/reviews/manage-card-right-edge-20261123.md`。
 
 ## 发布前最后检查
 
