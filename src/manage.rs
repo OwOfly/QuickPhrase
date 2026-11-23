@@ -45,6 +45,7 @@ const ID_CAT_DELETE: i32 = 214;
 const ID_RESTORE: i32 = 215;
 const ID_HOTKEY: i32 = 216;
 const ID_TAG_FILTER: i32 = 217;
+const ID_SELECT_ALL: i32 = 218;
 
 const MIN_WIDTH: i32 = 800;
 const MIN_HEIGHT: i32 = 540;
@@ -133,6 +134,7 @@ struct Manage {
     tag_options: Vec<String>,
     batch_ids: Vec<String>,
     new_button: HWND,
+    select_all_button: HWND,
     delete_button: HWND,
     restore_button: HWND,
     title_edit: HWND,
@@ -247,6 +249,11 @@ fn active_rows(
     let Some(data) = data() else {
         return Vec::new();
     };
+    let (query_tags, text_query) = search::split_tag_query(query);
+    let mut wanted: Vec<String> = query_tags;
+    if let Some(tag) = tag {
+        wanted.push(tag.to_lowercase());
+    }
     let category_names: Vec<(String, String)> = data
         .categories
         .iter()
@@ -271,13 +278,10 @@ fn active_rows(
                     Some(id) => snippet.category_id.as_deref() == Some(id),
                     None => true,
                 }
-                && match tag {
-                    Some(tag) => {
-                        let tag = tag.to_lowercase();
-                        snippet.tags.iter().any(|item| item.to_lowercase() == tag)
-                    }
-                    None => true,
-                }
+                && wanted.iter().all(|tag| {
+                    let tag = tag.to_lowercase();
+                    snippet.tags.iter().any(|item| item.to_lowercase() == tag)
+                })
         })
         .collect();
 
@@ -294,7 +298,7 @@ fn active_rows(
             sort_order: snippet.sort_order,
         })
         .collect();
-    let hits = search::rank(&docs, query, usize::MAX);
+    let hits = search::rank(&docs, text_query, usize::MAX);
     hits.into_iter()
         .map(|hit| {
             let snippet = pool[hit.index];
@@ -769,6 +773,33 @@ fn batch_change_tags(manage: &mut Manage, add: bool) {
             }
         }
     }
+}
+
+fn select_all_filtered(manage: &mut Manage) {
+    if manage.phrase_rows.is_empty() {
+        status_message(manage, "当前筛选结果为空");
+        return;
+    }
+    if manage.dirty && !confirm_discard(manage.hwnd) {
+        return;
+    }
+    let ids: Vec<String> = manage
+        .phrase_rows
+        .iter()
+        .map(|row| row.id.clone())
+        .collect();
+    if ids.len() == 1 {
+        manage.selected = Some(0);
+        select_list_row(manage, 0);
+        load_editor(manage, Some(&ids[0]));
+        status_message(manage, "已选择 1 个短语");
+        return;
+    }
+    unsafe {
+        let _ = SendMessageW(manage.list, LB_SETSEL, 1, -1);
+    }
+    manage.selected = Some(0);
+    load_batch(manage, ids);
 }
 
 fn confirm_discard(owner: HWND) -> bool {
@@ -1375,11 +1406,13 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
     let mid_inner_l = middle_pane.left + pad;
     let mid_inner_r = middle_pane.right - pad;
     let new_btn_w = scaled(70, dpi);
+    let select_btn_w = scaled(52, dpi);
+    let header_gap = scaled(8, dpi);
     let search_h = scaled(34, dpi);
     let search_shell = RECT {
         left: mid_inner_l,
         top: pad,
-        right: (mid_inner_r - new_btn_w - scaled(8, dpi)).max(mid_inner_l + 40),
+        right: (mid_inner_r - new_btn_w - select_btn_w - header_gap * 2).max(mid_inner_l + 40),
         bottom: pad + search_h,
     };
     let search_edit_rect = ui::edit_centered_rect(
@@ -1411,6 +1444,14 @@ fn layout(manage: &mut Manage, width: i32, height: i32) {
             tag_shell.top,
             (tag_shell.right - tag_shell.left).max(1),
             ui::combo_height(manage.tag_filter, dpi),
+            true,
+        );
+        let _ = MoveWindow(
+            manage.select_all_button,
+            mid_inner_r - new_btn_w - header_gap - select_btn_w,
+            pad,
+            select_btn_w,
+            search_h,
             true,
         );
         let _ = MoveWindow(
@@ -1722,9 +1763,20 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
             .map(|r| r.label.clone())
             .unwrap_or_else(|| "分类".to_string()),
     };
-    let mid_title = match &manage.tag_filter_value {
-        Some(tag) => format!("{mid_title} · #{tag}"),
-        None => mid_title,
+    let (query_tags, _) = search::split_tag_query(&wide_text(manage.search));
+    let mut filter_tags = query_tags;
+    if let Some(tag) = &manage.tag_filter_value {
+        if !filter_tags
+            .iter()
+            .any(|existing| existing.to_lowercase() == tag.to_lowercase())
+        {
+            filter_tags.push(tag.clone());
+        }
+    }
+    let mid_title = if filter_tags.is_empty() {
+        mid_title
+    } else {
+        format!("{mid_title} · #{}", filter_tags.join(" #"))
     };
 
     d2d::paint_buffered(hdc, client, |c| {
@@ -2430,6 +2482,14 @@ fn create(owner: HWND) -> Option<Manage> {
         ID_NEW,
         instance,
     );
+    let select_all_button = create_control(
+        w!("BUTTON"),
+        "全选",
+        WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_OWNERDRAW as u32),
+        hwnd,
+        ID_SELECT_ALL,
+        instance,
+    );
     let delete_button = create_control(
         w!("BUTTON"),
         "移入回收站",
@@ -2519,6 +2579,7 @@ fn create(owner: HWND) -> Option<Manage> {
         cat_add,
         cat_delete,
         new_button,
+        select_all_button,
         delete_button,
         restore_button,
         pinned,
@@ -2591,6 +2652,7 @@ fn create(owner: HWND) -> Option<Manage> {
         tag_options: Vec::new(),
         batch_ids: Vec::new(),
         new_button,
+        select_all_button,
         delete_button,
         restore_button,
         title_edit,
@@ -2634,6 +2696,7 @@ fn create(owner: HWND) -> Option<Manage> {
         list,
         tag_filter,
         new_button,
+        select_all_button,
         delete_button,
         restore_button,
         content_edit,
@@ -2942,6 +3005,7 @@ unsafe extern "system" fn window_proc(
                             manage.list,
                             manage.tag_filter,
                             manage.new_button,
+                            manage.select_all_button,
                             manage.delete_button,
                             manage.restore_button,
                             manage.content_edit,
@@ -3270,6 +3334,7 @@ unsafe extern "system" fn window_proc(
                         load_editor(manage, None);
                         let _ = SetFocus(Some(manage.title_edit));
                     }
+                    ID_SELECT_ALL => select_all_filtered(manage),
                     ID_DELETE => delete_selected(manage),
                     ID_RESTORE if notification == BN_CLICKED => {
                         let Some(id) = manage.editing.clone() else {
@@ -3431,6 +3496,13 @@ unsafe extern "system" fn window_proc(
                         manage.palette,
                         ui::ButtonKind::Primary,
                         Some(Icon::Plus),
+                        manage.dpi,
+                        manage.palette.card,
+                    ),
+                    ID_SELECT_ALL => ui::draw_button(
+                        draw,
+                        manage.palette,
+                        ui::ButtonKind::Secondary,
                         manage.dpi,
                         manage.palette.card,
                     ),

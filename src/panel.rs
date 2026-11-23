@@ -1,6 +1,7 @@
 //! QuickPhrase 2.0 floating quick-insert panel (Direct2D + DirectWrite).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -41,6 +42,7 @@ const PANEL_HEIGHT: i32 = 420;
 const BANNER_HEIGHT: i32 = 28;
 const SEARCH_HEIGHT: i32 = 40;
 const CATEGORY_HEIGHT: i32 = 40;
+const TAG_HEIGHT: i32 = 34;
 const FOOTER_HEIGHT: i32 = 38;
 const ITEM_HEIGHT: i32 = 60;
 
@@ -75,6 +77,7 @@ pub struct Item {
 pub struct PanelData {
     pub items: Vec<Item>,
     pub categories: Vec<(String, String)>,
+    pub tag_counts: Vec<(String, usize)>,
     pub notice: Option<String>,
     pub copy_only: Option<String>,
     pub paste_mode: bool,
@@ -83,12 +86,35 @@ pub struct PanelData {
     pub sort_mode: crate::search::SortMode,
 }
 
+/// Tag cloud data: case-insensitive merge (first spelling wins), count desc,
+/// then name order. Used by both the production panel and `--panel-test`.
+pub fn count_tags(items: &[Item]) -> Vec<(String, usize)> {
+    let mut counts: HashMap<String, (String, usize)> = HashMap::new();
+    for item in items {
+        for tag in &item.tags {
+            let entry = counts
+                .entry(tag.to_lowercase())
+                .or_insert_with(|| (tag.clone(), 0));
+            entry.1 += 1;
+        }
+    }
+    let mut counts: Vec<(String, usize)> = counts.into_values().collect();
+    counts.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.to_lowercase().cmp(&right.0.to_lowercase()))
+    });
+    counts
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum HoverTarget {
     None,
     Settings,
     Manage,
     Category(usize),
+    Tag(usize),
 }
 
 struct Brushes {
@@ -102,6 +128,7 @@ struct LayoutRects {
     settings_btn: RECT,
     hotkey_kbd: RECT,
     category_bar_bottom: i32,
+    tag_bar_bottom: i32,
     list: RECT,
     footer: RECT,
     manage_btn: RECT,
@@ -115,8 +142,10 @@ struct Panel {
     filtered: Vec<usize>,
     items: Vec<Item>,
     categories: Vec<(String, String)>,
+    tag_counts: Vec<(String, usize)>,
     sort_mode: crate::search::SortMode,
     active_category: Option<String>,
+    active_tags: Vec<String>,
     copy_only: Option<String>,
     notice: Option<String>,
     paste_mode: bool,
@@ -281,10 +310,16 @@ fn compute_layout(panel: &Panel, width: i32, height: i32) -> LayoutRects {
     };
 
     let category_bar_bottom = search_shell.bottom + scaled(CATEGORY_HEIGHT, dpi);
+    let tag_row = if panel.tag_counts.is_empty() {
+        0
+    } else {
+        scaled(TAG_HEIGHT, dpi)
+    };
+    let tag_bar_bottom = category_bar_bottom + tag_row;
     let footer_h = scaled(FOOTER_HEIGHT, dpi);
     let footer = RECT {
         left: 1,
-        top: (height - footer_h - 1).max(category_bar_bottom),
+        top: (height - footer_h - 1).max(tag_bar_bottom),
         right: (width - 1).max(2),
         bottom: (height - 1).max(1),
     };
@@ -298,7 +333,7 @@ fn compute_layout(panel: &Panel, width: i32, height: i32) -> LayoutRects {
         bottom: footer.top + (footer_h + manage_h) / 2,
     };
 
-    let list_top = category_bar_bottom + scaled(6, dpi);
+    let list_top = tag_bar_bottom + scaled(6, dpi);
     let list = RECT {
         left: scaled(8, dpi),
         top: list_top,
@@ -312,6 +347,7 @@ fn compute_layout(panel: &Panel, width: i32, height: i32) -> LayoutRects {
         settings_btn,
         hotkey_kbd,
         category_bar_bottom,
+        tag_bar_bottom,
         list,
         footer,
         manage_btn,
@@ -408,7 +444,7 @@ pub fn show_copy_only(notify: HWND, data: PanelData) -> u128 {
 
 pub fn show_test() -> u128 {
     crate::storage::init();
-    let items = crate::storage::panel_items()
+    let items: Vec<Item> = crate::storage::panel_items()
         .into_iter()
         .map(|row| Item {
             id: row.id,
@@ -425,6 +461,7 @@ pub fn show_test() -> u128 {
             use_count: row.use_count,
         })
         .collect();
+    let tag_counts = count_tags(&items);
     let settings = crate::storage::settings_clone().unwrap_or_default();
     let hotkey_hint = settings.hotkey.clone();
     present(
@@ -434,6 +471,7 @@ pub fn show_test() -> u128 {
         PanelData {
             items,
             categories: crate::storage::categories(),
+            tag_counts,
             notice: crate::storage::read_only_notice(),
             copy_only: None,
             paste_mode: false,
@@ -484,6 +522,7 @@ fn present(
         panel.notify = notify;
         panel.items = data.items;
         panel.categories = data.categories;
+        panel.tag_counts = data.tag_counts;
         panel.sort_mode = data.sort_mode;
         panel.notice = data.notice;
         panel.copy_only = data.copy_only;
@@ -491,6 +530,7 @@ fn present(
         panel.keep_tabs = data.keep_tabs;
         panel.hotkey_hint = data.hotkey_hint;
         panel.active_category = None;
+        panel.active_tags.clear();
         panel.hover = HoverTarget::None;
         panel.hiding = false;
         panel.quit_on_hide = quit_on_hide;
@@ -817,8 +857,10 @@ fn create() -> Option<Panel> {
         filtered: Vec::new(),
         items: Vec::new(),
         categories: Vec::new(),
+        tag_counts: Vec::new(),
         sort_mode: crate::search::SortMode::Recent,
         active_category: None,
+        active_tags: Vec::new(),
         copy_only: None,
         notice: None,
         paste_mode: false,
@@ -1231,6 +1273,45 @@ fn category_chips(panel: &Panel, rects: &LayoutRects, width: i32) -> Vec<Categor
     chips
 }
 
+struct TagChip {
+    name: String,
+    count: usize,
+    rect: RECT,
+}
+
+fn tag_chips(panel: &Panel, rects: &LayoutRects, width: i32) -> Vec<TagChip> {
+    if panel.tag_counts.is_empty() {
+        return Vec::new();
+    }
+    let dpi = panel.dpi;
+    let margin = scaled(14, dpi);
+    let right_limit = width - margin;
+    let height = scaled(22, dpi);
+    let top = rects.category_bar_bottom + (scaled(TAG_HEIGHT, dpi) - height) / 2;
+    let mut x = margin;
+    let mut chips = Vec::new();
+    for (name, count) in &panel.tag_counts {
+        let label = format!("{name} {count}");
+        let (tw, _) = d2d::measure_style(&label, TextStyle::Badge, dpi);
+        let chip_w = tw.ceil() as i32 + scaled(20, dpi);
+        if x + chip_w > right_limit {
+            break;
+        }
+        chips.push(TagChip {
+            name: name.clone(),
+            count: *count,
+            rect: RECT {
+                left: x,
+                top,
+                right: x + chip_w,
+                bottom: top + height,
+            },
+        });
+        x += chip_w + scaled(6, dpi);
+    }
+    chips
+}
+
 fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
     x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
 }
@@ -1240,6 +1321,8 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
     let palette = panel.palette;
     let rects = compute_layout(panel, client.right, client.bottom);
     let chips = category_chips(panel, &rects, client.right);
+    let tags = tag_chips(panel, &rects, client.right);
+    let query_tags = crate::search::split_tag_query(&panel.last_query).0;
     let edit_focused = unsafe { GetFocus() } == panel.edit;
 
     d2d::paint_buffered(hdc, client, |c| {
@@ -1447,6 +1530,58 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
             1.0,
         );
 
+        // 4b. Tag cloud row
+        for (idx, chip) in tags.iter().enumerate() {
+            let selected = panel
+                .active_tags
+                .iter()
+                .chain(query_tags.iter())
+                .any(|tag| tag.to_lowercase() == chip.name.to_lowercase());
+            let hovered = panel.hover == HoverTarget::Tag(idx);
+            let radius = (chip.rect.bottom - chip.rect.top) as f32 * 0.5;
+            if selected {
+                let fill = if palette.dark {
+                    palette.primary_hover
+                } else {
+                    palette.primary
+                };
+                c.fill_round(&chip.rect, radius, fill);
+            } else if hovered {
+                c.fill_stroke_round(
+                    &chip.rect,
+                    radius,
+                    palette.hover,
+                    palette.border_strong,
+                    1.0,
+                );
+            } else {
+                c.fill_round(&chip.rect, radius, palette.field);
+            }
+            c.draw_text(
+                &format!("{} {}", chip.name, chip.count),
+                &chip.rect,
+                TextStyle::Badge,
+                dpi,
+                if selected {
+                    COLORREF(0xFFFFFF)
+                } else {
+                    palette.secondary
+                },
+                AlignH::Center,
+                AlignV::Center,
+            );
+        }
+        if rects.tag_bar_bottom > rects.category_bar_bottom {
+            c.line(
+                1.0,
+                rects.tag_bar_bottom as f32 - 0.5,
+                (client.right - 1) as f32,
+                rects.tag_bar_bottom as f32 - 0.5,
+                palette.divider,
+                1.0,
+            );
+        }
+
         // 5. Empty State Illustration when list has no matches
         if let Some(message) = empty_message(panel) {
             let cx = (rects.list.left + rects.list.right) as f32 * 0.5;
@@ -1483,7 +1618,9 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
                 AlignV::Center,
             );
 
-            let hint = if !panel.last_query.is_empty() {
+            let hint = if !panel.active_tags.is_empty() {
+                "当前标签筛选无结果，点击标签芯片取消选择"
+            } else if !panel.last_query.is_empty() {
                 "尝试更换关键词，或点击「全部」分类"
             } else {
                 "点击右下角「管理短语」添加你的常用文本"
@@ -1805,27 +1942,19 @@ type FilterResult = (Vec<usize>, Vec<Highlight>, Vec<Highlight>);
 
 #[cfg(test)]
 fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterResult {
-    filter_items_mode(items, category, query, crate::search::SortMode::Recent)
+    filter_items_mode(items, category, query, &[], crate::search::SortMode::Recent)
 }
 
 fn filter_items_mode(
     items: &[Item],
     category: Option<&str>,
     query: &str,
+    active_tags: &[String],
     sort_mode: crate::search::SortMode,
 ) -> FilterResult {
-    let trimmed = query.trim();
-    let (tag_filter, text_query) = if let Some(rest) = trimmed.strip_prefix('#') {
-        let rest = rest.trim_start();
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let tag = parts.next().unwrap_or("").trim().to_lowercase();
-        (
-            if tag.is_empty() { None } else { Some(tag) },
-            parts.next().unwrap_or("").trim(),
-        )
-    } else {
-        (None, trimmed)
-    };
+    let (query_tags, text_query) = crate::search::split_tag_query(query);
+    let mut wanted = active_tags.to_vec();
+    wanted.extend(query_tags);
 
     let subset: Vec<usize> = items
         .iter()
@@ -1835,13 +1964,12 @@ fn filter_items_mode(
                 Some(id) => item.category_id.as_deref() == Some(id),
                 None => true,
             };
-            let tag_ok = match &tag_filter {
-                Some(tag) => item
-                    .tags
+            let tag_ok = wanted.iter().all(|tag| {
+                let tag = tag.to_lowercase();
+                item.tags
                     .iter()
-                    .any(|item_tag| item_tag.to_lowercase() == *tag),
-                None => true,
-            };
+                    .any(|item_tag| item_tag.to_lowercase() == tag)
+            });
             category_ok && tag_ok
         })
         .map(|(index, _)| index)
@@ -1958,6 +2086,7 @@ fn empty_message_for(
     filtered: usize,
     query: &str,
     has_category: bool,
+    has_tags: bool,
     load_failed: bool,
 ) -> Option<&'static str> {
     if filtered != 0 {
@@ -1969,7 +2098,7 @@ fn empty_message_for(
         }
         return Some("还没有短语");
     }
-    if !query.is_empty() {
+    if !query.is_empty() || has_tags {
         return Some("没有匹配的短语");
     }
     if has_category {
@@ -1997,6 +2126,7 @@ fn empty_message(panel: &Panel) -> Option<&'static str> {
         panel.filtered.len(),
         &panel.last_query,
         panel.active_category.is_some(),
+        !panel.active_tags.is_empty(),
         data_load_failed(panel.notice.as_deref()),
     )
 }
@@ -2017,6 +2147,7 @@ fn populate(query: &str) {
             &panel.items,
             panel.active_category.as_deref(),
             query,
+            &panel.active_tags,
             panel.sort_mode,
         );
         (
@@ -2178,6 +2309,11 @@ fn hit_test_hover(panel: &Panel, width: i32, height: i32, x: i32, y: i32) -> Hov
     for (idx, chip) in category_chips(panel, &rects, width).iter().enumerate() {
         if point_in(&chip.rect, x, y) {
             return HoverTarget::Category(idx);
+        }
+    }
+    for (idx, chip) in tag_chips(panel, &rects, width).iter().enumerate() {
+        if point_in(&chip.rect, x, y) {
+            return HoverTarget::Tag(idx);
         }
     }
     HoverTarget::None
@@ -2361,6 +2497,7 @@ unsafe extern "system" fn window_proc(
                 OpenSettings(HWND),
                 OpenManage(HWND),
                 Category(Option<String>, HWND),
+                Tag(String, HWND),
             }
 
             let action = PANEL.with(|slot| {
@@ -2381,6 +2518,11 @@ unsafe extern "system" fn window_proc(
                 for chip in category_chips(panel, &rects, client.right) {
                     if point_in(&chip.rect, x, y) {
                         return ClickAction::Category(chip.id, panel.edit);
+                    }
+                }
+                for chip in tag_chips(panel, &rects, client.right) {
+                    if point_in(&chip.rect, x, y) {
+                        return ClickAction::Tag(chip.name, panel.edit);
                     }
                 }
                 ClickAction::None
@@ -2425,6 +2567,31 @@ unsafe extern "system" fn window_proc(
                         let _ = SetFocus(Some(edit));
                     }
                 }
+                ClickAction::Tag(name, edit) => {
+                    let changed = PANEL.with(|slot| {
+                        let mut guard = slot.borrow_mut();
+                        let Some(panel) = guard.as_mut() else {
+                            return false;
+                        };
+                        if let Some(position) = panel
+                            .active_tags
+                            .iter()
+                            .position(|tag| tag.to_lowercase() == name.to_lowercase())
+                        {
+                            panel.active_tags.remove(position);
+                        } else {
+                            panel.active_tags.push(name.to_lowercase());
+                        }
+                        true
+                    });
+                    if changed && !edit.0.is_null() {
+                        let query = read_text(edit);
+                        populate(&query);
+                    }
+                    if !edit.0.is_null() {
+                        let _ = SetFocus(Some(edit));
+                    }
+                }
                 ClickAction::None => {}
             }
             LRESULT(0)
@@ -2449,6 +2616,11 @@ unsafe extern "system" fn window_proc(
                         return true;
                     }
                     for chip in category_chips(panel, &rects, client.right) {
+                        if point_in(&chip.rect, pt.x, pt.y) {
+                            return true;
+                        }
+                    }
+                    for chip in tag_chips(panel, &rects, client.right) {
                         if point_in(&chip.rect, pt.x, pt.y) {
                             return true;
                         }
@@ -2576,6 +2748,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
             PanelData {
                 items: base_items.clone(),
                 categories: vec![("bench".to_string(), "工作沟通".to_string())],
+                tag_counts: Vec::new(),
                 notice: None,
                 copy_only: None,
                 paste_mode: false,
@@ -2616,7 +2789,7 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_items, filter_items_mode, scaled, Item};
+    use super::{count_tags, filter_items, filter_items_mode, scaled, Item};
 
     fn rank_ids(items: &[Item], query: &str) -> Vec<usize> {
         filter_items(items, None, query).0
@@ -2679,7 +2852,7 @@ mod tests {
         items[1].use_count = 9;
         items[2].use_count = 4;
         let (filtered, _, _) =
-            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+            filter_items_mode(&items, None, "", &[], crate::search::SortMode::MostUsed);
         assert_eq!(filtered, vec![1, 2, 0]);
     }
 
@@ -2691,7 +2864,7 @@ mod tests {
         items[1].use_count = 5;
         items[1].last_used_at = Some("2026-01-01T00:00:00Z".to_string());
         let (filtered, _, _) =
-            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+            filter_items_mode(&items, None, "", &[], crate::search::SortMode::MostUsed);
         assert_eq!(filtered, vec![1, 0, 2]);
     }
 
@@ -2703,7 +2876,7 @@ mod tests {
         items[1].use_count = 9;
         items[2].use_count = 4;
         let (filtered, _, _) =
-            filter_items_mode(&items, None, "", crate::search::SortMode::MostUsed);
+            filter_items_mode(&items, None, "", &[], crate::search::SortMode::MostUsed);
         assert_eq!(filtered, vec![0, 1, 2]);
     }
 
@@ -2726,16 +2899,67 @@ mod tests {
     #[test]
     fn tag_prefix_filters_by_tag_and_optional_text() {
         let mut items = items();
-        items[0].tags = vec!["support".to_string()];
+        items[0].tags = vec!["support".to_string(), "refund".to_string()];
         items[1].tags = vec!["refund".to_string()];
         assert_eq!(rank_ids(&items, "#support"), vec![0]);
         assert_eq!(rank_ids(&items, "# support"), vec![0]);
         assert_eq!(rank_ids(&items, "#SUPPORT"), vec![0]);
+        assert_eq!(rank_ids(&items, "#support #refund"), vec![0]);
+        assert_eq!(rank_ids(&items, "#refund"), vec![0, 1]);
         assert_eq!(rank_ids(&items, "#support 项目"), vec![0]);
         assert_eq!(rank_ids(&items, "#"), vec![0, 1, 2]);
         let (filtered, _, _) = filter_items(&items, Some("c1"), "#support");
         assert_eq!(filtered, vec![0]);
+        let (filtered, _, _) = filter_items_mode(
+            &items,
+            None,
+            "",
+            &["refund".to_string()],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0, 1]);
+        let (filtered, _, _) = filter_items_mode(
+            &items,
+            None,
+            "",
+            &["support".to_string(), "refund".to_string()],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0]);
         assert!(rank_ids(&items, "#missing").is_empty());
+    }
+
+    #[test]
+    fn tag_chip_filter_is_case_insensitive() {
+        let mut items = items();
+        items[0].tags = vec!["VIP".to_string()];
+        let (filtered, _, _) = filter_items_mode(
+            &items,
+            None,
+            "",
+            &["VIP".to_string()],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0]);
+        let (filtered, _, _) = filter_items_mode(
+            &items,
+            None,
+            "",
+            &["vip".to_string()],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0]);
+    }
+
+    #[test]
+    fn tag_counts_merge_case_insensitively() {
+        let mut items = items();
+        items[0].tags = vec!["VIP".to_string(), "support".to_string()];
+        items[1].tags = vec!["vip".to_string()];
+        assert_eq!(
+            count_tags(&items),
+            vec![("VIP".to_string(), 2), ("support".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -2764,23 +2988,33 @@ mod tests {
     #[test]
     fn empty_message_priority() {
         assert_eq!(
-            super::empty_message_for(0, 0, "", false, false),
+            super::empty_message_for(0, 0, "", false, false, false),
             Some("还没有短语")
         );
         assert_eq!(
-            super::empty_message_for(0, 0, "", false, true),
+            super::empty_message_for(0, 0, "", false, false, true),
             Some("加载失败，已进入只读")
         );
         assert_eq!(
-            super::empty_message_for(3, 0, "abc", false, false),
+            super::empty_message_for(3, 0, "abc", false, false, false),
             Some("没有匹配的短语")
         );
         assert_eq!(
-            super::empty_message_for(3, 0, "", true, false),
+            super::empty_message_for(3, 0, "", true, false, false),
             Some("该分类下还没有短语")
         );
-        assert_eq!(super::empty_message_for(3, 0, "", false, false), None);
-        assert_eq!(super::empty_message_for(3, 1, "abc", true, false), None);
+        assert_eq!(
+            super::empty_message_for(3, 0, "", false, true, false),
+            Some("没有匹配的短语")
+        );
+        assert_eq!(
+            super::empty_message_for(3, 0, "", false, false, false),
+            None
+        );
+        assert_eq!(
+            super::empty_message_for(3, 1, "abc", true, false, false),
+            None
+        );
     }
 
     #[test]

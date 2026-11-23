@@ -871,7 +871,8 @@ fn paste_mode_setting() -> bool {
 
 fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
     let settings = storage::settings_clone().unwrap_or_default();
-    let items = storage::panel_items()
+    let rows = storage::panel_items();
+    let items: Vec<panel::Item> = rows
         .into_iter()
         .map(|row| panel::Item {
             id: row.id,
@@ -888,9 +889,11 @@ fn panel_data(copy_only: Option<String>, paste_mode: bool) -> panel::PanelData {
             use_count: row.use_count,
         })
         .collect();
+    let tag_counts = panel::count_tags(&items);
     panel::PanelData {
         items,
         categories: storage::categories(),
+        tag_counts,
         notice: storage::read_only_notice(),
         copy_only,
         paste_mode,

@@ -116,6 +116,11 @@ Start-Sleep -Milliseconds 400
 $supported = [int64][QPTagBatchSmoke]::SendMessageRaw($list, 0x018B, [IntPtr]::Zero, [IntPtr]::Zero)
 Check "tag filter support" ($supported -eq 2) ("list=" + $supported)
 
+[void][QPTagBatchSmoke]::PostMessage($manage, 0x0111, [IntPtr]218, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+$selectedFiltered = [int64][QPTagBatchSmoke]::SendMessageRaw($list, 0x0190, [IntPtr]::Zero, [IntPtr]::Zero)
+Check "select all respects filter" ($selectedFiltered -eq 2) ("selected=" + $selectedFiltered)
+
 [void][QPTagBatchSmoke]::SendMessageRaw($combo, 0x014E, [IntPtr]0, [IntPtr]::Zero)
 [void][QPTagBatchSmoke]::PostMessage($manage, 0x0111, [IntPtr](217 -bor (1 -shl 16)), [IntPtr]::Zero)
 Start-Sleep -Milliseconds 400
@@ -150,6 +155,11 @@ Check "batch remove applied" (
 Check "original tags preserved" (
     (($afterRemove.snippets[0].tags -contains "support") -and ($afterRemove.snippets[0].tags -contains "refund"))
 ) ("tags=" + ($afterRemove.snippets[0].tags -join ","))
+
+[void][QPTagBatchSmoke]::PostMessage($manage, 0x0111, [IntPtr]218, [IntPtr]::Zero)
+Start-Sleep -Milliseconds 400
+$selectedAll = [int64][QPTagBatchSmoke]::SendMessageRaw($list, 0x0190, [IntPtr]::Zero, [IntPtr]::Zero)
+Check "select all filtered rows" ($selectedAll -eq 3) ("selected=" + $selectedAll)
 
 Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
 $failed = @($results | Where-Object { -not $_.Ok })

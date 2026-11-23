@@ -44,6 +44,30 @@ pub struct Hit {
     pub content_highlight: Option<(usize, usize)>,
 }
 
+/// Splits leading `#tag` tokens from a query. Tags are lowercased; the
+/// returned text is the remaining keyword query. Stops at the first token that
+/// is not `#`-prefixed, so a literal `#` inside text stays searchable.
+pub fn split_tag_query(query: &str) -> (Vec<String>, &str) {
+    let mut rest = query.trim();
+    let mut tags = Vec::new();
+    loop {
+        let Some(after) = rest.strip_prefix('#') else {
+            break;
+        };
+        let after = after.trim_start();
+        let end = after
+            .find(|ch: char| ch.is_whitespace() || ch == '#')
+            .unwrap_or(after.len());
+        let tag = after[..end].trim().to_lowercase();
+        if tag.is_empty() {
+            return (tags, "");
+        }
+        tags.push(tag);
+        rest = after[end..].trim_start();
+    }
+    (tags, rest)
+}
+
 pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
     let allow_blob_fallback = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
@@ -234,7 +258,7 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bench, rank, Doc};
+    use super::{bench, rank, split_tag_query, Doc};
     use crate::storage::build_search_blob;
 
     fn doc<'a>(
@@ -660,6 +684,24 @@ mod tests {
         let hits = rank(&docs, "同名", 50);
         let ids: Vec<&str> = hits.iter().map(|hit| docs[hit.index].id).collect();
         assert_eq!(ids, vec!["a", "c", "d", "b"]);
+    }
+
+    #[test]
+    fn splits_leading_tag_tokens() {
+        assert_eq!(
+            split_tag_query("#Support #refund 退款"),
+            (vec!["support".to_string(), "refund".to_string()], "退款")
+        );
+        assert_eq!(
+            split_tag_query("#a#b"),
+            (vec!["a".to_string(), "b".to_string()], "")
+        );
+        assert_eq!(
+            split_tag_query("# support"),
+            (vec!["support".to_string()], "")
+        );
+        assert_eq!(split_tag_query("普通 #tag"), (Vec::new(), "普通 #tag"));
+        assert_eq!(split_tag_query("#"), (Vec::new(), ""));
     }
 
     #[test]
