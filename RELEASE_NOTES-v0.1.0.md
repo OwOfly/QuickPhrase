@@ -48,8 +48,8 @@
 - `cargo fmt --check` PASS
 - `cargo clippy --release` 0 警告
 - `cargo test` 150/150
-- panel-smoke 10/10、tray-smoke 19/19、tag-batch-smoke 10/10
-- host-matrix 10/10、snippet-hotkey-smoke 16/16（本构建 `4e89ba…`）
+- panel-smoke 10/10、tag-batch-smoke 10/10（本构建 `4e89ba…`）
+- tray-smoke 19/19、host-matrix 10/10、snippet-hotkey-smoke 16/16（`a908f8e` 构建；本次仅列表绘制改动，未触及托盘/注入路径）
 - 复核记录：`docs/reviews/` 下阶段三各模块记录
 
 ## 本次修复（2026-11-23）
