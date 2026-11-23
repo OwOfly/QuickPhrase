@@ -2374,7 +2374,7 @@ fn create(owner: HWND) -> Option<Manage> {
     let hwnd = match unsafe {
         let initial_dpi = GetDpiForSystem();
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            WS_EX_APPWINDOW,
             CLASS,
             TITLE,
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
