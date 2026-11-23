@@ -247,6 +247,8 @@ fileVersion=0.1.2 product=QuickPhrase 快语
 
 `cargo test` 150/150，fmt/clippy PASS；panel-smoke 10/10、tag-batch-smoke 10/10（本构建）。任务栏验证：exstyle `0x40100`，最小化后 `IsIconic=true` 且任务栏出现图标，恢复后 `IsIconic=false`；截图 `dist/ui-shots/taskbar-manage-minimized-012.png`。glm / kimi / qwen 初轮 PASS；glm 的“最小化→关闭→托盘重开”问题已用 `SW_RESTORE` 分支修复并 focused PASS。
 
+GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.2（id `455206285`，draft=false）。资产：zip 590,050 B（digest `sha256:667c2a59…d146c`）、独立 EXE 1,075,712 B（digest `sha256:70b9b133…2edb0`）、`SHA256SUMS.txt` 193 B；回下载 zip 与 exe 复算均通过。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

@@ -11,6 +11,7 @@
 - SHA256（exe）：`70b9b133fe9053ee6d37198ba3b425a05cf80f4a9de3e2f86db0e5c80d62edb0`
 - 许可证：MIT
 - 发布状态：补丁发布（2026-11-23）
+- 发布页：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.2
 
 ## 本次修复
 
