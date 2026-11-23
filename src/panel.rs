@@ -2193,6 +2193,9 @@ fn populate(query: &str) {
             let _ = send(list, LB_SETCURSEL, 0, 0);
         }
         let _ = ShowWindow(list, if titles.is_empty() { SW_HIDE } else { SW_SHOW });
+        // Filtering can shrink the list; erase the list itself so rows past the
+        // new match count cannot leave ghost cards behind.
+        let _ = InvalidateRect(Some(list), None, true);
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }

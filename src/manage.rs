@@ -375,6 +375,8 @@ fn reload_left(manage: &mut Manage) {
             manage.cat_delete,
             if show_del_cat { SW_SHOW } else { SW_HIDE },
         );
+        // A category delete can shrink the nav; erase the vacated rows.
+        let _ = InvalidateRect(Some(manage.left), None, true);
     }
 }
 
@@ -504,6 +506,9 @@ fn reload_list(manage: &mut Manage) {
         manage.selected = None;
     }
     unsafe {
+        // Deleting or filtering can shrink the list; repaint the whole list so
+        // rows past the new count are erased instead of leaving ghost cards.
+        let _ = InvalidateRect(Some(manage.list), None, true);
         let _ = InvalidateRect(Some(manage.hwnd), None, false);
     }
 }

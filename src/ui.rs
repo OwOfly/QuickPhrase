@@ -13,9 +13,9 @@ use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, GetDC, GetTextMetricsW, InvalidateRect, ReleaseDC, SelectObject,
-    CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, HDC, HFONT, HGDIOBJ,
-    OUT_DEFAULT_PRECIS, TEXTMETRICW,
+    CreateFontW, CreateSolidBrush, DeleteObject, FillRect, GetDC, GetTextMetricsW, InvalidateRect,
+    ReleaseDC, SelectObject, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
+    DEFAULT_PITCH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
@@ -1236,10 +1236,39 @@ unsafe extern "system" fn smooth_listbox_proc(
     if old == 0 {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
+    let surface = LIST_STATES.with(|map| map.borrow().get(&key).map(|s| s.surface));
     let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
         std::mem::transmute(old);
 
     match message {
+        // Owner-draw listboxes do not reliably erase the area below the last
+        // item when the row count shrinks; fill the whole client with the list
+        // surface colour so deleted/filtered rows cannot leave ghost cards.
+        WM_ERASEBKGND => {
+            if let Some(surface) = surface {
+                let hdc = HDC(wparam.0 as *mut core::ffi::c_void);
+                let palette = crate::theme::current();
+                let bg = match surface {
+                    ListSurface::Card => palette.card,
+                    ListSurface::Sidebar => palette.sidebar,
+                };
+                let mut client = RECT::default();
+                if GetClientRect(hwnd, &mut client).is_ok()
+                    && client.right > client.left
+                    && client.bottom > client.top
+                {
+                    let brush = CreateSolidBrush(bg);
+                    if !brush.is_invalid() {
+                        let _ = FillRect(hdc, &client, brush);
+                        let _ = DeleteObject(HGDIOBJ(brush.0));
+                        return LRESULT(1);
+                    }
+                }
+                // Fall through to the original proc if we could not fill, so
+                // the default erase still gets a chance instead of leaving
+                // stale pixels under a claimed-success return.
+            }
+        }
         WM_MOUSEWHEEL => {
             if let Some((_, _, m)) = listbox_metrics(hwnd) {
                 let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
