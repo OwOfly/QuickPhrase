@@ -1,186 +1,201 @@
-# QuickPhrase 快语
+<p align="center">
+  <img src="assets/quickphrase-logo.png" width="96" alt="QuickPhrase logo">
+</p>
 
-Windows 桌面全局快捷短语输入器。当前版本：**0.1.0（V1）**。
+<h1 align="center">QuickPhrase 快语</h1>
 
-完整技术方案见 `docs/_ref/final-plan.md`（v4.1），需求见 `docs/_ref/prd-v1.1.md`。
+<h3 align="center">按一下，把常用话术直接打进当前窗口。</h3>
 
-## 当前已实现
+<p align="center">
+  Windows 桌面全局快捷短语工具 · 全离线 · 单文件便携
+</p>
 
-- Rust + Win32，单进程、单实例（命名互斥 + 窗口消息唤起）
-- 托盘图标与右键菜单：打开面板 / 管理短语 / 新增短语 / 暂停或恢复快捷键 / 设置 / 恢复上次剪贴板内容 / 关于 / 退出；双击托盘打开管理窗口
-- 全局热键 `Ctrl + Alt + Q`，注册失败有明确提示；暂停/恢复可用
-- 退出时释放热键与托盘图标
-- 热键触发时同步快照：前台窗口、PID、进程创建时间、焦点控件、完整性级别
-- UI Automation 捕获：常驻 MTA 线程、60 ms 预算、零 HWND 上溯、`CompareElements`、只读/密码/插入点判定
-- 区域分类：终端 / 编辑器 / 未验证；身份与“可输入能力”分开报告
-- 前台切换监听（`EVENT_SYSTEM_FOREGROUND`，面板生命周期内）
-- 快捷面板：520×420、Direct2D/DirectWrite 自绘、原生 `EDIT` 搜索、OwnerDraw 列表、↑↓/Home/End、Enter 提交、Esc/点击外部关闭
-- 面板按光标定位并夹紧到显示器工作区；DWM 圆角与深色标题栏；Per-Monitor DPI 适配
-- 文本注入：恢复目标、G1–G12 守卫、`SendInput` Unicode（CR 换行）、三态结果
-- 输入策略：单行 Unicode；多行仅限已验证编辑器；终端/未知区域多行、超长、控制字符一律只复制到剪贴板
-- Per-Monitor V2 DPI manifest（已嵌入 EXE）与 Common-Controls v6 依赖
-- 本地滚动日志：`%LocalAppData%\QuickPhrase\logs\qp-YYYY-MM-DD.log`
+<p align="center">
+  <a href="https://github.com/OwOfly/QuickPhrase/releases/latest"><img src="https://img.shields.io/github/v/release/OwOfly/QuickPhrase?style=flat-square&color=6C5CE7&label=release" alt="release"></a>
+  <a href="https://github.com/OwOfly/QuickPhrase/releases"><img src="https://img.shields.io/github/downloads/OwOfly/QuickPhrase/total?style=flat-square&color=6C5CE7" alt="downloads"></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D4?style=flat-square&logo=windows11&logoColor=white" alt="platform">
+  <img src="https://img.shields.io/badge/rust-nightly-000000?style=flat-square&logo=rust" alt="rust">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/OwOfly/QuickPhrase?style=flat-square&color=2EA44F" alt="license"></a>
+</p>
 
-- 本地 JSON 存储：schema、原子写、5 份备份、恢复、只读模式、revision 高水位
-- 检索：D16 打分与排序、前 50、命中区间，支持标题拼音全拼与首字母（如 `tk` → 退款说明），1,000 条 P95 < 1 ms
-- 变量模板：`{date}`、`{time}`、`{datetime}` 在面板预览中展开，插入时按当前本地时间渲染；`{{`/`}}` 转义
-- 标签：管理窗口正文下方逗号分隔编辑，最多 10 个、单个 ≤24 字；标签进入检索 blob，可与标题/正文/拼音一起搜索
-- 标签筛选：管理窗口“标签”下拉 + 搜索框 `#a #b` 多标签 AND；面板顶部标签云可点选多个标签 AND，搜索框 `#标签` 也可用（可追加关键词）
-- 批量标签：管理列表 Ctrl/Shift 多选或“全选”当前筛选结果后批量添加/移除标签，单次原子写入
-- 短语专属快捷键：管理窗口“快捷键”字段（留空不设置），保存时校验格式、重复与全局热键冲突；命中后直接捕获并注入，目标不确定时仍只复制，不自动重试
-- 面板完整态：分类栏、空库/无匹配/加载失败空态、只读提示、捕获失败仅复制、关键词高亮
-- 管理窗口：三栏 Fluent 布局、CRUD、分类增删、回收站与恢复、校验、未保存拦截、自定义平滑滚动条
-- 设置窗口：740×560（最小 500×540）、热键录制与热回滚、Tab 策略、主题偏好、开机启动、剪贴板恢复、数据目录
-- 数据闭环：JSON 导出、导入（合并/替换）、最近 5 份备份恢复；回收站 30 天自动清理
-- 便携模式：可执行文件旁放 `portable.txt`（或 `portable`）文件，数据/备份/日志/截取改写到 `<exe>\data`
-- 暂停状态持久化：暂停后退出，下次启动仍保持暂停，可从托盘恢复
-- 面板排序：设置 → 外观与主题切换“最近使用 / 最常使用”，置顶始终优先
-- 关于窗口与 Direct2D 自绘托盘菜单；托盘：新增短语、暂停/恢复、第二实例唤起面板、退出释放资源
-- 注入加固：粘贴兼容模式（警示 + Ctrl+V）、剪贴板序列保护、长文本、UIA 连续超时降级、区域策略
-- 应用输入例外：设置 → 应用输入例外，按可执行文件名覆盖 Unicode/粘贴模式，未命中使用全局模式
-- UI Spec：统一主题令牌与浅/深/跟随系统、面板搜索图标/快捷键提示/设置与管理入口、类型图标、键盘焦点边框、淡入、管理窗口分类计数与校验红框；Direct2D/DirectWrite 矢量图标与文字
-- 键盘：面板与列表全键盘操作；管理/设置使用 `IsDialogMessage` 导航原生控件；设置自绘卡片提供 Tab/方向键/空格/Enter 焦点
+<p align="center">
+  <img src="docs/images/panel-light.png" width="620" alt="QuickPhrase 快捷面板">
+</p>
 
-**尚未实现 / 已知限制**：托盘气泡失败降级、代码签名；真实跨应用输入矩阵与 125/150/200% 视觉矩阵待交互桌面验证。
+<p align="center"><sub><code>Ctrl+Alt+Q</code> 呼出面板，搜索、回车、直接输入。目标不确定时只复制，不硬输。</sub></p>
 
-## 环境
+## 为什么是 QuickPhrase
 
-- Windows 10 21H2+ / Windows 11 x64
-- Rust nightly MSVC（当前 `nightly-2025-12-04`）
-- Windows SDK（`rc.exe`，build.rs 会自动在 `Windows Kits\10\bin\*\x64` 下查找）
+- **不打断工作流**：常驻托盘，一个热键在光标附近弹出面板，选完即输入，不用切窗口、不用找模板。
+- **数据留在本机**：全离线，无账号、无网络、无遥测、无键盘钩子。
+- **中文场景优先**：标题、正文、标签、拼音全拼与首字母都能搜，`tk` 就能找到“退款说明”。
+- **输入有边界**：只对已验证的可编辑目标注入；终端、未知区域、超长或控制字符一律只复制。
+- **带走即用**：单个 EXE，解压即运行；放一个 `portable.txt` 就变便携模式，数据跟着目录走。
 
-## 构建
+## 功能
+
+| 功能 | 说明 |
+| --- | --- |
+| ⚡ **全局呼出** | `Ctrl+Alt+Q` 在光标附近打开面板，可改键、可暂停；单实例，重复启动只会唤起已有窗口 |
+| 🔎 **全字段检索** | 标题 / 正文 / 标签 / 拼音，支持全拼与首字母；`#标签` 语法做标签过滤 |
+| 🏷️ **标签体系** | 单条最多 10 个标签；标签筛选、面板标签云、多标签 AND、按筛选结果批量添加/移除 |
+| ⌨️ **短语专属快捷键** | 每条短语可绑 `Ctrl+Alt+1` 这类组合，命中后直接输入；保存时校验重复与全局热键冲突 |
+| 🧩 **变量模板** | `{date}`、`{time}`、`{datetime}` 在预览中展开，插入时按当前本地时间渲染 |
+| 🗂️ **三栏管理** | 分类、短语、编辑区；回收站、恢复、置顶、未保存拦截、平滑滚动 |
+| 💾 **可靠的本地数据** | JSON 存储、原子写、保留 5 份备份、30 天回收站、JSON 导入/导出（合并或替换） |
+| 🎒 **便携模式** | EXE 同目录放 `portable.txt`（或 `portable`），数据、备份、日志改写到 `data\` |
+
+## 界面
+
+### 快捷面板
+
+浅色面板见上方大图；深色主题如下。分类与标签云在顶部，键盘全程可操作。
+
+<p align="center">
+  <img src="docs/images/panel-dark.png" width="520" alt="深色快捷面板">
+</p>
+
+### 管理短语
+
+分类、标签、专属快捷键、回收站都在一个窗口里。
+
+<p align="center">
+  <img src="docs/images/manage-light.png" width="900" alt="管理短语窗口">
+</p>
+
+### 设置
+
+热键、输入与剪贴板策略、主题、开机启动、数据目录、按应用输入例外。
+
+<p align="center">
+  <img src="docs/images/settings-light.png" width="640" alt="设置窗口">
+</p>
+
+## 快速开始
+
+1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.0-win-x64.zip`。
+2. 解压到任意目录，双击 `QuickPhrase.exe`。无需管理员权限。
+3. 托盘出现图标后，按 `Ctrl+Alt+Q` 呼出面板。
+4. 首次启动会写入几条示例短语，直接在管理窗口里改成自己的内容即可。
+
+> 未做代码签名，Windows SmartScreen 可能提示“未知发布者”。选择“更多信息 → 仍要运行”即可。
+
+### 常用操作
+
+| 操作 | 说明 |
+| --- | --- |
+| `Ctrl+Alt+Q` | 呼出快捷面板 |
+| `↑` `↓` / `Home` `End` | 在结果中移动 |
+| `Enter` | 输入选中的短语（目标不确定时复制到剪贴板） |
+| `Esc` | 关闭面板 |
+| `Ctrl+Alt+1` | 直接输入绑定了该快捷键的短语 |
+| `#标签` | 在搜索框按标签过滤；多个 `#标签` 为 AND |
+| 双击托盘图标 | 打开管理窗口 |
+
+## 数据与便携
+
+- 默认数据目录：`%LocalAppData%\QuickPhrase`（短语、设置、备份、日志）。
+- 便携模式：在 EXE 同目录放置 `portable.txt` 或 `portable`，数据改写到 `<exe>\data`。
+- 升级：替换 EXE 不会动数据；只有删除数据目录才会清除短语与设置。
+- 备份与恢复：设置 → 数据与存储，保留最近 5 份备份；回收站默认保留 30 天。
+- 导入/导出：QuickPhrase JSON，支持“合并”与“替换”两种导入方式。
+
+## 安全边界
+
+QuickPhrase 的原则是**宁可只复制，也不乱输入**：
+
+- 全离线运行，不发网络请求，不读浏览器数据，不装键盘钩子。
+- 注入前快照前台窗口、进程、焦点控件与完整性级别；只在可验证的可编辑目标上使用 `SendInput`。
+- 权限更高、身份不明、只读/密码框、终端多行、超长文本、控制字符：一律只写入剪贴板。
+- `SendInput` 失败或目标窗口切换后**不自动重试**，避免把内容打进错误的位置。
+- 日志只记录元数据，不记录短语正文；捕获诊断 JSON 仅保存在本机。
+
+## 从源码构建
+
+环境：Windows 10 21H2+ / Windows 11 x64、Rust nightly MSVC（当前 `nightly-2025-12-04`）、Windows SDK（`rc.exe`）。
 
 ```powershell
 cargo build --release
+# 产物：target\release\quickphrase.exe
 ```
 
-产物：`target\release\quickphrase.exe`（当前约 1 MB，含图标、版本资源、Direct2D 渲染与拼音数据）。
-
-## 打包
+打包发布 zip（EXE + README + LICENSE，附 SHA256）：
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\package.ps1
 ```
 
-产物在 `dist\`：
-
-- `QuickPhrase-<version>-win-x64.zip`（EXE + README + LICENSE）
-- `SHA256SUMS.txt`
-
-脚本会校验 zip ≤15 MB，并打印版本资源与打标签命令（`git tag v<version>`）。
-图标由 `scripts\make-icon.ps1` 生成，不需要外部素材。
-
-## 安装 / 卸载
-
-- 安装：解压 zip 到任意目录，运行 `QuickPhrase.exe`。无需管理员权限。
-- 开机启动：托盘「设置」→ 勾选「开机启动」；卸载前取消勾选或删除
-  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\QuickPhrase`。
-- 卸载：退出托盘程序，删除解压目录；如需清除数据，删除
-  `%LocalAppData%\QuickPhrase`（含短语、设置、备份与日志）。
-- 版本：EXE 内含文件版本 0.1.0、产品名与图标。
-
-## 运行
+<details>
+<summary><b>测试与冒烟脚本</b></summary>
 
 ```powershell
-.\target\release\quickphrase.exe
+cargo test                                   # 单元测试
+scripts\panel-smoke.ps1                      # 面板显示/键盘/提交
+scripts\tag-batch-smoke.ps1                  # 标签筛选与批量标签
+scripts\tray-smoke.ps1                       # 托盘菜单与生命周期
+scripts\host-matrix.ps1                      # 跨进程输入矩阵
+scripts\snippet-hotkey-smoke.ps1             # 专属快捷键直出
 ```
 
-- 托盘出现图标后，按 `Ctrl + Alt + Q` 打开快捷面板
-- 重复启动不会产生第二个进程，会唤起已有实例
-- 托盘菜单「暂停快捷键」可注销热键，再次点击恢复
+当前 0.1.0 构建：`cargo test` 150/150，fmt / clippy 通过；面板、标签批量、托盘、跨进程注入、专属快捷键冒烟全部通过。详细记录在 [`docs/reviews/`](docs/reviews/)。
 
-## 测试
+</details>
+
+<details>
+<summary><b>诊断命令</b></summary>
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\smoke.ps1
+.\quickphrase.exe --panel-test              # 手动打开面板（Esc 退出）
+.\quickphrase.exe --panel-bench             # 100 次显示/隐藏基准
+.\quickphrase.exe --manage-test             # 打开管理窗口
+.\quickphrase.exe --settings-test           # 打开设置窗口
+.\quickphrase.exe --capture-test --delay 2000  # 抓取当前前台，报告落盘
+.\quickphrase.exe --inject-test             # 注入守卫自测
+.\quickphrase.exe --search-bench            # 检索基准
 ```
 
-覆盖：冷启动、首实例存活、第二实例退出、托盘回调、优雅关闭、热键释放、日志断言。
+捕获报告写入 `%LocalAppData%\QuickPhrase\captures\capture-<ts>.json`，包含 UIA 元素属性、只读判定、插入点与耗时；日志在 `%LocalAppData%\QuickPhrase\logs\`。
 
-捕获链路：
+</details>
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\capture-smoke.ps1
-```
+<details>
+<summary><b>技术栈与目录</b></summary>
 
-手工诊断：先把焦点放到目标窗口，再运行
-
-```powershell
-.\target\release\quickphrase.exe --capture-test --delay 2000
-```
-
-`--delay` 毫秒后抓取当前前台，结果写入日志，并落盘到
-`%LocalAppData%\QuickPhrase\captures\capture-<ts>.json`，包含 UIA 元素属性、只读判定、插入点、耗时与前台事件序列。
-
-面板：
-
-```powershell
-# 100 次显示/隐藏基准
-.\target\release\quickphrase.exe --panel-bench
-
-# 手动打开面板（Esc 退出）
-.\target\release\quickphrase.exe --panel-test
-
-# 自动化冒烟
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\panel-smoke.ps1
-
-# 注入自测（自建 EDIT，走完整守卫与 SendInput）
-.\target\release\quickphrase.exe --inject-test
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\inject-smoke.ps1
-```
-
-单独测启动耗时（不含 PowerShell 调度开销）：
-
-```powershell
-$psi = [Diagnostics.ProcessStartInfo]::new()
-$psi.FileName = ".\target\release\quickphrase.exe"
-$psi.Arguments = "--bench"
-$psi.UseShellExecute = $false
-$sw = [Diagnostics.Stopwatch]::StartNew()
-[Diagnostics.Process]::Start($psi).WaitForExit()
-$sw.ElapsedMilliseconds
-```
-
-## 目录
+Rust + Win32，无 WebView、无 Electron。界面用 Direct2D / DirectWrite 自绘，原生 `EDIT` / `LISTBOX` 负责输入与列表；捕获用 UI Automation + 原生控件样式双证据；输入用 `SendInput` Unicode 或剪贴板粘贴。
 
 ```
 src/
-  main.rs          入口、CLI 参数
-  app.rs           隐藏主窗口、消息循环、托盘菜单
-  context.rs       原生窗口/进程/完整性/焦点快照
-  uia.rs           UI Automation 常驻线程、捕获、身份比对、降级
-  capture.rs       捕获编排、能力与区域判定、JSON 报告
-  panel.rs         快捷面板、搜索、分类、高亮、定位与 DPI
-  inject.rs        输入策略、守卫、SendInput/粘贴、三态结果、注入自测
-  clipboard.rs     剪贴板快照、序列保护、恢复
-  storage.rs       数据/设置/规则持久化、CRUD、备份与恢复
-  search.rs        D16 打分、排序与命中区间
-  manage.rs        三栏管理窗口、CRUD、回收站、校验
-  settings_ui.rs   设置窗口、热键录制、启动项、剪贴板恢复
-  theme.rs         浅/深/跟随系统主题令牌与对比度校验
-  foreground.rs    前台切换监听
-  hotkey.rs        RegisterHotKey 封装
-  single_instance.rs  命名互斥 + 第二实例唤起
-  tray.rs          Shell_NotifyIcon 封装
-  logging.rs       本地滚动日志
-  platform.rs      DPI、消息框、数据目录、启动项
-scripts/smoke.ps1          M0-1 冒烟测试
-scripts/capture-smoke.ps1  M0-2 捕获冒烟测试
-scripts/panel-smoke.ps1    M0-3 面板冒烟测试
-scripts/inject-smoke.ps1   M0-4 注入自测
-scripts/tray-smoke.ps1     M1-6 托盘冒烟
-scripts/make-icon.ps1      生成 assets/quickphrase.ico
-scripts/package.ps1        打包 zip 与 SHA256
-docs/_ref/         方案、PRD
-docs/reviews/      各里程碑验收与复核记录
+  main.rs       入口与 CLI
+  app.rs        主消息循环、托盘
+  panel.rs      快捷面板
+  manage.rs     管理窗口
+  settings_ui.rs 设置窗口
+  capture.rs / uia.rs   目标捕获与判定
+  inject.rs     输入策略与守卫
+  storage.rs    数据、备份、导入导出
+  search.rs     D16 打分、排序、拼音
+  theme.rs      主题令牌
+docs/reviews/   各阶段验收与复核记录
+scripts/        冒烟、打包、截图脚本
 ```
 
-## 已知限制（V1）
+</details>
 
-- 导入导出目前仅支持 QuickPhrase JSON；应用例外按 exe 文件名匹配，不支持通配符或窗口标题。
-- 托盘气泡失败无降级提示。
-- 代码签名未做，Windows 可能显示未知发布者。
-- 真实跨应用输入矩阵（Chrome/Word/VS Code/WeChat/终端）与 125/150/200% 视觉矩阵待交互桌面验证。
-- 浏览器多行、终端、未知区域固定只复制；粘贴模式也受同样区域限制。
-- 日志只记元数据，不记短语正文；捕获 JSON 含 UIA 元素名称，仅本机诊断使用。
+## 已知限制
+
+- 未代码签名；SmartScreen 会提示未知发布者。
+- 无安装器，采用 zip 便携分发；卸载为退出程序后删除目录。
+- 标签云只显示一行；含空格的标签需要通过管理窗口下拉或批量标签操作。
+- 专属快捷键需手动输入组合，暂不提供录制控件。
+- 批量标签输入是临时草稿，切换筛选或关窗不会提示保存。
+- 导入/导出仅支持 QuickPhrase JSON；应用输入例外按 exe 文件名匹配，不支持通配符或窗口标题。
+- 浏览器多行、终端、未知区域固定只复制；粘贴模式也受区域限制。
+- 托盘气泡失败没有降级提示。
+
+## 许可证
+
+[MIT](LICENSE) © 2026 OwOfly
+
+发布说明与 SHA256：[RELEASE_NOTES-v0.1.0.md](RELEASE_NOTES-v0.1.0.md)
+
+<p align="center"><sub>如果这个工具帮到你，欢迎点个 ⭐</sub></p>
