@@ -73,8 +73,8 @@
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.0-win-x64.zip`。
-2. 解压到任意目录，双击 `QuickPhrase.exe`。无需管理员权限。
+1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.0-win-x64.zip`，或直接下载单文件 `QuickPhrase-0.1.0-win-x64.exe`。
+2. 解压到任意目录（单文件版可跳过），双击 `QuickPhrase.exe`。无需管理员权限。
 3. 托盘出现图标后，按 `Ctrl+Alt+Q` 呼出面板。
 4. 首次启动会写入几条示例短语，直接在管理窗口里改成自己的内容即可。
 
@@ -184,7 +184,7 @@ scripts/        冒烟、打包、截图脚本
 ## 已知限制
 
 - 未代码签名；SmartScreen 会提示未知发布者。
-- 无安装器，采用 zip 便携分发；卸载为退出程序后删除目录。
+- 无安装器，采用 zip / 单文件 EXE 便携分发；卸载为退出程序后删除目录。
 - 标签云只显示一行；含空格的标签需要通过管理窗口下拉或批量标签操作。
 - 专属快捷键需手动输入组合，暂不提供录制控件。
 - 批量标签输入是临时草稿，切换筛选或关窗不会提示保存。

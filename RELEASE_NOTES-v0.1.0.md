@@ -2,17 +2,20 @@
 
 - 版本：`0.1.0`
 - 构建：Windows x64，Rust nightly MSVC
-- 产物：`QuickPhrase-0.1.0-win-x64.zip`
+- 产物：
+  - `QuickPhrase-0.1.0-win-x64.zip`（EXE + README + LICENSE）
+  - `QuickPhrase-0.1.0-win-x64.exe`（单文件，直接运行）
 - EXE：`1,075,712` bytes
 - ZIP：`590,329` bytes
-- SHA256：`4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a`
+- SHA256（zip）：`4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a`
+- SHA256（exe）：`1c1f89fe7da47a8b488dadd2c259d3efe43901cda309889b770827b56eefd187`
 - 许可证：MIT
 - 发布状态：人工桌面验收已通过（2026-11-23）；正式 `v0.1.0` 发布
 - 发布页：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.0
 
 ## 安装
 
-1. 解压 `QuickPhrase-0.1.0-win-x64.zip` 到任意目录。
+1. 解压 `QuickPhrase-0.1.0-win-x64.zip` 到任意目录；或直接下载单文件 `QuickPhrase-0.1.0-win-x64.exe`。
 2. 运行 `QuickPhrase.exe`。
 3. 默认数据目录：`%LocalAppData%\QuickPhrase`。
 4. 便携模式：在 EXE 同目录放 `portable.txt`（或 `portable`），数据改写到 `data\` 子目录。
@@ -38,7 +41,7 @@
 ## 已知限制
 
 - 未代码签名，Windows SmartScreen 可能提示未知发布者
-- 无安装器，采用 zip 便携分发
+- 无安装器，采用 zip / 单文件 EXE 便携分发
 - 标签云只显示一行；含空格标签只能用管理窗口下拉/批量标签
 - 专属快捷键需手动输入组合，暂不提供录制控件
 - 批量标签输入为临时草稿，切换筛选/关窗不提示

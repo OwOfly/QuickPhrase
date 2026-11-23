@@ -215,7 +215,7 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 用户确认桌面矩阵通过：记事本 / Chrome / VS Code / 终端 / 微信、IME、125/150/200% DPI；管理窗口编辑框灰框复测通过；“接口开发说明”卡片右侧遮挡修复确认。正式创建 `v0.1.0` 标签并按 GitHub Releases 渠道发布。
 
-GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.0（id `455074288`，draft=false，prerelease=false）。资产：`QuickPhrase-0.1.0-win-x64.zip` 590,329 B（GitHub digest `sha256:4e89ba75…f8122a`，与本地一致）、`SHA256SUMS.txt` 97 B；回下载 zip 复算 SHA256 通过。
+GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.0（id `455074288`，draft=false，prerelease=false）。资产：`QuickPhrase-0.1.0-win-x64.zip` 590,329 B（GitHub digest `sha256:4e89ba75…f8122a`）、独立 EXE `QuickPhrase-0.1.0-win-x64.exe` 1,075,712 B（digest `sha256:1c1f89fe…efd187`）、`SHA256SUMS.txt` 193 B（含 zip 与 exe 两条）；回下载 zip 与 exe 复算 SHA256 均通过。Release 标题已修正为 `QuickPhrase 快语 v0.1.0`。
 
 ## 已知偏差 / 未覆盖
 
