@@ -69,11 +69,17 @@ if ($zipSize -gt 15MB) {
 }
 
 $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-"$hash *QuickPhrase-$version-win-x64.zip" | Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ASCII
+$exeAsset = Join-Path $dist "QuickPhrase-$version-win-x64.exe"
+Copy-Item $exe $exeAsset -Force
+$exeHash = (Get-FileHash $exeAsset -Algorithm SHA256).Hash.ToLower()
+"$hash *QuickPhrase-$version-win-x64.zip`n$exeHash *QuickPhrase-$version-win-x64.exe" |
+    Set-Content (Join-Path $dist "SHA256SUMS.txt") -Encoding ASCII
 
 $exeSize = (Get-Item $exe).Length
 "exe=$exe bytes=$exeSize"
+"exeAsset=$exeAsset bytes=$((Get-Item $exeAsset).Length)"
 "zip=$zip bytes=$zipSize"
-"sha256=$hash"
+"sha256Zip=$hash"
+"sha256Exe=$exeHash"
 "fileVersion=$($versionInfo.FileVersion) product=$($versionInfo.ProductName)"
 "tag: git tag v$version && git push origin v$version"

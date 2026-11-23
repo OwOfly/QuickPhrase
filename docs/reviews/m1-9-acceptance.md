@@ -217,6 +217,20 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.0（id `455074288`，draft=false，prerelease=false）。资产：`QuickPhrase-0.1.0-win-x64.zip` 590,329 B（GitHub digest `sha256:4e89ba75…f8122a`）、独立 EXE `QuickPhrase-0.1.0-win-x64.exe` 1,075,712 B（digest `sha256:1c1f89fe…efd187`）、`SHA256SUMS.txt` 193 B（含 zip 与 exe 两条）；回下载 zip 与 exe 复算 SHA256 均通过。Release 标题已修正为 `QuickPhrase 快语 v0.1.0`。
 
+## v0.1.1 幽灵行修复后重打包（2026-11-23）
+
+管理窗口删除短语后的列表幽灵行修复（`f3b7104`，见 `docs/reviews/manage-list-ghost-rows-20261123.md`）进入补丁包；`package.ps1` 现在同时生成 zip、单文件 EXE 与双行 `SHA256SUMS.txt`：
+
+```
+exe bytes=1075712
+zip bytes=590089
+sha256Zip=6348cfb6586ae0b0385d343ed4eef9a2259b24f83d707d79032d296aadeb0e7b
+sha256Exe=c0cc1252fe789426a30fed98b8001524c70d7d255ebd04c6249a9ae2b8dc63c3
+fileVersion=0.1.1 product=QuickPhrase 快语
+```
+
+`cargo test` 150/150，fmt/clippy PASS；panel-smoke 10/10、tag-batch-smoke 10/10（本构建）。panel-smoke 的“Enter restores foreground”在 Chrome 占用前台时曾连续两次抖动，未改代码，重试通过；记录为环境相关 flake。幽灵行用 6→2 删除的屏幕截图复验通过（`dist/ui-shots/delete-ghost-screen-011.png`）。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

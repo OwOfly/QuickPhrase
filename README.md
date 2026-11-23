@@ -73,7 +73,7 @@
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.0-win-x64.zip`，或直接下载单文件 `QuickPhrase-0.1.0-win-x64.exe`。
+1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.1-win-x64.zip`，或直接下载单文件 `QuickPhrase-0.1.1-win-x64.exe`。
 2. 解压到任意目录（单文件版可跳过），双击 `QuickPhrase.exe`。无需管理员权限。
 3. 托盘出现图标后，按 `Ctrl+Alt+Q` 呼出面板。
 4. 首次启动会写入几条示例短语，直接在管理窗口里改成自己的内容即可。
@@ -137,7 +137,7 @@ scripts\host-matrix.ps1                      # 跨进程输入矩阵
 scripts\snippet-hotkey-smoke.ps1             # 专属快捷键直出
 ```
 
-当前 0.1.0 构建：`cargo test` 150/150，fmt / clippy 通过；面板、标签批量、托盘、跨进程注入、专属快捷键冒烟全部通过。详细记录在 [`docs/reviews/`](docs/reviews/)。
+当前 0.1.1 构建：`cargo test` 150/150，fmt / clippy 通过；面板、标签批量、托盘、跨进程注入、专属快捷键冒烟全部通过。详细记录在 [`docs/reviews/`](docs/reviews/)。
 
 </details>
 
@@ -196,6 +196,6 @@ scripts/        冒烟、打包、截图脚本
 
 [MIT](LICENSE) © 2026 OwOfly
 
-发布说明与 SHA256：[RELEASE_NOTES-v0.1.0.md](RELEASE_NOTES-v0.1.0.md)
+发布说明与 SHA256：[RELEASE_NOTES-v0.1.1.md](RELEASE_NOTES-v0.1.1.md)
 
 <p align="center"><sub>如果这个工具帮到你，欢迎点个 ⭐</sub></p>
