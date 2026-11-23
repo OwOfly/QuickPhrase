@@ -211,6 +211,10 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 本哈希取代标签云与全选的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 150/150，`cargo fmt --check` / `cargo clippy --release` PASS，panel-smoke 10/10，tag-batch-smoke 10/10。glm / kimi / qwen 复核 PASS（kimi/qwen 提出的截图路径状态边界已修复并 focused 复验）。未创建标签，待人工桌面矩阵。
 
+## 人工验收通过（2026-11-23）
+
+用户确认桌面矩阵通过：记事本 / Chrome / VS Code / 终端 / 微信、IME、125/150/200% DPI；管理窗口编辑框灰框复测通过；“接口开发说明”卡片右侧遮挡修复确认。正式创建 `v0.1.0` 标签并按 GitHub Releases 渠道发布。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。
@@ -223,4 +227,4 @@ fileVersion=0.1.0 product=QuickPhrase 快语
 
 图标、版本资源、发布 zip、哈希与安装说明已落地。r1/r2 发现全部闭环，**r2 三家 PASS，M1-9 过门，M1 全部里程碑完成。**
 
-残留：无代码签名、无安装器、干净环境与锁屏截图未验证。`v0.1.0` 标签命令由 `scripts/package.ps1` 打印，待人工执行。
+残留：无代码签名、无安装器、干净环境与锁屏截图未验证。`v0.1.0` 标签已创建，GitHub Release 随发布脚本上传。

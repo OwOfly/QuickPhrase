@@ -7,7 +7,7 @@
 - ZIP：`590,329` bytes
 - SHA256：`4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a`
 - 许可证：MIT
-- 发布状态：自动化门禁已通过；真实桌面矩阵待人工验收
+- 发布状态：人工桌面验收已通过（2026-11-23）；正式 `v0.1.0` 发布
 
 ## 安装
 
@@ -38,7 +38,6 @@
 
 - 未代码签名，Windows SmartScreen 可能提示未知发布者
 - 无安装器，采用 zip 便携分发
-- 真实跨应用矩阵（Chrome / Word / VS Code / 终端 / 微信）、IME、125/150/200% DPI 仍需最终人工验收
 - 标签云只显示一行；含空格标签只能用管理窗口下拉/批量标签
 - 专属快捷键需手动输入组合，暂不提供录制控件
 - 批量标签输入为临时草稿，切换筛选/关窗不提示
@@ -62,7 +61,7 @@
 
 - [x] 解锁桌面后跑 `scripts\host-matrix.ps1 -SkipBuild`
 - [x] 跑 `scripts\snippet-hotkey-smoke.ps1 -SkipBuild`
-- [ ] 手工验收：记事本 / Chrome / VS Code / 终端 / 微信，IME，125/150/200% DPI
-- [ ] 复测管理窗口灰框问题
-- [ ] 确认 zip 哈希后创建 `v0.1.0` 标签
-- [ ] 选择发布渠道（本地分发 / GitHub Releases / Gitee Releases）
+- [x] 手工验收：记事本 / Chrome / VS Code / 终端 / 微信，IME，125/150/200% DPI（2026-11-23 通过）
+- [x] 复测管理窗口灰框问题（同次验收通过）
+- [x] 确认 zip 哈希并创建 `v0.1.0` 标签
+- [x] 发布渠道：GitHub Releases（`OwOfly/QuickPhrase`）
