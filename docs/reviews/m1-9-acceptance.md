@@ -231,6 +231,8 @@ fileVersion=0.1.1 product=QuickPhrase 快语
 
 `cargo test` 150/150，fmt/clippy PASS；panel-smoke 10/10、tag-batch-smoke 10/10（本构建）。panel-smoke 的“Enter restores foreground”在 Chrome 占用前台时曾连续两次抖动，未改代码，重试通过；记录为环境相关 flake。幽灵行用 6→2 删除的屏幕截图复验通过（`dist/ui-shots/delete-ghost-screen-011.png`）。
 
+GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.1（id `455176560`，draft=false）。资产：zip 590,089 B（digest `sha256:6348cfb6…b0e7b`）、独立 EXE 1,075,712 B（digest `sha256:c0cc1252…c63c3`）、`SHA256SUMS.txt` 193 B；回下载 zip 与 exe 复算均通过。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。
