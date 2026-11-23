@@ -233,6 +233,20 @@ fileVersion=0.1.1 product=QuickPhrase 快语
 
 GitHub Release 已创建：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.1（id `455176560`，draft=false）。资产：zip 590,089 B（digest `sha256:6348cfb6…b0e7b`）、独立 EXE 1,075,712 B（digest `sha256:c0cc1252…c63c3`）、`SHA256SUMS.txt` 193 B；回下载 zip 与 exe 复算均通过。
 
+## v0.1.2 任务栏图标修复后重打包（2026-11-23）
+
+管理窗口最小化后无任务栏图标（见 `docs/reviews/manage-taskbar-20261123.md`）的修复进入补丁包；管理窗口任务栏按钮 + 托盘重开恢复：
+
+```
+exe bytes=1075712
+zip bytes=590050
+sha256Zip=667c2a5986a566c0b71a204de4ecaf003612767d3fba22e18122587c4d2d146c
+sha256Exe=70b9b133fe9053ee6d37198ba3b425a05cf80f4a9de3e2f86db0e5c80d62edb0
+fileVersion=0.1.2 product=QuickPhrase 快语
+```
+
+`cargo test` 150/150，fmt/clippy PASS；panel-smoke 10/10、tag-batch-smoke 10/10（本构建）。任务栏验证：exstyle `0x40100`，最小化后 `IsIconic=true` 且任务栏出现图标，恢复后 `IsIconic=false`；截图 `dist/ui-shots/taskbar-manage-minimized-012.png`。glm / kimi / qwen 初轮 PASS；glm 的“最小化→关闭→托盘重开”问题已用 `SW_RESTORE` 分支修复并 focused PASS。
+
 ## 已知偏差 / 未覆盖
 
 - 未做代码签名，Windows SmartScreen 可能提示未知发布者。

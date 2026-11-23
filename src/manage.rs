@@ -2763,7 +2763,15 @@ pub fn show(owner: HWND) {
         return;
     };
     unsafe {
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        // A minimized window that was hidden via WM_CLOSE must be restored,
+        // otherwise reopening from the tray would only bring back the taskbar
+        // button without the window body.
+        let cmd = if IsIconic(hwnd).as_bool() {
+            SW_RESTORE
+        } else {
+            SW_SHOW
+        };
+        let _ = ShowWindow(hwnd, cmd);
         let _ = SetForegroundWindow(hwnd);
     }
 
