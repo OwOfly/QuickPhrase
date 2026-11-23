@@ -8,6 +8,7 @@
 - SHA256：`4e89ba752a5d0ab5908af73f840443dc961db93d29e730371a15097420f8122a`
 - 许可证：MIT
 - 发布状态：人工桌面验收已通过（2026-11-23）；正式 `v0.1.0` 发布
+- 发布页：https://github.com/OwOfly/QuickPhrase/releases/tag/v0.1.0
 
 ## 安装
 
