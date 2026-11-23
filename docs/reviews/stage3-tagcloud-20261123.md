@@ -34,7 +34,7 @@
 - 隔离面板实测：标签芯片显示 `support 2`、`dev 1`、`refund 1`；`#support` 2 项、`#dev` 1 项
 - 管理“全选”实测：3 行全部选中，批量给 3 条加 `alltag` 后全部写入；再全选移除后恢复
 - panel-smoke 10/10；tray-smoke 19/19；tag-batch-smoke 10/10
-- host-matrix 10/10、snippet-hotkey-smoke 16/16 在上一构建 `14c45c…` 通过；本构建仅标签云/管理改动，复核时桌面锁定未复跑
+- host-matrix 10/10、snippet-hotkey-smoke 16/16（本构建 `20a1ea…`）
 - `scripts/package.ps1` PASS：exe 1,074,688 bytes；zip 590,171 bytes；SHA256 `20a1ea3f2da94b20295f35cfa93fd8e0fa4de477a80368839174d4701267980d`
 
 ## 复核

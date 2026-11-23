@@ -7,7 +7,7 @@
 - ZIP：`590,171` bytes
 - SHA256：`20a1ea3f2da94b20295f35cfa93fd8e0fa4de477a80368839174d4701267980d`
 - 许可证：MIT
-- 发布状态：自动化门禁已通过；`host-matrix`/`snippet-hotkey-smoke` 与真实桌面矩阵待解锁后复验（上一构建已通过）
+- 发布状态：自动化门禁已通过；真实桌面矩阵待人工验收
 
 ## 安装
 
@@ -49,13 +49,13 @@
 - `cargo clippy --release` 0 警告
 - `cargo test` 150/150
 - panel-smoke 10/10、tray-smoke 19/19、tag-batch-smoke 10/10
-- host-matrix / snippet-hotkey-smoke：上一构建 `14c45c…` 为 10/10、16/16；本构建待桌面解锁复跑
+- host-matrix 10/10、snippet-hotkey-smoke 16/16（本构建 `20a1ea…`）
 - 复核记录：`docs/reviews/` 下阶段三各模块记录
 
 ## 发布前最后检查
 
-- [ ] 解锁桌面后跑 `scripts\host-matrix.ps1 -SkipBuild`
-- [ ] 跑 `scripts\snippet-hotkey-smoke.ps1 -SkipBuild`
+- [x] 解锁桌面后跑 `scripts\host-matrix.ps1 -SkipBuild`
+- [x] 跑 `scripts\snippet-hotkey-smoke.ps1 -SkipBuild`
 - [ ] 手工验收：记事本 / Chrome / VS Code / 终端 / 微信，IME，125/150/200% DPI
 - [ ] 复测管理窗口灰框问题
 - [ ] 确认 zip 哈希后创建 `v0.1.0` 标签

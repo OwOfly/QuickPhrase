@@ -196,7 +196,7 @@ sha256=20a1ea3f2da94b20295f35cfa93fd8e0fa4de477a80368839174d4701267980d
 fileVersion=0.1.0 product=QuickPhrase 快语
 ```
 
-本哈希取代标签筛选与批量标签的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 150/150，panel-smoke 10/10，tray-smoke 19/19，tag-batch-smoke 10/10。host-matrix 10/10、snippet-hotkey-smoke 16/16 在上一构建 `14c45c…` 通过；本构建仅标签云/管理改动，复核时桌面锁定未复跑。
+本哈希取代标签筛选与批量标签的 zip 哈希；`dist/SHA256SUMS.txt` 已同步。`cargo test` 150/150，panel-smoke 10/10，tray-smoke 19/19，tag-batch-smoke 10/10，host-matrix（隔离数据）10/10，snippet-hotkey-smoke 16/16。
 
 ## 已知偏差 / 未覆盖
 
