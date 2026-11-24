@@ -40,8 +40,8 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    InvalidateRect, ReleaseDC, SelectObject, WindowFromDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS, HDC, HGDIOBJ, SRCCOPY,
+    InvalidateRect, PatBlt, ReleaseDC, SelectObject, WindowFromDC, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, BLACKNESS, DIB_RGB_COLORS, HDC, HGDIOBJ, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -222,13 +222,39 @@ struct Engine {
     target: ID2D1DCRenderTarget,
     formats: HashMap<FormatKey, IDWriteTextFormat>,
     icons: HashMap<Icon, ID2D1PathGeometry>,
+    brushes: RefCell<HashMap<(u32, u32), ID2D1SolidColorBrush>>,
+    buffers: HashMap<(i32, i32), Buffer>,
+    buffer_clock: u64,
     round_stroke: Option<ID2D1StrokeStyle>,
     brand_bitmap: Option<ID2D1Bitmap>,
     brand_loaded: bool,
 }
 
+/// Reusable offscreen DC + DIB for one paint size.
+struct Buffer {
+    mem_dc: HDC,
+    dib: HGDIOBJ,
+    old_bmp: HGDIOBJ,
+    last_used: u64,
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SelectObject(self.mem_dc, self.old_bmp);
+            let _ = DeleteObject(self.dib);
+            let _ = DeleteDC(self.mem_dc);
+        }
+    }
+}
+
 thread_local! {
     static ENGINE: RefCell<Option<Engine>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static BUFFER_CREATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn load_brand_bitmap(target: &ID2D1DCRenderTarget) -> Option<ID2D1Bitmap> {
@@ -356,6 +382,9 @@ fn create_engine() -> Option<Engine> {
             target,
             formats: HashMap::new(),
             icons: HashMap::new(),
+            brushes: RefCell::new(HashMap::new()),
+            buffers: HashMap::new(),
+            buffer_clock: 0,
             round_stroke,
             brand_bitmap: None,
             brand_loaded: false,
@@ -442,31 +471,83 @@ pub fn paint_buffered<F: FnOnce(&mut Canvas<'_>)>(hdc: HDC, rect: RECT, draw: F)
         };
 
         unsafe {
-            let mem_dc = CreateCompatibleDC(Some(hdc));
-            if mem_dc.0.is_null() {
+            let key = (width, height);
+            let tick = engine.buffer_clock.wrapping_add(1);
+            engine.buffer_clock = tick;
+            let mut evicted: Option<Buffer> = None;
+            let existing = engine.buffers.get_mut(&key).map(|buffer| {
+                buffer.last_used = tick;
+                buffer.mem_dc
+            });
+            let mem_dc = match existing {
+                Some(mem_dc) => mem_dc,
+                None => {
+                    let mem_dc = CreateCompatibleDC(Some(hdc));
+                    if mem_dc.0.is_null() {
+                        schedule_retry(hdc);
+                        return false;
+                    }
+                    let bmi = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: width,
+                            biHeight: -height, // top-down DIB
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+                    let Ok(dib) =
+                        CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                    else {
+                        let _ = DeleteDC(mem_dc);
+                        schedule_retry(hdc);
+                        return false;
+                    };
+                    let old_bmp = SelectObject(mem_dc, HGDIOBJ(dib.0));
+                    if old_bmp.0.is_null() {
+                        let _ = DeleteObject(HGDIOBJ(dib.0));
+                        let _ = DeleteDC(mem_dc);
+                        schedule_retry(hdc);
+                        return false;
+                    }
+                    #[cfg(test)]
+                    BUFFER_CREATES.with(|count| count.set(count.get() + 1));
+                    if engine.buffers.len() >= 32 {
+                        if let Some(evict) = engine
+                            .buffers
+                            .iter()
+                            .min_by_key(|(_, buffer)| buffer.last_used)
+                            .map(|(key, _)| *key)
+                        {
+                            // Keep the DC alive until after this frame's
+                            // BindDC/EndDraw; the target may still reference it.
+                            evicted = engine.buffers.remove(&evict);
+                        }
+                    }
+                    engine.buffers.insert(
+                        key,
+                        Buffer {
+                            mem_dc,
+                            dib: HGDIOBJ(dib.0),
+                            old_bmp,
+                            last_used: tick,
+                        },
+                    );
+                    mem_dc
+                }
+            };
+            // The DIB is reused; erase it so a draw that does not cover every
+            // pixel cannot show the previous frame.
+            if !PatBlt(mem_dc, 0, 0, width, height, BLACKNESS).as_bool() {
+                // A bad DC/DIB must not be reused with the previous frame.
+                *guard = None;
                 schedule_retry(hdc);
                 return false;
             }
-            let bmi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: width,
-                    biHeight: -height, // top-down DIB
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let Ok(dib) = CreateDIBSection(Some(mem_dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-            else {
-                let _ = DeleteDC(mem_dc);
-                schedule_retry(hdc);
-                return false;
-            };
-            let old_bmp = SelectObject(mem_dc, HGDIOBJ(dib.0));
 
             let bind_rect = RECT {
                 left: 0,
@@ -503,9 +584,6 @@ pub fn paint_buffered<F: FnOnce(&mut Canvas<'_>)>(hdc: HDC, rect: RECT, draw: F)
                 false
             };
 
-            let _ = SelectObject(mem_dc, old_bmp);
-            let _ = DeleteObject(HGDIOBJ(dib.0));
-            let _ = DeleteDC(mem_dc);
             if !ok {
                 // A lost device (D2DERR_RECREATE_TARGET) or a transient bind
                 // failure: drop the engine so the next paint starts fresh.
@@ -517,6 +595,9 @@ pub fn paint_buffered<F: FnOnce(&mut Canvas<'_>)>(hdc: HDC, rect: RECT, draw: F)
             } else {
                 clear_retry(hdc);
             }
+            // The target is done with the previous DC; safe to release an
+            // evicted buffer now.
+            drop(evicted);
             ok
         }
     })
@@ -552,12 +633,18 @@ pub struct Canvas<'a> {
 
 impl<'a> Canvas<'a> {
     fn brush(&self, color: COLORREF, alpha: f32) -> Option<ID2D1SolidColorBrush> {
-        unsafe {
+        let key = (color.0, alpha.to_bits());
+        if let Some(brush) = self.engine.brushes.borrow().get(&key) {
+            return Some(brush.clone());
+        }
+        let brush = unsafe {
             self.engine
                 .target
                 .CreateSolidColorBrush(&color_f(color, alpha), None)
-                .ok()
-        }
+                .ok()?
+        };
+        self.engine.brushes.borrow_mut().insert(key, brush.clone());
+        Some(brush)
     }
 
     fn format(&mut self, key: FormatKey) -> Option<IDWriteTextFormat> {
@@ -1749,8 +1836,40 @@ fn build_icon_geometry(factory: &ID2D1Factory, icon: Icon) -> Option<ID2D1PathGe
 #[cfg(test)]
 mod tests {
     use super::{
-        build_icon_geometry, create_engine, mono_font_family, ui_font_family, Icon, TextStyle,
+        build_icon_geometry, create_engine, mono_font_family, paint_buffered, ui_font_family, Icon,
+        TextStyle, BUFFER_CREATES, ENGINE,
     };
+    use windows::Win32::Foundation::{COLORREF, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HDC, HGDIOBJ,
+    };
+
+    struct TestSurface {
+        screen: HDC,
+        target: HDC,
+        dib: HGDIOBJ,
+        old: HGDIOBJ,
+    }
+
+    impl Drop for TestSurface {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.old.0.is_null() {
+                    let _ = SelectObject(self.target, self.old);
+                }
+                if !self.dib.0.is_null() {
+                    let _ = DeleteObject(self.dib);
+                }
+                if !self.target.0.is_null() {
+                    let _ = DeleteDC(self.target);
+                }
+                if !self.screen.0.is_null() {
+                    ReleaseDC(None, self.screen);
+                }
+            }
+        }
+    }
 
     #[test]
     fn resolved_font_families_are_non_empty() {
@@ -1806,5 +1925,92 @@ mod tests {
         for icon in all {
             assert!(build_icon_geometry(&engine.factory, icon).is_some());
         }
+    }
+
+    #[test]
+    fn buffered_paint_reuses_same_size_buffer() {
+        let screen = unsafe { GetDC(None) };
+        if screen.0.is_null() {
+            eprintln!("skip buffered paint test: no screen DC");
+            return;
+        }
+        let target = unsafe { CreateCompatibleDC(Some(screen)) };
+        if target.0.is_null() {
+            unsafe { ReleaseDC(None, screen) };
+            eprintln!("skip buffered paint test: no compatible DC");
+            return;
+        }
+        let mut surface = TestSurface {
+            screen,
+            target,
+            dib: HGDIOBJ::default(),
+            old: HGDIOBJ::default(),
+        };
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: 64,
+                biHeight: -32,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = unsafe {
+            CreateDIBSection(Some(target), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
+                .expect("target dib")
+        };
+        surface.dib = HGDIOBJ(dib.0);
+        surface.old = unsafe { SelectObject(target, HGDIOBJ(dib.0)) };
+
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 64,
+            bottom: 32,
+        };
+        let before = BUFFER_CREATES.with(|count| count.get());
+        assert!(paint_buffered(target, rect, |canvas| {
+            canvas.clear(COLORREF(0xFFFFFF));
+            canvas.fill_rect(&rect, COLORREF(0x102030));
+        }));
+        assert!(paint_buffered(target, rect, |canvas| {
+            canvas.clear(COLORREF(0xFFFFFF));
+        }));
+        assert_eq!(BUFFER_CREATES.with(|count| count.get()), before + 1);
+
+        let small = RECT {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 16,
+        };
+        assert!(paint_buffered(target, small, |canvas| {
+            canvas.clear(COLORREF(0));
+        }));
+        assert_eq!(BUFFER_CREATES.with(|count| count.get()), before + 2);
+
+        // Exercise eviction: 33 distinct sizes push the cache past its bound.
+        for size in 1..=33 {
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: size,
+                bottom: size,
+            };
+            assert!(paint_buffered(target, rect, |canvas| {
+                canvas.clear(COLORREF(0));
+            }));
+        }
+        let cached = ENGINE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|engine| engine.buffers.len())
+                .unwrap_or(0)
+        });
+        assert!(cached <= 32, "cached={cached}");
     }
 }
