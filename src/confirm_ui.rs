@@ -7,8 +7,8 @@ use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, GetMonitorInfoW, MonitorFromWindow, UpdateWindow, HBRUSH, HDC,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
+    BeginPaint, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromWindow, UpdateWindow, HBRUSH,
+    HDC, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::DRAWITEMSTRUCT;
@@ -34,6 +34,7 @@ struct Confirm {
     message: String,
     hint: String,
     danger: bool,
+    paint_failures: u32,
 }
 
 thread_local! {
@@ -209,6 +210,7 @@ pub fn confirm(
             message: message.to_string(),
             hint: hint.to_string(),
             danger,
+            paint_failures: 0,
         });
     });
     layout(w, h);
@@ -302,7 +304,7 @@ fn layout(w: i32, h: i32) {
     }
 }
 
-fn paint(dialog: &Confirm, hdc: HDC, client: RECT) {
+fn paint(dialog: &Confirm, hdc: HDC, client: RECT) -> bool {
     let dpi = dialog.dpi;
     let p = dialog.palette;
     d2d::paint_buffered(hdc, client, |c| {
@@ -382,7 +384,26 @@ fn paint(dialog: &Confirm, hdc: HDC, client: RECT) {
             AlignH::Left,
             AlignV::Center,
         );
-    });
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaintAction {
+    None,
+    Retry,
+    Close,
+}
+
+fn paint_step(ok: bool, failures: u32) -> (u32, PaintAction) {
+    if ok {
+        return (0, PaintAction::None);
+    }
+    let count = failures.saturating_add(1);
+    if count >= 3 {
+        (count, PaintAction::Close)
+    } else {
+        (count, PaintAction::Retry)
+    }
 }
 
 unsafe extern "system" fn window_proc(
@@ -397,13 +418,31 @@ unsafe extern "system" fn window_proc(
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
             let mut client = RECT::default();
             let _ = unsafe { GetClientRect(hwnd, &mut client) };
-            CONFIRM.with(|slot| {
-                if let Some(dialog) = slot.borrow().as_ref() {
-                    paint(dialog, hdc, client);
-                }
+            let action = CONFIRM.with(|slot| match slot.try_borrow_mut() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(dialog) => {
+                        let ok = paint(dialog, hdc, client);
+                        let (failures, action) = paint_step(ok, dialog.paint_failures);
+                        dialog.paint_failures = failures;
+                        action
+                    }
+                    None => PaintAction::None,
+                },
+                Err(_) => PaintAction::None,
             });
             unsafe {
                 let _ = EndPaint(hwnd, &ps);
+            }
+            match action {
+                PaintAction::None => {}
+                // Drive the next paint ourselves: D2D's retry is one-shot and
+                // may already be spent.
+                PaintAction::Retry => unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                },
+                PaintAction::Close => unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                },
             }
             LRESULT(0)
         }
@@ -478,5 +517,34 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{paint_step, PaintAction};
+
+    #[test]
+    fn paint_failures_retry_twice_then_fail_closed() {
+        let (failures, action) = paint_step(false, 0);
+        assert_eq!((failures, action), (1, PaintAction::Retry));
+        let (failures, action) = paint_step(false, failures);
+        assert_eq!((failures, action), (2, PaintAction::Retry));
+        let (failures, action) = paint_step(false, failures);
+        assert_eq!((failures, action), (3, PaintAction::Close));
+        // A prompt that never gets to close stays closed on later failures.
+        let (_, action) = paint_step(false, failures);
+        assert_eq!(action, PaintAction::Close);
+    }
+
+    #[test]
+    fn a_successful_paint_resets_the_failure_count() {
+        let (failures, _) = paint_step(false, 0);
+        let (failures, _) = paint_step(false, failures);
+        let (failures, action) = paint_step(true, failures);
+        assert_eq!((failures, action), (0, PaintAction::None));
+        // A later failure starts a fresh sequence instead of closing.
+        let (failures, action) = paint_step(false, failures);
+        assert_eq!((failures, action), (1, PaintAction::Retry));
     }
 }

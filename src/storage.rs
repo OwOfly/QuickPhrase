@@ -504,7 +504,7 @@ pub fn import_file(path: &Path, mode: ImportMode) -> Result<ImportSummary, Strin
     let bytes = if mode == ImportMode::Merge {
         read_merge_file(path)?
     } else {
-        fs::read(path).map_err(|err| format!("read:{err}"))?
+        read_bounded_file(path, FILE_MAX_BYTES, "file_too_large")?
     };
     with_store(|store| store.import_bytes(&bytes, mode))
         .unwrap_or_else(|| Err("storage_unavailable".into()))
@@ -512,24 +512,40 @@ pub fn import_file(path: &Path, mode: ImportMode) -> Result<ImportSummary, Strin
 
 /// Restore a user-confirmed backup, returning the number of removed bindings.
 pub fn restore_file(path: &Path) -> Result<usize, String> {
-    let bytes = fs::read(path).map_err(|err| format!("read:{err}"))?;
+    let bytes = read_bounded_file(path, FILE_MAX_BYTES, "file_too_large")?;
     with_store(|store| store.restore_bytes(&bytes))
         .unwrap_or_else(|| Err("storage_unavailable".into()))
 }
 
 /// Bound merge input even if the file grows after the metadata check.
 fn read_merge_file(path: &Path) -> Result<Vec<u8>, String> {
+    read_bounded_file(path, IMPORT_MAX_BYTES, "import_too_large")
+}
+
+/// Read at most `cap` bytes, rejecting larger files before allocating. The
+/// extra byte catches a file that grows after the metadata check.
+fn read_bounded_file(path: &Path, cap: usize, too_large: &'static str) -> Result<Vec<u8>, String> {
     let metadata = fs::metadata(path).map_err(|err| format!("read:{err}"))?;
-    if metadata.len() > IMPORT_MAX_BYTES as u64 {
-        return Err("import_too_large".to_string());
+    if metadata.len() > cap as u64 {
+        return Err(too_large.to_string());
     }
     let file = fs::File::open(path).map_err(|err| format!("read:{err}"))?;
+    read_bounded(file, cap, too_large)
+}
+
+/// Read at most `cap` bytes from an open file and reject one that grew past it.
+fn read_bounded(
+    reader: impl std::io::Read,
+    cap: usize,
+    too_large: &'static str,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    file.take(IMPORT_MAX_BYTES as u64 + 1)
+    reader
+        .take(cap as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|err| format!("read:{err}"))?;
-    if bytes.len() > IMPORT_MAX_BYTES {
-        return Err("import_too_large".to_string());
+    if bytes.len() > cap {
+        return Err(too_large.to_string());
     }
     Ok(bytes)
 }
@@ -642,27 +658,66 @@ fn validate_text(title: &str, content: &str) -> Result<(String, String), String>
 }
 
 const IMPORT_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// Replace/restore are explicit whole-library operations; allow large local
+/// exports while still bounding memory if the file is corrupt or crafted.
+/// 640 MiB covers 10k snippets whose 10k-unit bodies are entirely escape-heavy
+/// JSON plus the remaining fields; larger pathological libraries must be split.
+const FILE_MAX_BYTES: usize = 640 * 1024 * 1024;
 const IMPORT_MAX_SNIPPETS: usize = 10_000;
 const IMPORT_MAX_CATEGORIES: usize = 1_000;
+/// Hard ceilings for a whole-library replace/restore. They bound the retained
+/// and validated library, not the parser's transient allocation: serde still
+/// materialises the file before these checks run.
+const REPLACE_MAX_SNIPPETS: usize = 100_000;
+const REPLACE_MAX_CATEGORIES: usize = 10_000;
+
+fn import_limit_error(snippets: usize, categories: usize, merge: bool) -> Option<&'static str> {
+    if merge {
+        (snippets > IMPORT_MAX_SNIPPETS || categories > IMPORT_MAX_CATEGORIES)
+            .then_some("import_too_large")
+    } else {
+        (snippets > REPLACE_MAX_SNIPPETS || categories > REPLACE_MAX_CATEGORIES)
+            .then_some("too_many_items")
+    }
+}
 
 fn parse_import(bytes: &[u8], merge: bool) -> Result<DataFile, String> {
     if merge && bytes.len() > IMPORT_MAX_BYTES {
         return Err("import_too_large".into());
     }
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    // Count the arrays before materialising the library so a crafted file
+    // cannot expand into millions of structs ahead of the limit check.
+    let (snippets, categories) = probe_import_counts(bytes)?;
+    if let Some(code) = import_limit_error(snippets, categories, merge) {
+        return Err(code.to_string());
+    }
     let imported = serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
     validate_import(imported, merge)
+}
+
+/// Counts snippets/categories with zero-sized `IgnoredAny` elements: the probe
+/// keeps no per-item allocation, only the element count.
+fn probe_import_counts(bytes: &[u8]) -> Result<(usize, usize), String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Probe {
+        #[serde(default)]
+        snippets: Vec<serde::de::IgnoredAny>,
+        #[serde(default)]
+        categories: Vec<serde::de::IgnoredAny>,
+    }
+    let probe: Probe =
+        serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
+    Ok((probe.snippets.len(), probe.categories.len()))
 }
 
 fn validate_import(mut data: DataFile, merge: bool) -> Result<DataFile, String> {
     if data.schema_version != SCHEMA_VERSION {
         return Err("import_schema".to_string());
     }
-    if merge
-        && (data.snippets.len() > IMPORT_MAX_SNIPPETS
-            || data.categories.len() > IMPORT_MAX_CATEGORIES)
-    {
-        return Err("import_too_large".to_string());
+    if let Some(code) = import_limit_error(data.snippets.len(), data.categories.len(), merge) {
+        return Err(code.to_string());
     }
 
     let mut category_ids = HashSet::new();
@@ -2437,6 +2492,132 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qp-store-{tag}-{}", new_id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn bounded_read_rejects_oversized_before_reading() {
+        let dir = temp_dir("bounded-read");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.json");
+        fs::write(&path, [0u8; 32]).unwrap();
+        assert_eq!(
+            read_bounded_file(&path, 16, "too_large"),
+            Err("too_large".to_string())
+        );
+        assert_eq!(read_bounded_file(&path, 32, "too_large").unwrap().len(), 32);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn import_limits_distinguish_merge_and_replace() {
+        assert_eq!(
+            import_limit_error(IMPORT_MAX_SNIPPETS + 1, 0, true),
+            Some("import_too_large")
+        );
+        assert_eq!(
+            import_limit_error(0, IMPORT_MAX_CATEGORIES + 1, true),
+            Some("import_too_large")
+        );
+        assert_eq!(
+            import_limit_error(IMPORT_MAX_SNIPPETS, IMPORT_MAX_CATEGORIES, true),
+            None
+        );
+        assert_eq!(
+            import_limit_error(REPLACE_MAX_SNIPPETS + 1, 0, false),
+            Some("too_many_items")
+        );
+        assert_eq!(
+            import_limit_error(0, REPLACE_MAX_CATEGORIES + 1, false),
+            Some("too_many_items")
+        );
+        assert_eq!(
+            import_limit_error(REPLACE_MAX_SNIPPETS, REPLACE_MAX_CATEGORIES, false),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_counts_arrays_before_materialising() {
+        let json = br#"{"schemaVersion":2,"revision":0,"snippets":[{},{},{}],"categories":[{}]}"#;
+        assert_eq!(probe_import_counts(json), Ok((3, 1)));
+        assert!(probe_import_counts(br#"{"snippets":"not-an-array"}"#).is_err());
+    }
+
+    #[test]
+    fn parse_import_rejects_too_many_items_before_full_parse() {
+        let mut json =
+            String::from(r#"{"schemaVersion":2,"revision":0,"categories":[],"snippets":["#);
+        for index in 0..=REPLACE_MAX_SNIPPETS {
+            if index > 0 {
+                json.push(',');
+            }
+            // Empty objects are enough for the probe; the full parse would
+            // reject them, so the probe must return the item-limit error first.
+            json.push_str("{}");
+        }
+        json.push_str("]}");
+        assert_eq!(
+            parse_import(json.as_bytes(), false).unwrap_err(),
+            "too_many_items"
+        );
+    }
+
+    #[test]
+    fn bounded_reader_rejects_cap_plus_one_and_accepts_exact_and_empty() {
+        let exact = read_bounded(std::io::Cursor::new(vec![7u8; 16]), 16, "too_large").unwrap();
+        assert_eq!(exact.len(), 16);
+        assert_eq!(
+            read_bounded(std::io::Cursor::new(vec![7u8; 17]), 16, "too_large"),
+            Err("too_large".to_string())
+        );
+        assert!(
+            read_bounded(std::io::Cursor::new(Vec::new()), 16, "too_large")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    struct FailingReader;
+
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("boom"))
+        }
+    }
+
+    #[test]
+    fn bounded_reader_reports_io_errors() {
+        let err = read_bounded(FailingReader, 16, "too_large").unwrap_err();
+        assert!(err.starts_with("read:"), "{err}");
+    }
+
+    #[test]
+    fn replace_validation_rejects_too_many_items() {
+        let snippet = |index: usize| Snippet {
+            id: format!("id-{index}"),
+            title: format!("title-{index}"),
+            content: "body".to_string(),
+            category_id: None,
+            pinned: false,
+            sort_order: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            use_count: 0,
+            last_used_at: None,
+            last_insert_status: None,
+            deleted_at: None,
+            tags: Vec::new(),
+            hotkey: None,
+            search_blob: String::new(),
+        };
+        let data = DataFile {
+            schema_version: SCHEMA_VERSION,
+            revision: 0,
+            categories: Vec::new(),
+            snippets: (0..=REPLACE_MAX_SNIPPETS).map(snippet).collect(),
+        };
+        let err = validate_import(data, false).unwrap_err();
+        assert_eq!(err, "too_many_items");
     }
 
     #[test]

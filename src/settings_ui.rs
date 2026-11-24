@@ -2581,6 +2581,8 @@ fn data_error_text(code: &str) -> &'static str {
     match code {
         "read_only" => "只读模式，无法导入",
         "import_too_large" => "文件超过合并上限；如需还原整库，可选择替换",
+        "file_too_large" => "文件超过 640 MiB 上限，无法导入或恢复",
+        "too_many_items" => "导入条数超过上限（短语 100,000 / 分类 10,000）",
         code if code.starts_with("read:") => "无法读取选中的文件",
         "import_invalid_json" => "文件不是有效的 QuickPhrase JSON",
         "import_schema" => "文件版本不受支持",
@@ -2650,8 +2652,22 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
             } else {
                 return;
             };
-            if mode == storage::ImportMode::Replace && !crate::manage::confirm_exit() {
-                return;
+            if mode == storage::ImportMode::Replace {
+                if !crate::manage::confirm_exit() {
+                    return;
+                }
+                // "No" on the native prompt means replacing the whole library;
+                // require an explicit danger confirmation before touching data.
+                if !crate::confirm_ui::confirm(
+                    hwnd,
+                    "替换全部数据",
+                    "导入将替换当前全部短语和分类，现有数据会先写入备份。",
+                    "此操作不可撤销；取消不会修改现有数据。",
+                    "替换全部数据",
+                    true,
+                ) {
+                    return;
+                }
             }
             match storage::import_file(&path, mode) {
                 Ok(summary) => {

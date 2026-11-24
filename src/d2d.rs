@@ -565,7 +565,7 @@ pub fn paint_buffered<F: FnOnce(&mut Canvas<'_>)>(hdc: HDC, rect: RECT, draw: F)
                 engine.target.SetTransform(&Matrix3x2::identity());
                 let res = engine.target.EndDraw(None, None);
                 if res.is_ok() {
-                    let _ = BitBlt(
+                    BitBlt(
                         hdc,
                         rect.left,
                         rect.top,
@@ -575,8 +575,8 @@ pub fn paint_buffered<F: FnOnce(&mut Canvas<'_>)>(hdc: HDC, rect: RECT, draw: F)
                         0,
                         0,
                         SRCCOPY,
-                    );
-                    true
+                    )
+                    .is_ok()
                 } else {
                     false
                 }

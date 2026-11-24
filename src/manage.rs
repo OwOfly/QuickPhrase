@@ -3056,6 +3056,20 @@ pub fn library_replaced() {
 }
 
 fn refresh_library(manage: &mut Manage, replace_editor: bool) {
+    if replace_editor {
+        // An imported library can drop the category the list is filtered by;
+        // otherwise the window would show an empty list with no selected row.
+        if let View::Category(id) = &manage.view {
+            let exists = storage::with_data(|data| {
+                data.categories.iter().any(|category| &category.id == id)
+            })
+            .unwrap_or(false);
+            if !exists {
+                manage.view = View::All;
+                manage.selected = None;
+            }
+        }
+    }
     reload_left(manage);
     reload_categories(manage);
     reload_tag_filter(manage);
