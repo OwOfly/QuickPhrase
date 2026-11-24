@@ -376,7 +376,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
-            let _ = DestroyWindow(hwnd);
+            request_exit();
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -405,10 +405,17 @@ unsafe extern "system" fn window_proc(
                 state.tray_ok = false;
                 state.hotkey_ok = false;
             });
+            storage::flush_usage();
             PostQuitMessage(0);
             LRESULT(0)
         }
         WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                storage::flush_usage();
+            }
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
     }
 }
@@ -467,24 +474,29 @@ fn handle_command(id: u32) {
             }
         }
         ID_ABOUT => about(),
-        ID_EXIT => {
-            if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
-                logging::warn("exit deferred: injection in flight");
-                let hwnd = STATE.with(|state| state.borrow().hwnd);
-                if !hwnd.0.is_null() {
-                    tray::balloon(hwnd, "QuickPhrase", "正在输入，请稍候再退出");
-                }
-                return;
-            }
-            if !manage::confirm_exit() {
-                return;
-            }
-            let hwnd = STATE.with(|state| state.borrow().hwnd);
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-        }
+        ID_EXIT => request_exit(),
         _ => {}
+    }
+}
+
+/// One exit path for the tray command and an external `WM_CLOSE`: defer while
+/// an injection is in flight, ask about unsaved management changes, then
+/// destroy the main window (which triggers `WM_DESTROY` and the usage flush).
+fn request_exit() {
+    if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
+        logging::warn("exit deferred: injection in flight");
+        let hwnd = STATE.with(|state| state.borrow().hwnd);
+        if !hwnd.0.is_null() {
+            tray::balloon(hwnd, "QuickPhrase", "正在输入，请稍候再退出");
+        }
+        return;
+    }
+    if !manage::confirm_exit() {
+        return;
+    }
+    let hwnd = STATE.with(|state| state.borrow().hwnd);
+    unsafe {
+        let _ = DestroyWindow(hwnd);
     }
 }
 
@@ -733,7 +745,7 @@ fn hotkey_snippet(snippet_id: &str) {
                 "snippet hotkey inject outcome: {message} ({} ms)",
                 started.elapsed().as_millis()
             ));
-            storage::record_use(&item_id, outcome.status());
+            storage::record_use_async(&item_id, outcome.status());
             if notify_raw != 0 {
                 tray::balloon(
                     HWND(notify_raw as *mut core::ffi::c_void),
@@ -765,7 +777,7 @@ fn foreground_is_self() -> bool {
 
 fn copy_only_direct(main: HWND, snippet_id: &str, content: &str, reason: &str) {
     let (copied, snapshot) = clipboard::set_text_with_snapshot(main, content);
-    storage::record_use(snippet_id, "rejected");
+    storage::record_use_async(snippet_id, "rejected");
     logging::info(&format!(
         "snippet hotkey copy-only: reason={reason} copied={copied} non_text={} read_ok={}",
         snapshot.had_non_text, snapshot.read_ok

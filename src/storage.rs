@@ -11,7 +11,8 @@ use std::io::{Read, Write};
 use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pinyin::ToPinyin;
 use serde::de::DeserializeOwned;
@@ -260,6 +261,79 @@ pub fn with_store<R>(f: impl FnOnce(&mut Store) -> R) -> Option<R> {
     }
 }
 
+enum UsageEvent {
+    Record { id: String, status: String },
+    Flush(mpsc::Sender<()>),
+}
+
+static USAGE_TX: std::sync::OnceLock<mpsc::Sender<UsageEvent>> = std::sync::OnceLock::new();
+
+fn record_usage_now(id: &str, status: &str) {
+    match with_store(|store| store.record_use(id, status)) {
+        Some(Ok(())) => {}
+        Some(Err(err)) => logging::warn(&format!("usage save failed: {err}")),
+        None => logging::warn("usage event dropped: storage unavailable"),
+    }
+}
+
+fn run_usage_worker(rx: mpsc::Receiver<UsageEvent>, mut apply: impl FnMut(&str, &str)) {
+    while let Ok(event) = rx.recv() {
+        match event {
+            UsageEvent::Record { id, status } => apply(&id, &status),
+            UsageEvent::Flush(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
+fn usage_sender() -> &'static mpsc::Sender<UsageEvent> {
+    USAGE_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<UsageEvent>();
+        if let Err(err) = std::thread::Builder::new()
+            .name("quickphrase-usage".into())
+            .spawn(move || run_usage_worker(rx, record_usage_now))
+        {
+            logging::warn(&format!("usage worker spawn failed: {err}"));
+        }
+        tx
+    })
+}
+
+/// Queue a usage-stat update so the UI thread does not wait for the full atomic
+/// write. Events are applied in FIFO order by one background worker.
+///
+/// Callers must not hold the store mutex (for example from inside
+/// `with_store`); the synchronous fallback locks it.
+pub fn record_use_async(id: &str, status: &str) {
+    if usage_sender()
+        .send(UsageEvent::Record {
+            id: id.to_string(),
+            status: status.to_string(),
+        })
+        .is_err()
+    {
+        // The worker died or failed to start; never drop the update.
+        record_usage_now(id, status);
+    }
+}
+
+/// Wait for usage updates queued before this call to be applied. Called on an
+/// orderly shutdown so the last insert/copy counts are persisted.
+pub fn flush_usage() {
+    let Some(tx) = USAGE_TX.get() else {
+        return;
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    if tx.send(UsageEvent::Flush(done_tx)).is_ok() {
+        if done_rx.recv_timeout(Duration::from_millis(2000)).is_err() {
+            logging::warn("usage flush timed out; pending stats may be lost");
+        }
+    } else {
+        logging::warn("usage flush failed: worker channel closed");
+    }
+}
+
 /// Snapshot for the panel: id, title, content, category name.
 #[derive(Debug, Clone)]
 pub struct PanelRow {
@@ -503,14 +577,6 @@ pub fn save_settings(next: Settings) -> Result<(), String> {
     match with_store(|store| store.save_settings(next)) {
         Some(result) => result,
         None => Err("storage_unavailable".to_string()),
-    }
-}
-
-pub fn record_use(id: &str, status: &str) {
-    match with_store(|store| store.record_use(id, status)) {
-        Some(Ok(())) => {}
-        Some(Err(err)) => logging::warn(&format!("storage: record_use failed: {err}")),
-        None => logging::warn("storage: record_use before init"),
     }
 }
 
@@ -3321,6 +3387,34 @@ mod tests {
         store.record_use(&id, "accepted").unwrap();
         assert_eq!(store.data.snippets[position].search_blob, "sentinel");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_worker_preserves_fifo_and_flushes() {
+        let (tx, rx) = mpsc::channel();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_worker = seen.clone();
+        let worker = std::thread::spawn(move || {
+            run_usage_worker(rx, move |id, status| {
+                seen_worker.lock().unwrap().push(format!("{id}:{status}"));
+            });
+        });
+        tx.send(UsageEvent::Record {
+            id: "a".to_string(),
+            status: "accepted".to_string(),
+        })
+        .unwrap();
+        tx.send(UsageEvent::Record {
+            id: "b".to_string(),
+            status: "rejected".to_string(),
+        })
+        .unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        tx.send(UsageEvent::Flush(done_tx)).unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert_eq!(*seen.lock().unwrap(), vec!["a:accepted", "b:rejected"]);
+        drop(tx);
+        worker.join().unwrap();
     }
 
     #[test]

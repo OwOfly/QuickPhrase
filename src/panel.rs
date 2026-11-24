@@ -943,7 +943,7 @@ fn commit() {
         }
         let reason = copy_only.as_deref().unwrap_or("no_target");
         let (copied, snapshot) = crate::clipboard::set_text_with_snapshot(hwnd, &content);
-        crate::storage::record_use(&item_id, "rejected");
+        crate::storage::record_use_async(&item_id, "rejected");
         logging::info(&format!(
             "panel copy-only commit: index={item_index} category={category_id} copied={copied} non_text={} read_ok={}",
             snapshot.had_non_text,
@@ -1013,7 +1013,7 @@ fn commit() {
             );
             let message = outcome.describe();
             logging::info(&format!("inject outcome: {message}"));
-            crate::storage::record_use(&item_id, outcome.status());
+            crate::storage::record_use_async(&item_id, outcome.status());
             if let Ok(mut slot) = INJECT_RESULT.lock() {
                 *slot = Some(message);
             }

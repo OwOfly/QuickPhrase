@@ -198,6 +198,7 @@ fn main() {
             }
         }
         panel::shutdown();
+        storage::flush_usage();
         logging::info("panel-test done");
         return;
     }
