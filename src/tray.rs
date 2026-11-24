@@ -47,13 +47,11 @@ pub fn set_tip(hwnd: HWND, tip: &str) {
     }
 }
 
-pub fn balloon(hwnd: HWND, title: &str, text: &str) {
+pub fn balloon(hwnd: HWND, title: &str, text: &str) -> bool {
     let mut data = base(hwnd);
     data.uFlags = NIF_INFO;
     data.dwInfoFlags = NIIF_INFO;
     copy_into(&mut data.szInfoTitle, title);
     copy_into(&mut data.szInfo, text);
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
-    }
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &data).as_bool() }
 }

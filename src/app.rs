@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,12 @@ const ID_RESTORE_CLIP: u32 = 1007;
 const ID_QUICK_ADD: u32 = 1008;
 
 const SELFTEST_TIMER: usize = 1;
+const WM_UIA_DEGRADED: u32 = WM_APP + 0x71;
+
+/// Main window handle readable from the UIA worker thread.
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+static UIA_DEGRADED_PENDING: AtomicBool = AtomicBool::new(false);
+static UIA_DEGRADED_NOTICE: AtomicBool = AtomicBool::new(false);
 
 const TIP_NORMAL: &str = "QuickPhrase 快语";
 const TIP_PAUSED: &str = "QuickPhrase（快捷键已暂停）";
@@ -81,6 +87,40 @@ fn clear_exit_gate(expected: ExitGate) {
 
 pub(crate) fn exit_pending() -> bool {
     exit_gate_blocks(exit_gate())
+}
+
+/// Posted when insertions degrade to copy-only. The main thread shows at most
+/// one balloon per session, and keeps the request pending while the tray is
+/// unavailable so a recreated tray can still deliver it.
+pub(crate) fn notify_uia_degraded() {
+    UIA_DEGRADED_PENDING.store(true, Ordering::Relaxed);
+    let raw = MAIN_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut core::ffi::c_void);
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_UIA_DEGRADED, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn show_uia_degraded_notice(hwnd: HWND) {
+    if UIA_DEGRADED_NOTICE.load(Ordering::Relaxed) {
+        return;
+    }
+    let tray_ok = STATE.with(|state| state.borrow().tray_ok);
+    if !tray_ok {
+        return;
+    }
+    if UIA_DEGRADED_NOTICE.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if tray::balloon(hwnd, "QuickPhrase", "输入增强暂不可用，本次将仅复制") {
+        UIA_DEGRADED_PENDING.store(false, Ordering::Relaxed);
+    } else {
+        // Keep the request pending so TaskbarCreated can retry it.
+        UIA_DEGRADED_NOTICE.store(false, Ordering::Relaxed);
+    }
 }
 
 fn exit_gate_blocks(gate: ExitGate) -> bool {
@@ -201,6 +241,7 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
             ..State::default()
         };
     });
+    MAIN_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
     storage::init();
     // Diagnostic runs always exercise hotkey registration, even when the user
@@ -356,6 +397,9 @@ unsafe extern "system" fn window_proc(
             logging::error("TaskbarCreated: re-adding the tray icon failed");
         }
         STATE.with(|state| state.borrow_mut().tray_ok = ok);
+        if ok && UIA_DEGRADED_PENDING.load(Ordering::Relaxed) {
+            show_uia_degraded_notice(hwnd);
+        }
         return LRESULT(0);
     }
 
@@ -420,6 +464,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            MAIN_HWND.store(0, Ordering::Relaxed);
             panel::shutdown();
             manage::shutdown();
             settings_ui::shutdown();
@@ -476,6 +521,10 @@ unsafe extern "system" fn window_proc(
             // midway by the system.
             set_exit_gate(ExitGate::SessionEnding);
             LRESULT(1)
+        }
+        WM_UIA_DEGRADED => {
+            show_uia_degraded_notice(hwnd);
+            LRESULT(0)
         }
         WM_ENDSESSION => {
             if wparam.0 != 0 {

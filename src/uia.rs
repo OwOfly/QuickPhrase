@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
@@ -97,32 +97,62 @@ pub struct UiaClient {
     mailbox: Arc<Mailbox>,
     next_id: AtomicU64,
     latest: Arc<AtomicU64>,
-    timeouts: AtomicU32,
-    unavailable: AtomicBool,
+    worker_alive: Arc<AtomicBool>,
+    quarantine: Mutex<Quarantine>,
 }
+
+const QUARANTINE: Duration = Duration::from_secs(60);
 
 impl UiaClient {
     fn new() -> Self {
         let mailbox = Arc::new(Mailbox::new());
         let latest = Arc::new(AtomicU64::new(0));
+        let worker_alive = Arc::new(AtomicBool::new(true));
 
         let worker_mailbox = mailbox.clone();
         let worker_latest = latest.clone();
+        let worker_alive_ref = worker_alive.clone();
         let spawned = thread::Builder::new()
             .name("quickphrase-uia".into())
-            .spawn(move || worker(worker_mailbox, worker_latest))
+            .spawn(move || worker(worker_mailbox, worker_latest, worker_alive_ref))
             .is_ok();
 
+        let mut quarantine = Quarantine::new();
         if !spawned {
             crate::logging::error("failed to spawn UIA worker");
+            worker_alive.store(false, Ordering::Relaxed);
+            quarantine.mark_unavailable(Instant::now());
+            crate::app::notify_uia_degraded();
         }
 
         Self {
             mailbox,
             next_id: AtomicU64::new(0),
             latest,
-            timeouts: AtomicU32::new(0),
-            unavailable: AtomicBool::new(!spawned),
+            worker_alive,
+            quarantine: Mutex::new(quarantine),
+        }
+    }
+
+    /// Restart the COM worker if it exited. Called with the global client lock
+    /// held, so at most one restart is in flight.
+    fn ensure_worker(&self) {
+        if self.worker_alive.load(Ordering::Relaxed) {
+            return;
+        }
+        self.worker_alive.store(true, Ordering::Relaxed);
+        let mailbox = self.mailbox.clone();
+        let latest = self.latest.clone();
+        let alive = self.worker_alive.clone();
+        let spawned = thread::Builder::new()
+            .name("quickphrase-uia".into())
+            .spawn(move || worker(mailbox, latest, alive))
+            .is_ok();
+        if spawned {
+            crate::logging::warn("UIA worker restarted");
+        } else {
+            self.worker_alive.store(false, Ordering::Relaxed);
+            crate::logging::error("failed to restart UIA worker");
         }
     }
 
@@ -132,8 +162,29 @@ impl UiaClient {
         id
     }
 
+    /// Whether a request may be sent. A degraded client stays copy-only until
+    /// the quarantine expires; then exactly one probe is allowed. A timeout on
+    /// that probe re-quarantines it.
+    fn ready(&self) -> bool {
+        let Ok(mut quarantine) = self.quarantine.lock() else {
+            return false;
+        };
+        if !quarantine.ready(Instant::now()) {
+            return false;
+        }
+        drop(quarantine);
+        self.ensure_worker();
+        true
+    }
+
+    fn note_success(&self) {
+        if let Ok(mut quarantine) = self.quarantine.lock() {
+            quarantine.note_success();
+        }
+    }
+
     pub fn warmup(&self, timeout: Duration) -> bool {
-        if self.unavailable.load(Ordering::Relaxed) {
+        if !self.ready() {
             return false;
         }
         let id = self.next_request();
@@ -146,19 +197,22 @@ impl UiaClient {
 
         match reply_rx.recv_timeout(timeout) {
             Ok(()) => {
-                self.timeouts.store(0, Ordering::Relaxed);
+                self.note_success();
                 true
             }
             Err(RecvTimeoutError::Timeout) => {
-                self.note_timeout();
+                self.note_failure("timeout");
                 false
             }
-            Err(RecvTimeoutError::Disconnected) => false,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.note_failure("worker disconnected");
+                false
+            }
         }
     }
 
     pub fn capture(&self, foreground: HWND, timeout: Duration) -> Option<UiaSnapshot> {
-        if self.unavailable.load(Ordering::Relaxed) {
+        if !self.ready() {
             return None;
         }
         let id = self.next_request();
@@ -172,19 +226,22 @@ impl UiaClient {
 
         match reply_rx.recv_timeout(timeout) {
             Ok(result) => {
-                self.timeouts.store(0, Ordering::Relaxed);
+                self.note_success();
                 result
             }
             Err(RecvTimeoutError::Timeout) => {
-                self.note_timeout();
+                self.note_failure("timeout");
                 None
             }
-            Err(RecvTimeoutError::Disconnected) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.note_failure("worker disconnected");
+                None
+            }
         }
     }
 
     pub fn compare_last(&self, foreground: HWND, timeout: Duration) -> Option<bool> {
-        if self.unavailable.load(Ordering::Relaxed) {
+        if !self.ready() {
             return None;
         }
         let id = self.next_request();
@@ -198,27 +255,102 @@ impl UiaClient {
 
         match reply_rx.recv_timeout(timeout) {
             Ok(result) => {
-                self.timeouts.store(0, Ordering::Relaxed);
+                self.note_success();
                 result
             }
             Err(RecvTimeoutError::Timeout) => {
-                self.note_timeout();
+                self.note_failure("timeout");
                 None
             }
-            Err(RecvTimeoutError::Disconnected) => None,
+            Err(RecvTimeoutError::Disconnected) => {
+                self.note_failure("worker disconnected");
+                None
+            }
         }
     }
 
-    fn note_timeout(&self) {
-        let count = self.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::logging::warn(&format!("UIA request timed out ({count})"));
-        if should_degrade(count) {
-            self.unavailable.store(true, Ordering::Relaxed);
+    fn note_failure(&self, reason: &str) {
+        let (count, degraded) = self
+            .quarantine
+            .lock()
+            .map(|mut quarantine| quarantine.note_timeout(Instant::now()))
+            .unwrap_or((0, false));
+        if count == 0 {
+            return;
+        }
+        crate::logging::warn(&format!("UIA request failed ({count}, {reason})"));
+        if degraded {
+            crate::app::notify_uia_degraded();
             crate::logging::error(
-                "UIA marked unavailable for this session; insertions degrade to copy-only",
+                "UIA marked unavailable; insertions degrade to copy-only until the cooldown expires",
             );
         }
     }
+}
+
+/// Consecutive UIA timeout and quarantine state, split out so the degradation
+/// sequence is testable without spawning the COM worker.
+struct Quarantine {
+    consecutive_timeouts: u32,
+    unavailable: bool,
+    until: Option<Instant>,
+}
+
+impl Quarantine {
+    fn new() -> Self {
+        Self {
+            consecutive_timeouts: 0,
+            unavailable: false,
+            until: None,
+        }
+    }
+
+    /// A degraded client stays copy-only until the deadline; then exactly one
+    /// probe is allowed. A timeout on that probe re-quarantines it.
+    fn ready(&mut self, now: Instant) -> bool {
+        if !self.unavailable {
+            return true;
+        }
+        if !quarantine_expired(now, self.until) {
+            return false;
+        }
+        self.unavailable = false;
+        self.until = None;
+        // Count the probe as the first of the next two attempts.
+        self.consecutive_timeouts = 1;
+        crate::logging::warn("UIA quarantine expired; attempting one probe");
+        true
+    }
+
+    fn note_success(&mut self) {
+        self.consecutive_timeouts = 0;
+        self.unavailable = false;
+        self.until = None;
+    }
+
+    /// Start a cooldown without a request, e.g. when the worker cannot spawn.
+    fn mark_unavailable(&mut self, now: Instant) {
+        self.consecutive_timeouts = 2;
+        self.unavailable = true;
+        self.until = Some(now + QUARANTINE);
+    }
+
+    fn note_timeout(&mut self, now: Instant) -> (u32, bool) {
+        self.consecutive_timeouts += 1;
+        let count = self.consecutive_timeouts;
+        if should_degrade(count) {
+            self.unavailable = true;
+            self.until = Some(now + QUARANTINE);
+            (count, true)
+        } else {
+            (count, false)
+        }
+    }
+}
+
+/// Whether a degraded client may probe again.
+fn quarantine_expired(now: Instant, until: Option<Instant>) -> bool {
+    until.is_some_and(|deadline| now >= deadline)
 }
 
 /// Two consecutive timeouts are enough to stop asking UIA for the session.
@@ -265,7 +397,8 @@ pub fn combine_read_only(value: Option<bool>, text: Option<bool>) -> Option<bool
     }
 }
 
-fn worker(mailbox: Arc<Mailbox>, latest: Arc<AtomicU64>) {
+fn worker(mailbox: Arc<Mailbox>, latest: Arc<AtomicU64>, alive: Arc<AtomicBool>) {
+    let _alive = WorkerAlive(alive);
     let init = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if init.is_err() {
         crate::logging::error(&format!("CoInitializeEx failed: 0x{:08X}", init.0 as u32));
@@ -342,6 +475,15 @@ fn worker(mailbox: Arc<Mailbox>, latest: Arc<AtomicU64>) {
 
 fn is_stale(id: u64, deadline: Instant, latest: &AtomicU64) -> bool {
     is_stale_at(id, deadline, latest, Instant::now())
+}
+
+/// Marks the worker dead on every exit path, including early COM failures.
+struct WorkerAlive(Arc<AtomicBool>);
+
+impl Drop for WorkerAlive {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
 }
 
 fn is_stale_at(id: u64, deadline: Instant, latest: &AtomicU64, now: Instant) -> bool {
@@ -574,7 +716,10 @@ mod tests {
     use std::sync::mpsc::{self, TryRecvError};
     use std::time::{Duration, Instant};
 
-    use super::{combine_read_only, is_stale_at, should_degrade, Mailbox, Request};
+    use super::{
+        combine_read_only, is_stale_at, quarantine_expired, should_degrade, Mailbox, Quarantine,
+        Request, QUARANTINE,
+    };
 
     #[test]
     fn degrades_after_two_consecutive_uia_timeouts() {
@@ -582,6 +727,60 @@ mod tests {
         assert!(!should_degrade(1));
         assert!(should_degrade(2));
         assert!(should_degrade(3));
+    }
+
+    #[test]
+    fn quarantine_expires_only_after_the_deadline() {
+        let now = std::time::Instant::now();
+        assert!(!quarantine_expired(now, None));
+        assert!(!quarantine_expired(
+            now,
+            Some(now + std::time::Duration::from_secs(1))
+        ));
+        assert!(quarantine_expired(
+            now,
+            Some(now - std::time::Duration::from_secs(1))
+        ));
+    }
+
+    #[test]
+    fn quarantine_allows_one_probe_and_re_degrades_on_failure() {
+        let t0 = Instant::now();
+        let mut q = Quarantine::new();
+        assert!(q.ready(t0));
+        assert_eq!(q.note_timeout(t0), (1, false));
+        assert!(q.ready(t0));
+        assert_eq!(q.note_timeout(t0), (2, true));
+        assert!(!q.ready(t0 + Duration::from_secs(1)));
+        assert!(!q.ready(t0 + QUARANTINE - Duration::from_secs(1)));
+
+        // Exactly one probe after the deadline; its timeout re-quarantines.
+        let t1 = t0 + QUARANTINE + Duration::from_secs(1);
+        assert!(q.ready(t1));
+        assert_eq!(q.note_timeout(t1), (2, true));
+        assert!(!q.ready(t1 + Duration::from_secs(1)));
+
+        // A successful probe restores the normal one-outage tolerance.
+        let t2 = t1 + QUARANTINE + Duration::from_secs(1);
+        assert!(q.ready(t2));
+        q.note_success();
+        assert!(q.ready(t2));
+        assert_eq!(q.note_timeout(t2), (1, false));
+        assert!(q.ready(t2));
+    }
+
+    #[test]
+    fn spawn_failure_cooldown_then_reprobe() {
+        let t0 = Instant::now();
+        let mut q = Quarantine::new();
+        q.mark_unavailable(t0);
+        assert!(!q.ready(t0 + Duration::from_secs(1)));
+        assert!(q.ready(t0 + QUARANTINE + Duration::from_secs(1)));
+        // The reprobe counts as the first of the next two attempts.
+        assert_eq!(
+            q.note_timeout(t0 + QUARANTINE + Duration::from_secs(2)),
+            (2, true)
+        );
     }
 
     #[test]
