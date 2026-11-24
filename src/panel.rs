@@ -638,6 +638,34 @@ pub fn hide_only() {
     hide(false);
 }
 
+/// Re-read the system palette while the panel is open (high contrast toggle).
+pub fn refresh_theme() {
+    let retheme = PANEL.with(|slot| {
+        let mut guard = match slot.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => return None,
+        };
+        let panel = guard.as_mut()?;
+        let palette = theme::current();
+        if palette == panel.palette {
+            return None;
+        }
+        destroy_brushes(&panel.brushes);
+        panel.brushes = make_brushes(palette);
+        panel.palette = palette;
+        Some((panel.hwnd, panel.edit, panel.list, palette))
+    });
+    let Some((hwnd, edit, list, palette)) = retheme else {
+        return;
+    };
+    ui::apply_popup_style(hwnd, palette);
+    ui::theme_control(edit, palette.dark);
+    ui::theme_control(list, palette.dark);
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, true);
+    }
+}
+
 fn window_identity(hwnd: HWND) -> Option<(u32, u64, u32)> {
     let mut pid = 0u32;
     let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
@@ -1394,7 +1422,11 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
             } else {
                 (
                     palette.primary_soft,
-                    palette.primary_text,
+                    if crate::theme::high_contrast_cached() {
+                        palette.heading
+                    } else {
+                        palette.primary_text
+                    },
                     Icon::Clipboard,
                     "粘贴兼容模式（Ctrl+V）· 原纯文本剪贴板受保护".to_string(),
                 )
@@ -1467,7 +1499,11 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
             (icon_tile.left + icon_tile.right) as f32 * 0.5,
             (icon_tile.top + icon_tile.bottom) as f32 * 0.5,
             d2d::scaled_f(14.0, dpi),
-            palette.primary,
+            if crate::theme::high_contrast_cached() {
+                palette.heading
+            } else {
+                palette.primary
+            },
         );
 
         // Hotkey tactile keycap
@@ -1542,7 +1578,7 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
                 TextStyle::Label,
                 dpi,
                 if selected {
-                    COLORREF(0xFFFFFF)
+                    crate::theme::on_primary(&palette)
                 } else {
                     palette.secondary
                 },
@@ -1593,7 +1629,7 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
                 TextStyle::Badge,
                 dpi,
                 if selected {
-                    COLORREF(0xFFFFFF)
+                    crate::theme::on_primary(&palette)
                 } else {
                     palette.secondary
                 },
@@ -1750,12 +1786,19 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
             },
             1.0,
         );
+        let manage_text = if manage_hover {
+            crate::theme::on_selection(&palette)
+        } else if crate::theme::high_contrast_cached() {
+            palette.heading
+        } else {
+            palette.primary_text
+        };
         c.icon(
             Icon::Grid,
             (rects.manage_btn.left + scaled(15, dpi)) as f32,
             (rects.manage_btn.top + rects.manage_btn.bottom) as f32 * 0.5,
             d2d::scaled_f(12.0, dpi),
-            palette.primary_text,
+            manage_text,
         );
         let mtxt = RECT {
             left: rects.manage_btn.left + scaled(25, dpi),
@@ -1768,7 +1811,7 @@ fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
             &mtxt,
             TextStyle::Label,
             dpi,
-            palette.primary_text,
+            manage_text,
             AlignH::Center,
             AlignV::Center,
         );
@@ -1826,7 +1869,11 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
                 right: pill.left + scaled(6, dpi),
                 bottom: pill.bottom - scaled(10, dpi),
             };
-            c.fill_round(&accent_bar, d2d::scaled_f(2.0, dpi), palette.primary);
+            c.fill_round(
+                &accent_bar,
+                d2d::scaled_f(2.0, dpi),
+                palette.selection_border,
+            );
         }
 
         // Semantic 36x36 rounded icon tile (matches demo w-9 h-9 rounded-[10px])
@@ -1931,7 +1978,11 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             &title_rect,
             TextStyle::Heading,
             dpi,
-            palette.heading,
+            if selected {
+                crate::theme::on_selection(&palette)
+            } else {
+                palette.heading
+            },
             title_hl,
             palette.highlight,
             palette.highlight_text,
@@ -1958,7 +2009,11 @@ fn draw_item(panel: &Panel, draw: &DRAWITEMSTRUCT) {
             &preview_rect,
             TextStyle::Caption,
             dpi,
-            palette.secondary,
+            if selected {
+                crate::theme::on_selection(&palette)
+            } else {
+                palette.secondary
+            },
             safe_hl,
             palette.highlight,
             palette.highlight_text,

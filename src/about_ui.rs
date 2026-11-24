@@ -248,6 +248,26 @@ pub fn show() {
     }
 }
 
+/// Re-read the system palette while the About window is open.
+pub fn refresh_theme() {
+    ABOUT.with(|slot| {
+        let Ok(mut guard) = slot.try_borrow_mut() else {
+            return;
+        };
+        let Some(about) = guard.as_mut() else {
+            return;
+        };
+        let palette = theme::current();
+        if palette != about.palette {
+            about.palette = palette;
+            ui::apply_window_style(about.hwnd);
+            unsafe {
+                let _ = InvalidateRect(Some(about.hwnd), None, true);
+            }
+        }
+    });
+}
+
 pub fn show_test() -> bool {
     QUIT_ON_CLOSE.store(true, Ordering::Relaxed);
     show();

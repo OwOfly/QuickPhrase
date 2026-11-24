@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::{w, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor, SetBkMode,
     SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT,
@@ -796,7 +796,7 @@ fn paint_settings(ui: &SettingsUi, hdc: HDC, client: RECT) {
                     right: item.left + scaled(6, dpi),
                     bottom: item.bottom - scaled(9, dpi),
                 };
-                c.fill_round(&bar, d2d::scaled_f(2.0, dpi), p.primary);
+                c.fill_round(&bar, d2d::scaled_f(2.0, dpi), p.selection_border);
             } else if hovered {
                 c.fill_round(&item, d2d::scaled_f(10.0, dpi), p.hover);
             }
@@ -1010,7 +1010,11 @@ fn paint_tab_general(
             &ht,
             TextStyle::Label,
             dpi,
-            p.primary_text,
+            if crate::theme::high_contrast_cached() {
+                p.heading
+            } else {
+                p.primary_text
+            },
             AlignH::Left,
             AlignV::Center,
         );
@@ -1103,11 +1107,22 @@ fn paint_tab_input(
         rcx,
         rcy,
         d2d::scaled_f(7.0, dpi),
-        if uni_sel { p.primary } else { p.border_strong },
+        if uni_sel {
+            crate::theme::on_selection(&p)
+        } else if crate::theme::high_contrast_cached() {
+            p.heading
+        } else {
+            p.primary
+        },
         d2d::scaled_f(1.6, dpi),
     );
     if uni_sel {
-        c.fill_circle(rcx, rcy, d2d::scaled_f(3.6, dpi), p.primary);
+        c.fill_circle(
+            rcx,
+            rcy,
+            d2d::scaled_f(3.6, dpi),
+            crate::theme::on_selection(&p),
+        );
     }
     let ut = RECT {
         left: r.mode_unicode.left + scaled(38, dpi),
@@ -1120,7 +1135,11 @@ fn paint_tab_input(
         &ut,
         TextStyle::Heading,
         dpi,
-        p.heading,
+        if uni_sel {
+            crate::theme::on_selection(&p)
+        } else {
+            p.heading
+        },
         AlignH::Left,
         AlignV::Center,
     );
@@ -1151,7 +1170,11 @@ fn paint_tab_input(
         &ud,
         TextStyle::Caption,
         dpi,
-        p.secondary,
+        if uni_sel {
+            crate::theme::on_selection(&p)
+        } else {
+            p.secondary
+        },
         AlignH::Left,
         AlignV::Center,
     );
@@ -1181,11 +1204,22 @@ fn paint_tab_input(
         pcx,
         pcy,
         d2d::scaled_f(7.0, dpi),
-        if pas_sel { p.primary } else { p.border_strong },
+        if pas_sel {
+            crate::theme::on_selection(&p)
+        } else if crate::theme::high_contrast_cached() {
+            p.heading
+        } else {
+            p.primary
+        },
         d2d::scaled_f(1.6, dpi),
     );
     if pas_sel {
-        c.fill_circle(pcx, pcy, d2d::scaled_f(3.6, dpi), p.primary);
+        c.fill_circle(
+            pcx,
+            pcy,
+            d2d::scaled_f(3.6, dpi),
+            crate::theme::on_selection(&p),
+        );
     }
     let pt = RECT {
         left: r.mode_paste.left + scaled(38, dpi),
@@ -1198,7 +1232,11 @@ fn paint_tab_input(
         &pt,
         TextStyle::Heading,
         dpi,
-        p.heading,
+        if pas_sel {
+            crate::theme::on_selection(&p)
+        } else {
+            p.heading
+        },
         AlignH::Left,
         AlignV::Center,
     );
@@ -1213,7 +1251,11 @@ fn paint_tab_input(
         &pd,
         TextStyle::Caption,
         dpi,
-        p.secondary,
+        if pas_sel {
+            crate::theme::on_selection(&p)
+        } else {
+            p.secondary
+        },
         AlignH::Left,
         AlignV::Center,
     );
@@ -1485,7 +1527,7 @@ fn paint_tab_appearance(
                 cx,
                 cy,
                 d2d::scaled_f(9.0, dpi),
-                COLORREF(0xFFFFFF),
+                crate::theme::on_primary(&p),
             );
         }
     }
@@ -1945,8 +1987,27 @@ fn load(ui: &mut SettingsUi) {
     apply_live_theme(ui, &ui.theme_pref.clone());
 }
 
+/// Re-read the system palette while the settings window is open.
+pub fn refresh_theme() {
+    UI.with(|slot| {
+        let mut guard = match slot.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let Some(ui) = guard.as_mut() else {
+            return;
+        };
+        if !unsafe { IsWindowVisible(ui.hwnd) }.as_bool() {
+            return;
+        }
+        let pref = ui.theme_pref.clone();
+        apply_live_theme(ui, &pref);
+        relayout(ui);
+    });
+}
+
 fn apply_live_theme(ui: &mut SettingsUi, pref: &str) {
-    let palette = theme::resolve(pref);
+    let palette = theme::palette_for(pref);
     if palette != ui.palette {
         ui.palette = palette;
         theme::preview(palette);
@@ -3231,6 +3292,11 @@ unsafe extern "system" fn window_proc(
             } else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 theme::clear_preview();
+                // Closing settings drops its preview; other windows must not
+                // keep rendering the discarded palette.
+                crate::manage::refresh_theme();
+                crate::panel::refresh_theme();
+                crate::about_ui::refresh_theme();
             }
             LRESULT(0)
         }

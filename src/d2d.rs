@@ -1325,7 +1325,11 @@ impl<'a> Canvas<'a> {
             self.stroke_round(
                 &ring,
                 radius + pad as f32,
-                palette.primary,
+                if crate::theme::high_contrast_cached() {
+                    palette.heading
+                } else {
+                    palette.primary
+                },
                 scaled_f(1.5, dpi),
             );
         }
@@ -1339,7 +1343,14 @@ impl<'a> Canvas<'a> {
         let cy = (rect.top + rect.bottom) as f32 * 0.5;
         // Subtle shadow under thumb
         self.fill_circle_alpha(cx, cy + 1.0, thumb_r, COLORREF(0x000000), 0.18);
-        self.fill_circle(cx, cy, thumb_r, COLORREF(0xFFFFFF));
+        let thumb = if checked {
+            crate::theme::on_primary(&palette)
+        } else if crate::theme::high_contrast_cached() {
+            palette.page
+        } else {
+            COLORREF(0xFFFFFF)
+        };
+        self.fill_circle(cx, cy, thumb_r, thumb);
     }
 
     /// Draw a crisp Lucide-style 24×24 vector icon centered at `(cx, cy)` within

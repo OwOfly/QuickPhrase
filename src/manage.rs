@@ -205,6 +205,8 @@ thread_local! {
 }
 
 static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
+/// A theme refresh arrived while a modal owned the MANAGE borrow.
+static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
@@ -1430,7 +1432,7 @@ fn draw_phrase_row(manage: &Manage, draw: &DRAWITEMSTRUCT) {
                 right: card.left + scaled(6, dpi),
                 bottom: card.bottom - scaled(10, dpi),
             };
-            c.fill_round(&bar, d2d::scaled_f(2.0, dpi), palette.primary);
+            c.fill_round(&bar, d2d::scaled_f(2.0, dpi), palette.selection_border);
         } else {
             // Subtle bottom divider on unselected items
             c.line(
@@ -1451,7 +1453,11 @@ fn draw_phrase_row(manage: &Manage, draw: &DRAWITEMSTRUCT) {
                 (title_left + scaled(6, dpi)) as f32,
                 (top_row_y + scaled(9, dpi)) as f32,
                 d2d::scaled_f(11.5, dpi),
-                palette.primary,
+                if selected {
+                    palette.selection_border
+                } else {
+                    palette.primary
+                },
             );
             title_left += scaled(16, dpi);
         }
@@ -1487,7 +1493,11 @@ fn draw_phrase_row(manage: &Manage, draw: &DRAWITEMSTRUCT) {
             &preview_rect,
             TextStyle::Caption,
             dpi,
-            palette.secondary,
+            if selected {
+                palette.primary_text
+            } else {
+                palette.secondary
+            },
             AlignH::Left,
             AlignV::Center,
         );
@@ -1522,7 +1532,11 @@ fn draw_phrase_row(manage: &Manage, draw: &DRAWITEMSTRUCT) {
             &cat_rect,
             TextStyle::Badge,
             dpi,
-            palette.muted,
+            if selected {
+                palette.primary_text
+            } else {
+                palette.muted
+            },
             AlignH::Left,
             AlignV::Center,
         );
@@ -2219,7 +2233,14 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
                     + ((l.editor_header.bottom - l.editor_header.top) + badge_h) / 2,
             };
             let (badge_bg, badge_fg) = if batch {
-                (palette.primary_soft, palette.primary_text)
+                (
+                    palette.primary_soft,
+                    if crate::theme::high_contrast_cached() {
+                        palette.heading
+                    } else {
+                        palette.primary_text
+                    },
+                )
             } else {
                 (palette.warning_soft, palette.warning)
             };
@@ -3008,41 +3029,95 @@ pub fn show(owner: HWND) {
         let Some(manage) = guard.as_mut() else {
             return;
         };
-        let palette = theme::current();
-        if palette != manage.palette {
-            unsafe {
-                let _ = DeleteObject(HGDIOBJ(manage.sidebar_brush.0));
-                let _ = DeleteObject(HGDIOBJ(manage.card_brush.0));
-                let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
-            }
-            manage.sidebar_brush = unsafe { CreateSolidBrush(palette.sidebar) };
-            manage.card_brush = unsafe { CreateSolidBrush(palette.card) };
-            manage.field_brush = unsafe { CreateSolidBrush(palette.field) };
-            manage.palette = palette;
-            for control in [
-                manage.left,
-                manage.list,
-                manage.category,
-                manage.tag_filter,
-                manage.cat_name,
-                manage.search,
-                manage.title_edit,
-                manage.content_edit,
-                manage.tags_edit,
-                manage.hotkey_edit,
-            ] {
-                ui::theme_control(control, palette.dark);
-            }
-            ui::theme_combo(manage.category, palette.dark);
-            ui::theme_combo(manage.tag_filter, palette.dark);
-            ui::theme_scrollbar(manage.content_edit, palette.dark);
-            ui::apply_window_style(manage.hwnd);
-        }
+        apply_palette(manage);
         unsafe {
             let _ = SetFocus(Some(manage.search));
         }
         refresh_library(manage, false);
     });
+}
+
+fn apply_palette(manage: &mut Manage) {
+    let palette = theme::current();
+    if palette == manage.palette {
+        return;
+    }
+    unsafe {
+        let _ = DeleteObject(HGDIOBJ(manage.sidebar_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.card_brush.0));
+        let _ = DeleteObject(HGDIOBJ(manage.field_brush.0));
+    }
+    manage.sidebar_brush = unsafe { CreateSolidBrush(palette.sidebar) };
+    manage.card_brush = unsafe { CreateSolidBrush(palette.card) };
+    manage.field_brush = unsafe { CreateSolidBrush(palette.field) };
+    manage.palette = palette;
+    for control in [
+        manage.left,
+        manage.list,
+        manage.category,
+        manage.tag_filter,
+        manage.cat_name,
+        manage.search,
+        manage.title_edit,
+        manage.content_edit,
+        manage.tags_edit,
+        manage.hotkey_edit,
+    ] {
+        ui::theme_control(control, palette.dark);
+    }
+    ui::theme_combo(manage.category, palette.dark);
+    ui::theme_combo(manage.tag_filter, palette.dark);
+    ui::theme_scrollbar(manage.content_edit, palette.dark);
+    ui::apply_window_style(manage.hwnd);
+}
+
+/// Re-read the system palette (high contrast / theme change) while open.
+pub fn refresh_theme() {
+    MANAGE.with(|slot| {
+        let mut guard = match slot.try_borrow_mut() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // A modal owns the borrow and pumps messages; retry after it
+                // releases instead of dropping the refresh.
+                REFRESH_PENDING.store(true, Ordering::Relaxed);
+                return;
+            }
+        };
+        let Some(manage) = guard.as_mut() else {
+            return;
+        };
+        REFRESH_PENDING.store(false, Ordering::Relaxed);
+        refresh_palette(manage);
+    });
+}
+
+fn apply_pending_theme() {
+    if !REFRESH_PENDING.load(Ordering::Relaxed) {
+        return;
+    }
+    MANAGE.with(|slot| {
+        let Ok(mut guard) = slot.try_borrow_mut() else {
+            return;
+        };
+        let Some(manage) = guard.as_mut() else {
+            return;
+        };
+        REFRESH_PENDING.store(false, Ordering::Relaxed);
+        refresh_palette(manage);
+    });
+}
+
+fn refresh_palette(manage: &mut Manage) {
+    apply_palette(manage);
+    for row in &mut manage.nav_rows {
+        if matches!(row.view, View::Category(_)) {
+            row.dot = Some(theme::category_dot_for_name(&row.label));
+        }
+    }
+    relayout(manage);
+    unsafe {
+        let _ = InvalidateRect(Some(manage.hwnd), None, true);
+    }
 }
 
 /// Refresh an open editor after a confirmed replacement without changing focus.
@@ -3225,6 +3300,7 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    apply_pending_theme();
     match message {
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;

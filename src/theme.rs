@@ -3,9 +3,17 @@
 //! `theme = system` follows the Windows app theme; light/dark are explicit.
 //! Every foreground/background pair is checked against WCAG AA contrast ratios.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Graphics::Gdi::{
+    GetSysColor, COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+    COLOR_WINDOWTEXT,
+};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::UI::Accessibility::{HCF_HIGHCONTRASTON, HIGHCONTRASTW};
+use windows::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETHIGHCONTRAST};
 
 const APP_THEME_KEY: PCWSTR =
     w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
@@ -66,10 +74,16 @@ pub const CATEGORY_DOTS: [COLORREF; 6] = [
 
 #[allow(dead_code)]
 pub fn category_dot(index: usize) -> COLORREF {
+    if high_contrast_cached() {
+        return COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) });
+    }
     CATEGORY_DOTS[index % CATEGORY_DOTS.len()]
 }
 
 pub fn category_dot_for_name(name: &str) -> COLORREF {
+    if high_contrast_cached() {
+        return COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) });
+    }
     if name.is_empty() {
         return rgb(0x88, 0x90, 0xA8);
     }
@@ -165,11 +179,136 @@ pub fn resolve(preference: &str) -> Palette {
     }
 }
 
+/// Preference resolution with High Contrast taking precedence.
+pub fn palette_for(preference: &str) -> Palette {
+    if high_contrast() {
+        high_contrast_palette()
+    } else {
+        resolve(preference)
+    }
+}
+
+static HC_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether Windows High Contrast is enabled. Queried live so a theme toggle is
+/// picked up by the next palette refresh.
+pub fn high_contrast() -> bool {
+    let mut hc = HIGHCONTRASTW {
+        cbSize: std::mem::size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            std::mem::size_of::<HIGHCONTRASTW>() as u32,
+            Some(&mut hc as *mut _ as *mut core::ffi::c_void),
+            Default::default(),
+        )
+    };
+    let enabled = ok.is_ok() && (hc.dwFlags.0 & HCF_HIGHCONTRASTON.0) != 0;
+    HC_ACTIVE.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
+/// Last observed HC state for hot paths (category dots). Updated by
+/// `high_contrast()` during palette refreshes and window opens.
+pub fn high_contrast_cached() -> bool {
+    HC_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Text/icon colour on a `primary` (brand or HC highlight) fill.
+pub fn on_primary(palette: &Palette) -> COLORREF {
+    on_primary_for(palette, high_contrast_cached())
+}
+
+fn on_primary_for(palette: &Palette, hc: bool) -> COLORREF {
+    if hc {
+        palette.primary_text
+    } else {
+        COLORREF(0xFFFFFF)
+    }
+}
+
+pub fn on_selection(palette: &Palette) -> COLORREF {
+    on_selection_for(palette, high_contrast_cached())
+}
+
+fn on_selection_for(palette: &Palette, hc: bool) -> COLORREF {
+    if hc {
+        palette.highlight_text
+    } else {
+        palette.primary_text
+    }
+}
+
+fn high_contrast_palette() -> Palette {
+    high_contrast_palette_from(
+        unsafe { GetSysColor(COLOR_WINDOW) },
+        unsafe { GetSysColor(COLOR_BTNFACE) },
+        unsafe { GetSysColor(COLOR_WINDOWTEXT) },
+        unsafe { GetSysColor(COLOR_HIGHLIGHT) },
+        unsafe { GetSysColor(COLOR_HIGHLIGHTTEXT) },
+    )
+}
+
+fn high_contrast_palette_from(
+    window: u32,
+    face: u32,
+    text: u32,
+    highlight: u32,
+    highlight_text: u32,
+) -> Palette {
+    let window = COLORREF(window);
+    let face = COLORREF(face);
+    let text = COLORREF(text);
+    let highlight = COLORREF(highlight);
+    let highlight_text = COLORREF(highlight_text);
+    Palette {
+        dark: false,
+        page: window,
+        sidebar: face,
+        card: window,
+        card_subtle: face,
+        heading: text,
+        secondary: text,
+        muted: text,
+        border: text,
+        border_strong: text,
+        divider: text,
+        hover: highlight,
+        selection: highlight,
+        selection_border: text,
+        primary: highlight,
+        primary_hover: highlight,
+        primary_active: highlight,
+        primary_soft: face,
+        primary_text: highlight_text,
+        highlight,
+        highlight_text,
+        kbd_bg: window,
+        kbd_border: text,
+        success: text,
+        success_soft: window,
+        warning: text,
+        warning_soft: window,
+        error: text,
+        danger: text,
+        danger_soft: window,
+        field: window,
+        field_focus: window,
+    }
+}
+
 thread_local! {
     static PREVIEW: std::cell::RefCell<Option<Palette>> = const { std::cell::RefCell::new(None) };
 }
 
 pub fn current() -> Palette {
+    // High contrast must win over an unsaved settings preview; otherwise a
+    // pinned preview can keep other windows out of HC after a toggle.
+    if high_contrast() {
+        return high_contrast_palette();
+    }
     PREVIEW
         .with(|preview| preview.borrow().to_owned())
         .unwrap_or_else(|| resolve(&crate::storage::settings_clone().unwrap_or_default().theme))
@@ -230,7 +369,40 @@ fn luminance(color: COLORREF) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_preview, contrast_ratio, current, preview, resolve, COLORREF, DARK, LIGHT};
+    use super::{
+        clear_preview, contrast_ratio, current, high_contrast_palette_from, on_primary_for,
+        on_selection_for, preview, resolve, rgb, COLORREF, DARK, LIGHT,
+    };
+
+    #[test]
+    fn on_primary_keeps_white_in_light_dark_and_pairs_hc() {
+        assert_eq!(on_primary_for(&LIGHT, false), COLORREF(0xFFFFFF));
+        assert_eq!(on_primary_for(&DARK, false), COLORREF(0xFFFFFF));
+        assert_eq!(on_primary_for(&LIGHT, true), LIGHT.primary_text);
+        assert_eq!(on_selection_for(&LIGHT, false), LIGHT.primary_text);
+        assert_eq!(on_selection_for(&LIGHT, true), LIGHT.highlight_text);
+    }
+
+    #[test]
+    fn high_contrast_palette_maps_system_colors() {
+        let window = rgb(10, 11, 12);
+        let face = rgb(20, 21, 22);
+        let text = rgb(230, 231, 232);
+        let highlight = rgb(40, 41, 42);
+        let highlight_text = rgb(250, 251, 252);
+        let palette =
+            high_contrast_palette_from(window.0, face.0, text.0, highlight.0, highlight_text.0);
+        assert!(!palette.dark);
+        assert_eq!(palette.page, window);
+        assert_eq!(palette.sidebar, face);
+        assert_eq!(palette.card, window);
+        assert_eq!(palette.heading, text);
+        assert_eq!(palette.muted, text);
+        assert_eq!(palette.primary, highlight);
+        assert_eq!(palette.primary_text, highlight_text);
+        assert_eq!(palette.field, window);
+        assert_eq!(palette.danger, text);
+    }
 
     #[test]
     fn preview_overrides_current_and_clear_is_idempotent() {

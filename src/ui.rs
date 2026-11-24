@@ -425,7 +425,11 @@ pub fn draw_button_with_icon(
     let (fill, border, text_color) = match kind {
         ButtonKind::Primary => {
             let fill = if disabled {
-                palette.border
+                if crate::theme::high_contrast_cached() {
+                    palette.card
+                } else {
+                    palette.border
+                }
             } else if pressed {
                 palette.primary_active
             } else if hover || palette.dark {
@@ -436,7 +440,7 @@ pub fn draw_button_with_icon(
             let text = if disabled {
                 palette.secondary
             } else {
-                COLORREF(0xFFFFFF)
+                crate::theme::on_primary(&palette)
             };
             (fill, fill, text)
         }
@@ -497,6 +501,10 @@ pub fn draw_button_with_icon(
             };
             let text = if disabled {
                 palette.secondary
+            } else if pressed {
+                crate::theme::on_selection(&palette)
+            } else if crate::theme::high_contrast_cached() {
+                palette.heading
             } else {
                 palette.primary_text
             };
@@ -526,7 +534,9 @@ pub fn draw_button_with_icon(
                 bottom: rect.bottom - ring,
             };
             let ring_color = if kind == ButtonKind::Primary {
-                COLORREF(0xFFFFFF)
+                crate::theme::on_primary(&palette)
+            } else if crate::theme::high_contrast_cached() {
+                palette.heading
             } else {
                 palette.primary
             };
@@ -648,7 +658,7 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, _font:
                 right: pill.left + scaled(6, dpi),
                 bottom: pill.bottom - scaled(5, dpi),
             };
-            c.fill_round(&bar, d2d::scaled_f(2.0, dpi), palette.primary);
+            c.fill_round(&bar, d2d::scaled_f(2.0, dpi), palette.selection_border);
         }
         let text_rect = RECT {
             left: rect.left + scaled(12, dpi),
@@ -659,7 +669,7 @@ pub fn draw_combo_item(draw: &DRAWITEMSTRUCT, palette: Palette, dpi: u32, _font:
         let color = if disabled {
             palette.secondary
         } else if selected && !closed {
-            palette.primary_text
+            crate::theme::on_selection(&palette)
         } else {
             palette.heading
         };

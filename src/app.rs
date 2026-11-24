@@ -522,6 +522,15 @@ unsafe extern "system" fn window_proc(
             set_exit_gate(ExitGate::SessionEnding);
             LRESULT(1)
         }
+        WM_SETTINGCHANGE | WM_SYSCOLORCHANGE | WM_THEMECHANGED => {
+            // Settings owns the global preview; refresh it first so the other
+            // windows read the same palette.
+            settings_ui::refresh_theme();
+            manage::refresh_theme();
+            panel::refresh_theme();
+            crate::about_ui::refresh_theme();
+            LRESULT(0)
+        }
         WM_UIA_DEGRADED => {
             show_uia_degraded_notice(hwnd);
             LRESULT(0)
