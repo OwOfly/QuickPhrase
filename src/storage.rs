@@ -398,8 +398,13 @@ pub fn read_only_notice() -> Option<String> {
     .flatten()
 }
 
-pub fn data_clone() -> Option<DataFile> {
-    with_store(|store| store.data().clone())
+/// Read the current data file without cloning it.
+///
+/// The closure runs while the store mutex is held, so it must only read and
+/// copy the fields it needs; it must not send window messages or call back
+/// into storage.
+pub fn with_data<R>(f: impl FnOnce(&DataFile) -> R) -> Option<R> {
+    with_store(|store| f(store.data()))
 }
 
 pub fn active_count() -> usize {

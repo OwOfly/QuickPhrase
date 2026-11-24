@@ -79,9 +79,52 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
     rank_with_mode(docs, query, limit, SortMode::Recent)
 }
 
+/// Rank without building highlight ranges; returns indices into `docs`.
+pub fn rank_indices(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<usize> {
+    rank_indices_with_mode(docs, query, limit, SortMode::Recent)
+}
+
+/// Rank without highlights, in the same order as [`rank_with_mode`].
+pub fn rank_indices_with_mode(
+    docs: &[Doc<'_>],
+    query: &str,
+    limit: usize,
+    mode: SortMode,
+) -> Vec<usize> {
+    let (_, mut scored) = rank_scored(docs, query, mode);
+    scored.truncate(limit);
+    scored.into_iter().map(|(_, index)| index).collect()
+}
+
 /// Rank by relevance and pinning first, comparing usage before recency only
 /// in MostUsed mode. Compute highlights only after limiting the result set.
 pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMode) -> Vec<Hit> {
+    let (needle, mut scored) = rank_scored(docs, query, mode);
+    scored.truncate(limit);
+    scored
+        .into_iter()
+        .map(|(score, index)| {
+            let doc = &docs[index];
+            let (title_highlight, content_highlight) = if needle.is_empty() {
+                (None, None)
+            } else {
+                (
+                    find_range(doc.title, &needle),
+                    find_range(doc.content, &needle),
+                )
+            };
+            Hit {
+                index,
+                score,
+                title_highlight,
+                content_highlight,
+            }
+        })
+        .collect()
+}
+
+/// Shared matching and ordering for both the highlight and index-only APIs.
+fn rank_scored(docs: &[Doc<'_>], query: &str, mode: SortMode) -> (String, Vec<(u32, usize)>) {
     let allow_blob_fallback = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
     let mut scored: Vec<(u32, usize)> = Vec::new();
@@ -150,27 +193,7 @@ pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMod
             .then_with(|| a.id.cmp(b.id))
     });
 
-    scored.truncate(limit);
-    scored
-        .into_iter()
-        .map(|(score, index)| {
-            let doc = &docs[index];
-            let (title_highlight, content_highlight) = if needle.is_empty() {
-                (None, None)
-            } else {
-                (
-                    find_range(doc.title, &needle),
-                    find_range(doc.content, &needle),
-                )
-            };
-            Hit {
-                index,
-                score,
-                title_highlight,
-                content_highlight,
-            }
-        })
-        .collect()
+    (needle, scored)
 }
 
 /// Larger timestamps sort first; `None` sorts last.
@@ -276,7 +299,9 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bench, rank, split_tag_query, Doc};
+    use super::{
+        bench, rank, rank_indices_with_mode, rank_with_mode, split_tag_query, Doc, SortMode,
+    };
     use crate::storage::build_search_blob;
 
     fn doc<'a>(
@@ -755,5 +780,71 @@ mod tests {
     fn bench_runs_at_1000_documents() {
         let (_, p95, _) = bench(1_000, 20);
         assert!(p95 < 50_000, "p95={p95}us");
+    }
+
+    #[test]
+    fn index_only_rank_matches_highlight_rank() {
+        let titles = ["项目进度", "接口说明", "收到回复", "API"];
+        let contents = ["本周完成接口联调", "返回 JSON", "已收到", "api 文档"];
+        let blobs: Vec<String> = titles
+            .iter()
+            .zip(contents)
+            .map(|(title, content)| build_search_blob(title, content, &["support".to_string()]))
+            .collect();
+        let docs: Vec<Doc> = (0..titles.len())
+            .map(|index| Doc {
+                id: titles[index],
+                title: titles[index],
+                content: contents[index],
+                blob: &blobs[index],
+                pinned: index == 3,
+                use_count: index as u64,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: index as i32,
+            })
+            .collect();
+        for query in ["", "项目", "api", "接口", "support", "xiangmu"] {
+            for mode in [SortMode::Recent, SortMode::MostUsed] {
+                for limit in [0, 1, 2, 50] {
+                    let hits = rank_with_mode(&docs, query, limit, mode);
+                    let indices = rank_indices_with_mode(&docs, query, limit, mode);
+                    let expected: Vec<usize> = hits.iter().map(|hit| hit.index).collect();
+                    assert_eq!(
+                        indices, expected,
+                        "query={query:?} mode={mode:?} limit={limit}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_only_rank_truncates_ties_by_id() {
+        let title = "同样的标题";
+        let content = "同样的正文";
+        let blob = build_search_blob(title, content, &[]);
+        let docs: Vec<Doc> = ["c", "a", "b"]
+            .iter()
+            .map(|id| Doc {
+                id,
+                title,
+                content,
+                blob: &blob,
+                pinned: false,
+                use_count: 0,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: 0,
+            })
+            .collect();
+        for mode in [SortMode::Recent, SortMode::MostUsed] {
+            let indices = rank_indices_with_mode(&docs, "", 2, mode);
+            let hits = rank_with_mode(&docs, "", 2, mode);
+            let expected: Vec<usize> = hits.iter().map(|hit| hit.index).collect();
+            assert_eq!(indices, expected);
+            let ids: Vec<&str> = indices.iter().map(|&index| docs[index].id).collect();
+            assert_eq!(ids, vec!["a", "b"]);
+        }
     }
 }

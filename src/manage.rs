@@ -89,6 +89,34 @@ struct PhraseRow {
     pinned: bool,
 }
 
+/// Fields needed to populate the editor for one snippet, copied while the
+/// storage read lock is held instead of cloning the whole data file.
+struct SnippetFields {
+    id: String,
+    title: String,
+    content: String,
+    tags: Vec<String>,
+    hotkey: Option<String>,
+    category_id: Option<String>,
+    pinned: bool,
+    deleted: bool,
+}
+
+impl SnippetFields {
+    fn from_snippet(snippet: &Snippet) -> Self {
+        Self {
+            id: snippet.id.clone(),
+            title: snippet.title.clone(),
+            content: snippet.content.clone(),
+            tags: snippet.tags.clone(),
+            hotkey: snippet.hotkey.clone(),
+            category_id: snippet.category_id.clone(),
+            pinned: snippet.pinned,
+            deleted: snippet.deleted_at.is_some(),
+        }
+    }
+}
+
 struct Fonts {
     body: HFONT,
     title: HFONT,
@@ -154,6 +182,9 @@ struct Manage {
     error_field: Option<i32>,
     error_message: Option<String>,
     status_text: String,
+    title_units: usize,
+    content_units: usize,
+    content_lines: usize,
     dpi: u32,
     view: View,
     editing: Option<String>,
@@ -204,6 +235,20 @@ fn set_text(control: HWND, text: &str) {
     }
 }
 
+/// Refresh the editor length counters after a load or a user edit. Counts use
+/// UTF-16 units, matching the storage validation limits (emoji count as two).
+fn refresh_editor_metrics(manage: &mut Manage) {
+    let title = wide_text(manage.title_edit);
+    let content = wide_text(manage.content_edit);
+    manage.title_units = title.encode_utf16().count();
+    manage.content_units = content.encode_utf16().count();
+    manage.content_lines = if content.is_empty() {
+        1
+    } else {
+        content.lines().count().max(1)
+    };
+}
+
 fn status_message(manage: &mut Manage, text: &str) {
     manage.status_text = text.to_string();
     unsafe {
@@ -236,128 +281,155 @@ fn error_text(code: &str) -> &'static str {
     }
 }
 
-fn data() -> Option<storage::DataFile> {
-    storage::data_clone()
-}
-
 fn active_rows(
     category: Option<&str>,
     query: &str,
     recycle: bool,
     tag: Option<&str>,
 ) -> Vec<PhraseRow> {
-    let Some(data) = data() else {
-        return Vec::new();
-    };
-    let (query_tags, text_query) = search::split_tag_query(query);
-    let mut wanted: Vec<String> = query_tags;
-    if let Some(tag) = tag {
-        wanted.push(tag.to_lowercase());
-    }
-    let category_names: Vec<(String, String)> = data
-        .categories
-        .iter()
-        .map(|category| (category.id.clone(), category.name.clone()))
-        .collect();
-    let name_of = |id: Option<&str>| -> String {
-        id.and_then(|id| {
-            category_names
-                .iter()
-                .find(|(value, _)| value == id)
-                .map(|(_, name)| name.clone())
-        })
-        .unwrap_or_default()
-    };
+    storage::with_data(|data| {
+        let (query_tags, text_query) = search::split_tag_query(query);
+        let mut wanted: Vec<String> = query_tags;
+        if let Some(tag) = tag {
+            wanted.push(tag.to_lowercase());
+        }
+        let category_names: Vec<(String, String)> = data
+            .categories
+            .iter()
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
+        let name_of = |id: Option<&str>| -> String {
+            id.and_then(|id| {
+                category_names
+                    .iter()
+                    .find(|(value, _)| value == id)
+                    .map(|(_, name)| name.clone())
+            })
+            .unwrap_or_default()
+        };
 
-    let pool: Vec<&Snippet> = data
-        .snippets
-        .iter()
-        .filter(|snippet| {
-            (snippet.deleted_at.is_some()) == recycle
-                && match category {
-                    Some(id) => snippet.category_id.as_deref() == Some(id),
-                    None => true,
-                }
-                && wanted.iter().all(|tag| {
-                    let tag = tag.to_lowercase();
-                    snippet.tags.iter().any(|item| item.to_lowercase() == tag)
-                })
-        })
-        .collect();
+        let pool: Vec<&Snippet> = data
+            .snippets
+            .iter()
+            .filter(|snippet| {
+                (snippet.deleted_at.is_some()) == recycle
+                    && match category {
+                        Some(id) => snippet.category_id.as_deref() == Some(id),
+                        None => true,
+                    }
+                    && wanted.iter().all(|tag| {
+                        let tag = tag.to_lowercase();
+                        snippet.tags.iter().any(|item| item.to_lowercase() == tag)
+                    })
+            })
+            .collect();
 
-    let docs: Vec<Doc> = pool
-        .iter()
-        .map(|snippet| Doc {
-            id: &snippet.id,
-            title: &snippet.title,
-            content: &snippet.content,
-            blob: &snippet.search_blob,
-            pinned: snippet.pinned,
-            use_count: snippet.use_count,
-            last_used_at: snippet.last_used_at.as_deref(),
-            updated_at: &snippet.updated_at,
-            sort_order: snippet.sort_order,
-        })
-        .collect();
-    let hits = search::rank(&docs, text_query, usize::MAX);
-    hits.into_iter()
-        .map(|hit| {
-            let snippet = pool[hit.index];
-            let preview = snippet.content.replace("\r\n", " ↵ ").replace('\n', " ↵ ");
-            PhraseRow {
-                id: snippet.id.clone(),
-                title: snippet.title.clone(),
-                preview,
-                category: name_of(snippet.category_id.as_deref()),
+        let docs: Vec<Doc> = pool
+            .iter()
+            .map(|snippet| Doc {
+                id: &snippet.id,
+                title: &snippet.title,
+                content: &snippet.content,
+                blob: &snippet.search_blob,
                 pinned: snippet.pinned,
-            }
-        })
-        .collect()
+                use_count: snippet.use_count,
+                last_used_at: snippet.last_used_at.as_deref(),
+                updated_at: &snippet.updated_at,
+                sort_order: snippet.sort_order,
+            })
+            .collect();
+        search::rank_indices(&docs, text_query, usize::MAX)
+            .into_iter()
+            .map(|index| {
+                let snippet = pool[index];
+                PhraseRow {
+                    id: snippet.id.clone(),
+                    title: snippet.title.clone(),
+                    preview: preview_text(&snippet.content),
+                    category: name_of(snippet.category_id.as_deref()),
+                    pinned: snippet.pinned,
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Single-line list preview: skip CR, map LF to the existing arrow marker and
+/// bound the length so a long body cannot allocate a full copy on every list
+/// rebuild.
+fn preview_text(content: &str) -> String {
+    const PREVIEW_CHARS: usize = 160;
+    let mut preview = String::new();
+    let mut count = 0;
+    for ch in content.chars() {
+        if ch == '\r' {
+            continue;
+        }
+        if count == PREVIEW_CHARS {
+            preview.push('…');
+            break;
+        }
+        if ch == '\n' {
+            preview.push_str(" ↵ ");
+        } else {
+            preview.push(ch);
+        }
+        count += 1;
+    }
+    preview
 }
 
 fn reload_left(manage: &mut Manage) {
-    let Some(data) = data() else {
+    let Some(mut rows) = storage::with_data(|data| {
+        let mut active_total = 0usize;
+        let mut deleted = 0usize;
+        let mut per_category: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for snippet in &data.snippets {
+            if snippet.deleted_at.is_some() {
+                deleted += 1;
+                continue;
+            }
+            active_total += 1;
+            if let Some(id) = snippet.category_id.as_deref() {
+                *per_category.entry(id).or_default() += 1;
+            }
+        }
+        let mut rows = vec![NavRow {
+            label: "全部短语".to_string(),
+            count: active_total,
+            view: View::All,
+            dot: None,
+        }];
+        for category in &data.categories {
+            rows.push(NavRow {
+                label: category.name.clone(),
+                count: per_category.get(category.id.as_str()).copied().unwrap_or(0),
+                view: View::Category(category.id.clone()),
+                dot: None,
+            });
+        }
+        rows.push(NavRow {
+            label: "回收站".to_string(),
+            count: deleted,
+            view: View::Recycle,
+            dot: None,
+        });
+        rows
+    }) else {
         return;
     };
+    // Theme helpers stay outside the storage borrow, even though this one is a
+    // pure hash today.
+    for row in &mut rows {
+        if matches!(row.view, View::Category(_)) {
+            row.dot = Some(theme::category_dot_for_name(&row.label));
+        }
+    }
     unsafe {
         let _ = SendMessageW(manage.left, LB_RESETCONTENT, 0, 0);
     }
-    let active: Vec<&Snippet> = data
-        .snippets
-        .iter()
-        .filter(|snippet| snippet.deleted_at.is_none())
-        .collect();
-    let deleted = data
-        .snippets
-        .iter()
-        .filter(|snippet| snippet.deleted_at.is_some())
-        .count();
-
-    let mut rows = vec![NavRow {
-        label: "全部短语".to_string(),
-        count: active.len(),
-        view: View::All,
-        dot: None,
-    }];
-    for category in &data.categories {
-        let count = active
-            .iter()
-            .filter(|snippet| snippet.category_id.as_deref() == Some(category.id.as_str()))
-            .count();
-        rows.push(NavRow {
-            label: category.name.clone(),
-            count,
-            view: View::Category(category.id.clone()),
-            dot: Some(theme::category_dot_for_name(&category.name)),
-        });
-    }
-    rows.push(NavRow {
-        label: "回收站".to_string(),
-        count: deleted,
-        view: View::Recycle,
-        dot: None,
-    });
-
     for row in &rows {
         let wide = platform::wide(&row.label);
         unsafe {
@@ -382,7 +454,25 @@ fn reload_left(manage: &mut Manage) {
 }
 
 fn reload_categories(manage: &mut Manage) {
-    let Some(data) = data() else {
+    let draft = manage.draft_category.clone();
+    let Some((categories, index)) = storage::with_data(|data| {
+        let categories: Vec<(String, String)> = data
+            .categories
+            .iter()
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
+        // Restore by stable id, not by the old numeric index: an import can
+        // reorder or remove categories while an editor draft is still open.
+        let index = draft
+            .as_deref()
+            .and_then(|id| {
+                data.categories
+                    .iter()
+                    .position(|category| category.id == id)
+            })
+            .map(|position| position + 1);
+        (categories, index)
+    }) else {
         return;
     };
     unsafe {
@@ -397,24 +487,13 @@ fn reload_categories(manage: &mut Manage) {
             uncategorized.as_ptr() as isize,
         );
     }
-    for category in &data.categories {
-        let wide = platform::wide(&category.name);
+    for (_, name) in &categories {
+        let wide = platform::wide(name);
         unsafe {
             let _ = SendMessageW(manage.category, CB_ADDSTRING, 0, wide.as_ptr() as isize);
         }
     }
-    // Restore by stable id, not by the old numeric index: an import can
-    // reorder or remove categories while an editor draft is still open.
-    let index = manage
-        .draft_category
-        .as_deref()
-        .and_then(|id| {
-            data.categories
-                .iter()
-                .position(|category| category.id == id)
-        })
-        .map(|position| position + 1);
-    if index.is_none() && manage.draft_category.is_some() {
+    if index.is_none() && draft.is_some() {
         manage.draft_category = None;
     }
     unsafe {
@@ -423,36 +502,24 @@ fn reload_categories(manage: &mut Manage) {
 }
 
 fn reload_tag_filter(manage: &mut Manage) {
-    let Some(data) = data() else {
-        return;
-    };
     let recycle = matches!(manage.view, View::Recycle);
-    let mut options: Vec<String> = Vec::new();
-    for snippet in &data.snippets {
-        if (snippet.deleted_at.is_some()) != recycle {
-            continue;
-        }
-        for tag in &snippet.tags {
-            if !options
-                .iter()
-                .any(|existing| existing.to_lowercase() == tag.to_lowercase())
-            {
-                options.push(tag.clone());
+    let selected = manage.tag_filter_value.clone();
+    let Some((options, index)) = storage::with_data(|data| {
+        let mut options: Vec<String> = Vec::new();
+        for snippet in &data.snippets {
+            if (snippet.deleted_at.is_some()) != recycle {
+                continue;
+            }
+            for tag in &snippet.tags {
+                if !options
+                    .iter()
+                    .any(|existing| existing.to_lowercase() == tag.to_lowercase())
+                {
+                    options.push(tag.clone());
+                }
             }
         }
-    }
-    options.sort_by_key(|tag| tag.to_lowercase());
-
-    let selected = manage.tag_filter_value.clone();
-    manage.loading = true;
-    unsafe {
-        let _ = SendMessageW(manage.tag_filter, CB_RESETCONTENT, 0, 0);
-        let all = platform::wide("全部标签");
-        let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, all.as_ptr() as isize);
-        for tag in &options {
-            let wide = platform::wide(tag);
-            let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, wide.as_ptr() as isize);
-        }
+        options.sort_by_key(|tag| tag.to_lowercase());
         let index = selected
             .as_deref()
             .and_then(|selected| {
@@ -462,6 +529,19 @@ fn reload_tag_filter(manage: &mut Manage) {
             })
             .map(|position| position + 1)
             .unwrap_or(0);
+        (options, index)
+    }) else {
+        return;
+    };
+    manage.loading = true;
+    unsafe {
+        let _ = SendMessageW(manage.tag_filter, CB_RESETCONTENT, 0, 0);
+        let all = platform::wide("全部标签");
+        let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, all.as_ptr() as isize);
+        for tag in &options {
+            let wide = platform::wide(tag);
+            let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, wide.as_ptr() as isize);
+        }
         let _ = SendMessageW(manage.tag_filter, CB_SETCURSEL, index, 0);
         manage.tag_filter_value = if index == 0 {
             None
@@ -520,9 +600,15 @@ fn open_combo_picker(manage: &mut Manage, id: i32) {
             reload_categories(manage);
             let index = unsafe { SendMessageW(manage.category, CB_GETCURSEL, 0, 0) }.0;
             let mut items = vec!["未分类".to_string()];
-            if let Some(file) = data() {
-                items.extend(file.categories.iter().map(|c| c.name.clone()));
-            }
+            items.extend(
+                storage::with_data(|data| {
+                    data.categories
+                        .iter()
+                        .map(|category| category.name.clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            );
             if let Some(pick) = crate::dropmenu::show(
                 manage.hwnd,
                 manage.category,
@@ -637,26 +723,34 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
     manage.error_field = None;
     manage.error_message = None;
 
-    let snippet = id.and_then(|id| {
-        data().and_then(|data| data.snippets.into_iter().find(|snippet| snippet.id == id))
-    });
-    let data = data();
+    let view = manage.view.clone();
+    let (snippet, categories) = storage::with_data(|data| {
+        let snippet = id
+            .and_then(|id| data.snippets.iter().find(|snippet| snippet.id == id))
+            .map(SnippetFields::from_snippet);
+        let categories: Vec<(String, String)> = data
+            .categories
+            .iter()
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
+        (snippet, categories)
+    })
+    .unwrap_or((None, Vec::new()));
     match snippet {
         Some(snippet) => {
             set_text(manage.title_edit, &snippet.title);
             set_text(manage.content_edit, &snippet.content);
             set_text(manage.tags_edit, &snippet.tags.join(", "));
             set_text(manage.hotkey_edit, snippet.hotkey.as_deref().unwrap_or(""));
-            let index = data
+            let index = snippet
+                .category_id
                 .as_ref()
-                .and_then(|data| {
-                    snippet.category_id.as_ref().and_then(|id| {
-                        data.categories
-                            .iter()
-                            .position(|category| &category.id == id)
-                            .map(|position| position + 1)
-                    })
+                .and_then(|id| {
+                    categories
+                        .iter()
+                        .position(|(category_id, _)| category_id == id)
                 })
+                .map(|position| position + 1)
                 .unwrap_or(0);
             unsafe {
                 let _ = SendMessageW(manage.category, CB_SETCURSEL, index, 0);
@@ -668,7 +762,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
                 let _ = InvalidateRect(Some(manage.hwnd), None, false);
             }
             manage.editing = Some(snippet.id);
-            manage.editing_deleted = snippet.deleted_at.is_some();
+            manage.editing_deleted = snippet.deleted;
             manage.dirty = false;
             manage.status_text = "已加载短语".to_string();
             set_text(
@@ -696,11 +790,11 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
             set_text(manage.content_edit, "");
             set_text(manage.tags_edit, "");
             set_text(manage.hotkey_edit, "");
-            let default_cat = match &manage.view {
-                View::Category(cat_id) => data
-                    .as_ref()
-                    .and_then(|d| d.categories.iter().position(|c| &c.id == cat_id))
-                    .map(|p| p + 1)
+            let default_cat = match &view {
+                View::Category(cat_id) => categories
+                    .iter()
+                    .position(|(category_id, _)| category_id == cat_id)
+                    .map(|position| position + 1)
                     .unwrap_or(0),
                 _ => 0,
             };
@@ -714,9 +808,9 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
             // the id in sync because save_editor now uses the stable id, not
             // the combo index.
             manage.draft_category = if default_cat > 0 {
-                data.as_ref()
-                    .and_then(|d| d.categories.get(default_cat - 1))
-                    .map(|category| category.id.clone())
+                categories
+                    .get(default_cat - 1)
+                    .map(|(category_id, _)| category_id.clone())
             } else {
                 None
             };
@@ -726,6 +820,7 @@ fn load_editor(manage: &mut Manage, id: Option<&str>) {
             manage.status_text = "新建短语".to_string();
         }
     }
+    refresh_editor_metrics(manage);
     manage.loading = false;
     relayout(manage);
     unsafe {
@@ -795,31 +890,40 @@ fn load_batch(manage: &mut Manage, ids: Vec<String>) {
     manage.error_field = None;
     manage.error_message = None;
 
-    let data = data();
-    if let Some(snippet) = data.as_ref().and_then(|data| {
-        ids.first()
-            .and_then(|id| data.snippets.iter().find(|snippet| &snippet.id == id))
-    }) {
+    let first_id = ids.first().map(String::as_str);
+    let (first, categories) = storage::with_data(|data| {
+        let first = first_id
+            .and_then(|id| data.snippets.iter().find(|snippet| snippet.id == id))
+            .map(SnippetFields::from_snippet);
+        let categories: Vec<(String, String)> = data
+            .categories
+            .iter()
+            .map(|category| (category.id.clone(), category.name.clone()))
+            .collect();
+        (first, categories)
+    })
+    .unwrap_or((None, Vec::new()));
+    if let Some(snippet) = first {
         set_text(manage.title_edit, &snippet.title);
         set_text(manage.content_edit, &snippet.content);
         manage.pinned_state = snippet.pinned;
         manage.draft_category = snippet.category_id.clone();
-        let index = data
+        let index = snippet
+            .category_id
             .as_ref()
-            .and_then(|data| {
-                snippet.category_id.as_ref().and_then(|id| {
-                    data.categories
-                        .iter()
-                        .position(|category| &category.id == id)
-                        .map(|position| position + 1)
-                })
+            .and_then(|id| {
+                categories
+                    .iter()
+                    .position(|(category_id, _)| category_id == id)
             })
+            .map(|position| position + 1)
             .unwrap_or(0);
         unsafe {
             let _ = SendMessageW(manage.category, CB_SETCURSEL, index, 0);
             let _ = InvalidateRect(Some(manage.pinned), None, false);
         }
     }
+    refresh_editor_metrics(manage);
     set_text(manage.tags_edit, "");
     set_text(manage.hotkey_edit, "");
     set_text(manage.save_button, "添加标签");
@@ -930,10 +1034,12 @@ fn current_category(manage: &Manage) -> Option<String> {
     if index <= 0 {
         return None;
     }
-    let data = data()?;
-    data.categories
-        .get(index as usize - 1)
-        .map(|category| category.id.clone())
+    storage::with_data(|data| {
+        data.categories
+            .get(index as usize - 1)
+            .map(|category| category.id.clone())
+    })
+    .flatten()
 }
 
 fn save_editor(manage: &mut Manage) {
@@ -974,14 +1080,13 @@ fn save_editor(manage: &mut Manage) {
             }
         }
         let editing = manage.editing.clone();
-        let duplicate = storage::data_clone()
-            .map(|data| {
-                data.snippets.iter().any(|snippet| {
-                    Some(snippet.id.as_str()) != editing.as_deref()
-                        && snippet.hotkey.as_deref() == Some(candidate)
-                })
+        let duplicate = storage::with_data(|data| {
+            data.snippets.iter().any(|snippet| {
+                Some(snippet.id.as_str()) != editing.as_deref()
+                    && snippet.hotkey.as_deref() == Some(candidate)
             })
-            .unwrap_or(false);
+        })
+        .unwrap_or(false);
         if duplicate {
             let message = "该快捷键已被其他短语使用";
             manage.error_field = Some(ID_HOTKEY);
@@ -1861,15 +1966,9 @@ fn paint_manage(manage: &Manage, hdc: HDC, client: RECT) {
     let l = manage.layout;
     let focus = unsafe { GetFocus() };
 
-    let title_text = wide_text(manage.title_edit);
-    let content_text = wide_text(manage.content_edit);
-    let title_chars = title_text.chars().count();
-    let content_chars = content_text.chars().count();
-    let content_lines = if content_text.is_empty() {
-        1
-    } else {
-        content_text.lines().count().max(1)
-    };
+    let title_chars = manage.title_units;
+    let content_chars = manage.content_units;
+    let content_lines = manage.content_lines;
     let active_total = manage.nav_rows.first().map(|r| r.count).unwrap_or(0);
     let mid_title = match &manage.view {
         View::All => "全部短语".to_string(),
@@ -2790,6 +2889,9 @@ fn create(owner: HWND) -> Option<Manage> {
         error_field: None,
         error_message: None,
         status_text: "就绪".to_string(),
+        title_units: 0,
+        content_units: 0,
+        content_lines: 1,
         dpi,
         view: View::All,
         editing: None,
@@ -3447,14 +3549,14 @@ unsafe extern "system" fn window_proc(
                         if manage.dirty && !confirm_discard(hwnd) {
                             return;
                         }
-                        let name = data()
-                            .and_then(|file| {
-                                file.categories
-                                    .into_iter()
-                                    .find(|c| c.id == category)
-                                    .map(|c| c.name)
-                            })
-                            .unwrap_or_else(|| "该分类".to_string());
+                        let name = storage::with_data(|data| {
+                            data.categories
+                                .iter()
+                                .find(|c| c.id == category)
+                                .map(|c| c.name.clone())
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| "该分类".to_string());
                         let message = format!("删除「{name}」后，其短语会移到未分类。");
                         if !crate::confirm_ui::confirm(
                             manage.hwnd,
@@ -3548,6 +3650,9 @@ unsafe extern "system" fn window_proc(
                         if !manage.loading && manage.batch_ids.is_empty() {
                             manage.dirty = true;
                             manage.status_text = "未保存修改".to_string();
+                        }
+                        if id as i32 == ID_TITLE || id as i32 == ID_CONTENT {
+                            refresh_editor_metrics(manage);
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -3778,5 +3883,37 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_text;
+
+    #[test]
+    fn preview_bounds_and_maps_newlines() {
+        assert_eq!(preview_text("a\r\nb\nc"), "a ↵ b ↵ c");
+        assert_eq!(preview_text("a\rb"), "ab");
+
+        let exact = "x".repeat(160);
+        assert_eq!(preview_text(&exact), exact);
+
+        let trailing_cr = format!("{}\r", "x".repeat(160));
+        assert_eq!(preview_text(&trailing_cr), "x".repeat(160));
+
+        let longer = "x".repeat(161);
+        let preview = preview_text(&longer);
+        assert_eq!(preview.chars().count(), 161);
+        assert!(preview.ends_with('…'));
+
+        let boundary_lf = format!("{}\n", "x".repeat(160));
+        let preview = preview_text(&boundary_lf);
+        assert_eq!(preview.chars().count(), 161);
+        assert!(preview.ends_with('…'));
+
+        let emoji = "😀".repeat(200);
+        let preview = preview_text(&emoji);
+        assert_eq!(preview.chars().count(), 161);
+        assert!(preview.ends_with('…'));
     }
 }
