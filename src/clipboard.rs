@@ -1,4 +1,5 @@
 use std::sync::Mutex;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{
     GetLastError, GlobalFree, SetLastError, ERROR_SUCCESS, HANDLE, HGLOBAL, HWND,
@@ -86,7 +87,11 @@ fn replace_text(owner: HWND, text: &str, expected: Option<u32>) -> (bool, Snapsh
     unsafe {
         // A null owner would become the clipboard owner after EmptyClipboard,
         // making SetClipboardData fail. Use our own HWND, never the target's.
-        if OpenClipboard(Some(owner)).is_err() {
+        if !retry_until(
+            || OpenClipboard(Some(owner)).is_ok(),
+            3,
+            Duration::from_millis(30),
+        ) {
             let _ = GlobalFree(Some(memory));
             return (false, Snapshot::default());
         }
@@ -218,9 +223,49 @@ pub fn sequence() -> u32 {
     unsafe { GetClipboardSequenceNumber() }
 }
 
+/// Bounded retry for a transiently owned clipboard. No sleep when the delay is
+/// zero, so tests can drive it synchronously.
+fn retry_until(mut operation: impl FnMut() -> bool, attempts: u32, delay: Duration) -> bool {
+    for attempt in 0..attempts {
+        if operation() {
+            return true;
+        }
+        if attempt + 1 < attempts && !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{decode_snapshot, is_text_format, MAX_SNAPSHOT_UNITS};
+    use super::{decode_snapshot, is_text_format, retry_until, MAX_SNAPSHOT_UNITS};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn retry_until_stops_after_the_first_success_or_the_limit() {
+        let calls = AtomicU32::new(0);
+        let ok = retry_until(
+            || calls.fetch_add(1, Ordering::Relaxed) == 1,
+            3,
+            Duration::ZERO,
+        );
+        assert!(ok);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let calls = AtomicU32::new(0);
+        let ok = retry_until(
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                false
+            },
+            3,
+            Duration::ZERO,
+        );
+        assert!(!ok);
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
 
     #[test]
     fn snapshot_requires_a_terminator_within_its_allocation_and_limit() {

@@ -2579,24 +2579,22 @@ fn rule_error_text(code: &str) -> &'static str {
 
 fn data_error_text(code: &str) -> &'static str {
     match code {
-        "read_only" => "只读模式，无法导入",
+        "read_only" => "只读模式，无法导入或恢复",
         "import_too_large" => "文件超过合并上限；如需还原整库，可选择替换",
         "file_too_large" => "文件超过 640 MiB 上限，无法导入或恢复",
-        "too_many_items" => "导入条数超过上限（短语 100,000 / 分类 10,000）",
+        "too_many_items" => "数据条数超过上限（短语 100,000 / 分类 10,000），无法导入或恢复",
         code if code.starts_with("read:") => "无法读取选中的文件",
         "import_invalid_json" => "文件不是有效的 QuickPhrase JSON",
         "import_schema" => "文件版本不受支持",
-        "import_category_id" | "import_category_name" | "import_category_missing" => {
-            "导入分类数据无效"
-        }
-        "import_tags" => "导入标签不合规（不能含逗号、单个不超 24 字、最多 10 个）",
-        "import_hotkey" => "导入快捷键不合规（格式错误、重复或与全局热键冲突）",
-        "import_snippet_id" => "导入短语 ID 无效",
-        "duplicate_title" => "导入数据包含重复标题",
+        "import_category_id" | "import_category_name" | "import_category_missing" => "分类数据无效",
+        "import_tags" => "标签不合规（不能含逗号、单个不超 24 字、最多 10 个）",
+        "import_hotkey" => "快捷键不合规（格式错误、重复或与全局热键冲突）",
+        "import_snippet_id" => "短语 ID 无效",
+        "duplicate_title" => "数据包含重复标题",
         "title_empty" | "title_too_long" | "content_empty" | "content_too_long" => {
-            "导入短语内容不符合校验规则"
+            "短语内容不符合校验规则"
         }
-        _ => "导入失败，请检查文件或日志",
+        _ => "导入或恢复失败，请检查文件或日志",
     }
 }
 
@@ -3252,5 +3250,22 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::data_error_text;
+
+    #[test]
+    fn data_errors_are_neutral_for_import_and_restore() {
+        assert_eq!(data_error_text("read_only"), "只读模式，无法导入或恢复");
+        assert!(!data_error_text("import_category_id").contains("导入"));
+        assert!(!data_error_text("duplicate_title").contains("导入"));
+        assert!(!data_error_text("import_hotkey").contains("导入"));
+        assert_eq!(
+            data_error_text("unknown"),
+            "导入或恢复失败，请检查文件或日志"
+        );
     }
 }

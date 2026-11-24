@@ -991,6 +991,31 @@ impl<'a> Canvas<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_wrapped(
+        &mut self,
+        text: &str,
+        rect: &RECT,
+        style: TextStyle,
+        dpi: u32,
+        color: COLORREF,
+        align_h: AlignH,
+        align_v: AlignV,
+    ) {
+        let (size_px, weight, mono) = style.spec(dpi);
+        self.text_styled(
+            text,
+            rect_f(rect),
+            size_px,
+            weight,
+            mono,
+            true,
+            color,
+            align_h,
+            align_v,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_highlighted(
         &mut self,
         text: &str,

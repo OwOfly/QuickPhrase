@@ -21,7 +21,7 @@ use crate::{logging, platform, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.Confirm");
 const WIDTH: i32 = 452;
-const HEIGHT: i32 = 196;
+const HEIGHT: i32 = 270;
 const ID_CANCEL: i32 = 601;
 const ID_CONFIRM: i32 = 602;
 
@@ -358,9 +358,9 @@ fn paint(dialog: &Confirm, hdc: HDC, client: RECT) -> bool {
             left: text_left,
             top: scaled(56, dpi),
             right: client.right - scaled(24, dpi),
-            bottom: scaled(80, dpi),
+            bottom: scaled(132, dpi),
         };
-        c.draw_text(
+        c.draw_text_wrapped(
             &dialog.message,
             &message_rect,
             TextStyle::Body,
@@ -371,9 +371,9 @@ fn paint(dialog: &Confirm, hdc: HDC, client: RECT) -> bool {
         );
         let hint_rect = RECT {
             left: text_left,
-            top: scaled(82, dpi),
+            top: scaled(136, dpi),
             right: client.right - scaled(24, dpi),
-            bottom: scaled(104, dpi),
+            bottom: scaled(158, dpi),
         };
         c.draw_text(
             &dialog.hint,
