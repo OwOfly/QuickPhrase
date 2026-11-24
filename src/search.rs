@@ -5,9 +5,16 @@
 //! Ties break by pinned, useCount (MostUsed only), lastUsedAt, updatedAt, sortOrder, id. At most
 //! `limit` hits are returned.
 
+use std::borrow::Cow;
 use std::time::Instant;
 
 pub const DEFAULT_LIMIT: usize = 50;
+
+/// Lowercased title/content prepared once per panel snapshot.
+pub struct LowerKeys {
+    pub title: String,
+    pub content: String,
+}
 
 /// Borrowed searchable fields and deterministic ranking tie-breakers.
 pub struct Doc<'a> {
@@ -99,7 +106,29 @@ pub fn rank_indices_with_mode(
 /// Rank by relevance and pinning first, comparing usage before recency only
 /// in MostUsed mode. Compute highlights only after limiting the result set.
 pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMode) -> Vec<Hit> {
-    let (needle, mut scored) = rank_scored(docs, query, mode);
+    let (needle, scored) = rank_scored(docs, query, mode);
+    build_hits(docs, &needle, scored, limit)
+}
+
+/// Rank using title/content lowercased once by the caller. The keys must be
+/// aligned with `docs`; a missing entry falls back to lowercasing that doc.
+pub fn rank_prepared_with_mode(
+    docs: &[Doc<'_>],
+    keys: &[&LowerKeys],
+    query: &str,
+    limit: usize,
+    mode: SortMode,
+) -> Vec<Hit> {
+    let (needle, scored) = rank_scored_with_keys(docs, query, mode, Some(keys));
+    build_hits(docs, &needle, scored, limit)
+}
+
+fn build_hits(
+    docs: &[Doc<'_>],
+    needle: &str,
+    mut scored: Vec<(u32, usize)>,
+    limit: usize,
+) -> Vec<Hit> {
     scored.truncate(limit);
     scored
         .into_iter()
@@ -109,8 +138,8 @@ pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMod
                 (None, None)
             } else {
                 (
-                    find_range(doc.title, &needle),
-                    find_range(doc.content, &needle),
+                    find_range(doc.title, needle),
+                    find_range(doc.content, needle),
                 )
             };
             Hit {
@@ -125,6 +154,15 @@ pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMod
 
 /// Shared matching and ordering for both the highlight and index-only APIs.
 fn rank_scored(docs: &[Doc<'_>], query: &str, mode: SortMode) -> (String, Vec<(u32, usize)>) {
+    rank_scored_with_keys(docs, query, mode, None)
+}
+
+fn rank_scored_with_keys(
+    docs: &[Doc<'_>],
+    query: &str,
+    mode: SortMode,
+    keys: Option<&[&LowerKeys]>,
+) -> (String, Vec<(u32, usize)>) {
     let allow_blob_fallback = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
     let mut scored: Vec<(u32, usize)> = Vec::new();
@@ -139,39 +177,51 @@ fn rank_scored(docs: &[Doc<'_>], query: &str, mode: SortMode) -> (String, Vec<(u
         }
         // The blob joins title and content with a newline. A match spanning that
         // boundary must not count: require a real hit in one of the two fields.
-        let title_lower = doc.title.to_lowercase();
-        let score = if title_lower == needle {
+        let prepared = keys.and_then(|keys| keys.get(index));
+        let title_lower: Cow<'_, str> = match prepared {
+            Some(key) => Cow::Borrowed(key.title.as_str()),
+            None => Cow::Owned(doc.title.to_lowercase()),
+        };
+        let title_lower = title_lower.as_ref();
+        let score = if title_lower == needle.as_str() {
             400
-        } else if title_lower.starts_with(&needle) {
+        } else if title_lower.starts_with(needle.as_str()) {
             300
-        } else if title_lower.contains(&needle) {
+        } else if title_lower.contains(needle.as_str()) {
             200
-        } else if doc.content.to_lowercase().contains(&needle) {
-            100
-        } else if allow_blob_fallback && needle.chars().count() >= 2 {
-            // Blob-only matches come from pinyin keys or tags. Rank them below
-            // literal title/content hits and skip highlighting. A single
-            // character would match too many initials/tags.
-            let pinyin_hit = allow_blob_fallback
-                && needle
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphabetic() || ch == ' ')
-                && {
-                    let mut tail = doc.blob.rsplit('\n');
-                    let initials = tail.next().unwrap_or("");
-                    let compact = tail.next().unwrap_or("");
-                    let full = tail.next().unwrap_or("");
-                    full.contains(&needle)
-                        || compact.contains(&needle)
-                        || initials.contains(&needle)
-                };
-            if pinyin_hit {
-                90
-            } else {
-                85
-            }
         } else {
-            continue;
+            // Lowercase the body only when the title did not already match.
+            let content_lower: Cow<'_, str> = match prepared {
+                Some(key) => Cow::Borrowed(key.content.as_str()),
+                None => Cow::Owned(doc.content.to_lowercase()),
+            };
+            if content_lower.contains(needle.as_str()) {
+                100
+            } else if allow_blob_fallback && needle.chars().count() >= 2 {
+                // Blob-only matches come from pinyin keys or tags. Rank them below
+                // literal title/content hits and skip highlighting. A single
+                // character would match too many initials/tags.
+                let pinyin_hit = allow_blob_fallback
+                    && needle
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphabetic() || ch == ' ')
+                    && {
+                        let mut tail = doc.blob.rsplit('\n');
+                        let initials = tail.next().unwrap_or("");
+                        let compact = tail.next().unwrap_or("");
+                        let full = tail.next().unwrap_or("");
+                        full.contains(&needle)
+                            || compact.contains(&needle)
+                            || initials.contains(&needle)
+                    };
+                if pinyin_hit {
+                    90
+                } else {
+                    85
+                }
+            } else {
+                continue;
+            }
         };
         scored.push((score, index));
     }
@@ -300,7 +350,8 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bench, rank, rank_indices_with_mode, rank_with_mode, split_tag_query, Doc, SortMode,
+        bench, rank, rank_indices_with_mode, rank_prepared_with_mode, rank_with_mode,
+        split_tag_query, Doc, LowerKeys, SortMode,
     };
     use crate::storage::build_search_blob;
 
@@ -845,6 +896,90 @@ mod tests {
             assert_eq!(indices, expected);
             let ids: Vec<&str> = indices.iter().map(|&index| docs[index].id).collect();
             assert_eq!(ids, vec!["a", "b"]);
+        }
+    }
+
+    #[test]
+    fn prepared_rank_matches_normal_rank() {
+        let titles = ["项目进度", "接口说明", "收到回复", "API"];
+        let contents = ["本周完成接口联调", "返回 JSON", "已收到", "api 文档"];
+        let blobs: Vec<String> = titles
+            .iter()
+            .zip(contents)
+            .map(|(title, content)| build_search_blob(title, content, &["support".to_string()]))
+            .collect();
+        let docs: Vec<Doc> = (0..titles.len())
+            .map(|index| Doc {
+                id: titles[index],
+                title: titles[index],
+                content: contents[index],
+                blob: &blobs[index],
+                pinned: index == 3,
+                use_count: index as u64,
+                last_used_at: None,
+                updated_at: "2026-01-01T00:00:00Z",
+                sort_order: index as i32,
+            })
+            .collect();
+        let keys: Vec<LowerKeys> = titles
+            .iter()
+            .zip(contents)
+            .map(|(title, content)| LowerKeys {
+                title: title.to_lowercase(),
+                content: content.to_lowercase(),
+            })
+            .collect();
+        let key_refs: Vec<&LowerKeys> = keys.iter().collect();
+        for query in ["", "项目", "api", "接口", "support", "xiangmu"] {
+            for mode in [SortMode::Recent, SortMode::MostUsed] {
+                for limit in [0, 1, 2, 50] {
+                    let normal = rank_with_mode(&docs, query, limit, mode);
+                    let prepared = rank_prepared_with_mode(&docs, &key_refs, query, limit, mode);
+                    let normal: Vec<_> = normal
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.index,
+                                hit.score,
+                                hit.title_highlight,
+                                hit.content_highlight,
+                            )
+                        })
+                        .collect();
+                    let prepared: Vec<_> = prepared
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.index,
+                                hit.score,
+                                hit.title_highlight,
+                                hit.content_highlight,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        prepared, normal,
+                        "query={query:?} mode={mode:?} limit={limit}"
+                    );
+                    let short = &key_refs[..2];
+                    let fallback = rank_prepared_with_mode(&docs, short, query, limit, mode);
+                    let fallback: Vec<_> = fallback
+                        .iter()
+                        .map(|hit| {
+                            (
+                                hit.index,
+                                hit.score,
+                                hit.title_highlight,
+                                hit.content_highlight,
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        fallback, normal,
+                        "short keys query={query:?} mode={mode:?} limit={limit}"
+                    );
+                }
+            }
         }
     }
 }

@@ -141,6 +141,8 @@ struct Panel {
     edit_font: HFONT,
     filtered: Vec<usize>,
     items: Vec<Item>,
+    lower_keys: Vec<crate::search::LowerKeys>,
+    lower_tags: Vec<Vec<String>>,
     categories: Vec<(String, String)>,
     tag_counts: Vec<(String, usize)>,
     sort_mode: crate::search::SortMode,
@@ -521,6 +523,8 @@ fn present(
         panel.monitor = monitor;
         panel.notify = notify;
         panel.items = data.items;
+        panel.lower_keys.clear();
+        panel.lower_tags.clear();
         panel.categories = data.categories;
         panel.tag_counts = data.tag_counts;
         panel.sort_mode = data.sort_mode;
@@ -856,6 +860,8 @@ fn create() -> Option<Panel> {
         edit_font,
         filtered: Vec::new(),
         items: Vec::new(),
+        lower_keys: Vec::new(),
+        lower_tags: Vec::new(),
         categories: Vec::new(),
         tag_counts: Vec::new(),
         sort_mode: crate::search::SortMode::Recent,
@@ -1945,6 +1951,24 @@ fn filter_items(items: &[Item], category: Option<&str>, query: &str) -> FilterRe
     filter_items_mode(items, category, query, &[], crate::search::SortMode::Recent)
 }
 
+fn lower_keys(items: &[Item]) -> Vec<crate::search::LowerKeys> {
+    items
+        .iter()
+        .map(|item| crate::search::LowerKeys {
+            title: item.title.to_lowercase(),
+            content: item.content.to_lowercase(),
+        })
+        .collect()
+}
+
+fn lower_tags(items: &[Item]) -> Vec<Vec<String>> {
+    items
+        .iter()
+        .map(|item| item.tags.iter().map(|tag| tag.to_lowercase()).collect())
+        .collect()
+}
+
+#[cfg(test)]
 fn filter_items_mode(
     items: &[Item],
     category: Option<&str>,
@@ -1952,24 +1976,46 @@ fn filter_items_mode(
     active_tags: &[String],
     sort_mode: crate::search::SortMode,
 ) -> FilterResult {
+    let keys = lower_keys(items);
+    let tags = lower_tags(items);
+    filter_items_prepared(items, &keys, &tags, category, query, active_tags, sort_mode)
+}
+
+fn filter_items_prepared(
+    items: &[Item],
+    keys: &[crate::search::LowerKeys],
+    lower_tags: &[Vec<String>],
+    category: Option<&str>,
+    query: &str,
+    active_tags: &[String],
+    sort_mode: crate::search::SortMode,
+) -> FilterResult {
     let (query_tags, text_query) = crate::search::split_tag_query(query);
-    let mut wanted = active_tags.to_vec();
+    let mut wanted: Vec<String> = active_tags.iter().map(|tag| tag.to_lowercase()).collect();
     wanted.extend(query_tags);
 
     let subset: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| {
+        .filter(|(index, item)| {
             let category_ok = match category {
                 Some(id) => item.category_id.as_deref() == Some(id),
                 None => true,
             };
-            let tag_ok = wanted.iter().all(|tag| {
-                let tag = tag.to_lowercase();
-                item.tags
-                    .iter()
-                    .any(|item_tag| item_tag.to_lowercase() == tag)
-            });
+            let tag_ok = if wanted.is_empty() {
+                true
+            } else {
+                match lower_tags.get(*index) {
+                    Some(tags) => wanted
+                        .iter()
+                        .all(|tag| tags.iter().any(|item_tag| item_tag == tag)),
+                    None => wanted.iter().all(|tag| {
+                        item.tags
+                            .iter()
+                            .any(|item_tag| item_tag.to_lowercase() == *tag)
+                    }),
+                }
+            };
             category_ok && tag_ok
         })
         .map(|(index, _)| index)
@@ -1992,9 +2038,19 @@ fn filter_items_mode(
             }
         })
         .collect();
-
-    let hits =
-        crate::search::rank_with_mode(&docs, text_query, crate::search::DEFAULT_LIMIT, sort_mode);
+    let subset_keys: Vec<&crate::search::LowerKeys> =
+        subset.iter().filter_map(|&index| keys.get(index)).collect();
+    let hits = if subset_keys.len() == docs.len() {
+        crate::search::rank_prepared_with_mode(
+            &docs,
+            &subset_keys,
+            text_query,
+            crate::search::DEFAULT_LIMIT,
+            sort_mode,
+        )
+    } else {
+        crate::search::rank_with_mode(&docs, text_query, crate::search::DEFAULT_LIMIT, sort_mode)
+    };
     let mut filtered = Vec::with_capacity(hits.len());
     let mut title_highlights = Vec::with_capacity(hits.len());
     let mut content_highlights = Vec::with_capacity(hits.len());
@@ -2111,6 +2167,24 @@ fn empty_message(panel: &Panel) -> Option<&'static str> {
 }
 
 fn populate(query: &str) {
+    let needs_keys = !query.trim().is_empty()
+        || PANEL.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|panel| !panel.active_tags.is_empty())
+        });
+    if needs_keys {
+        PANEL.with(|slot| {
+            if let Some(panel) = slot.borrow_mut().as_mut() {
+                if panel.lower_keys.len() != panel.items.len() {
+                    panel.lower_keys = lower_keys(&panel.items);
+                }
+                if panel.lower_tags.len() != panel.items.len() {
+                    panel.lower_tags = lower_tags(&panel.items);
+                }
+            }
+        });
+    }
     let (hwnd, list, filtered, title_highlights, content_highlights) = PANEL.with(|slot| {
         let guard = slot.borrow();
         let Some(panel) = guard.as_ref() else {
@@ -2122,8 +2196,10 @@ fn populate(query: &str) {
                 Vec::new(),
             );
         };
-        let (filtered, title_highlights, content_highlights) = filter_items_mode(
+        let (filtered, title_highlights, content_highlights) = filter_items_prepared(
             &panel.items,
+            &panel.lower_keys,
+            &panel.lower_tags,
             panel.active_category.as_deref(),
             query,
             &panel.active_tags,
@@ -2771,7 +2847,7 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_tags, filter_items, filter_items_mode, scaled, Item};
+    use super::{count_tags, filter_items, filter_items_mode, filter_items_prepared, scaled, Item};
 
     fn rank_ids(items: &[Item], query: &str) -> Vec<usize> {
         filter_items(items, None, query).0
@@ -2825,6 +2901,32 @@ mod tests {
     #[test]
     fn empty_query_returns_every_item() {
         assert_eq!(rank_ids(&items(), ""), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn prepared_filter_without_keys_matches_all_for_empty_query() {
+        let items = items();
+        let (filtered, _, _) = filter_items_prepared(
+            &items,
+            &[],
+            &[],
+            None,
+            "",
+            &[],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0, 1, 2]);
+
+        let (filtered, _, _) = filter_items_prepared(
+            &items,
+            &[],
+            &[],
+            None,
+            "项目",
+            &[],
+            crate::search::SortMode::Recent,
+        );
+        assert_eq!(filtered, vec![0]);
     }
 
     #[test]
