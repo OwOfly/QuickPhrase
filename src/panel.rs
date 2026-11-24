@@ -24,7 +24,7 @@ use windows::Win32::UI::Input::Ime::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT, VK_CONTROL,
-    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_MENU, VK_RETURN, VK_SHIFT, VK_UP,
+    VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -2297,6 +2297,62 @@ fn modifiers_down() -> bool {
     }
 }
 
+/// True only for a plain Ctrl+Left/Right press outside an IME composition.
+fn is_category_key(key: u16, ctrl: bool, shift: bool, alt: bool, composing: bool) -> bool {
+    (key == VK_LEFT.0 || key == VK_RIGHT.0) && ctrl && !shift && !alt && !composing
+}
+
+/// Cycle the category filter from the search box: `None` (all) then each
+/// category, wrapping in both directions. Focus stays in the search box.
+fn cycle_category(delta: isize) -> bool {
+    let (edit, changed) = PANEL.with(|slot| {
+        let mut guard = slot.borrow_mut();
+        let Some(panel) = guard.as_mut() else {
+            return (HWND::default(), false);
+        };
+        let Some(next) = stepped_category(&panel.categories, &panel.active_category, delta) else {
+            return (HWND::default(), false);
+        };
+        panel.active_category = next;
+        (panel.edit, true)
+    });
+    if !changed {
+        return false;
+    }
+    if !edit.0.is_null() {
+        let query = read_text(edit);
+        populate(&query);
+        unsafe {
+            let _ = SetFocus(Some(edit));
+        }
+        logging::info("panel category key");
+    }
+    true
+}
+
+/// Returns the id after `delta` steps (outer `None` = unchanged, inner `None`
+/// = the "all" filter).
+fn stepped_category(
+    categories: &[(String, String)],
+    active: &Option<String>,
+    delta: isize,
+) -> Option<Option<String>> {
+    let mut options: Vec<Option<&str>> = Vec::with_capacity(categories.len() + 1);
+    options.push(None);
+    options.extend(categories.iter().map(|(id, _)| Some(id.as_str())));
+    let current = options
+        .iter()
+        .position(|id| *id == active.as_deref())
+        .unwrap_or(0);
+    let next = (current as isize + delta).rem_euclid(options.len() as isize) as usize;
+    let candidate = options[next];
+    if candidate == active.as_deref() {
+        None
+    } else {
+        Some(candidate.map(str::to_string))
+    }
+}
+
 fn ime_composing(hwnd: HWND) -> bool {
     unsafe {
         let context = ImmGetContext(hwnd);
@@ -2346,6 +2402,20 @@ unsafe extern "system" fn edit_proc(
         }
         if key == VK_ESCAPE.0 {
             hide_and_restore();
+            return LRESULT(0);
+        }
+        let shift_down = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+        let alt_down = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+        if is_category_key(
+            key,
+            unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0,
+            shift_down,
+            alt_down,
+            ime_composing(hwnd),
+        ) {
+            if !cycle_category(if key == VK_LEFT.0 { -1 } else { 1 }) {
+                return call_default_edit(hwnd, message, wparam, lparam);
+            }
             return LRESULT(0);
         }
         if modifiers_down() {
@@ -2871,7 +2941,11 @@ pub fn shutdown() {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_tags, filter_items, filter_items_mode, filter_items_prepared, scaled, Item};
+    use super::{
+        count_tags, filter_items, filter_items_mode, filter_items_prepared, is_category_key,
+        scaled, stepped_category, Item,
+    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_LEFT, VK_RIGHT, VK_UP};
 
     fn rank_ids(items: &[Item], query: &str) -> Vec<usize> {
         filter_items(items, None, query).0
@@ -3022,6 +3096,60 @@ mod tests {
         assert_eq!(filtered, vec![0, 1]);
         let (filtered, _, _) = filter_items(&items, Some("c2"), "项目");
         assert!(filtered.is_empty());
+    }
+
+    #[test]
+    fn category_key_requires_plain_ctrl_outside_ime() {
+        assert!(is_category_key(VK_LEFT.0, true, false, false, false));
+        assert!(is_category_key(VK_RIGHT.0, true, false, false, false));
+        assert!(!is_category_key(VK_LEFT.0, false, false, false, false));
+        assert!(!is_category_key(VK_LEFT.0, true, true, false, false));
+        assert!(!is_category_key(VK_LEFT.0, true, false, true, false));
+        assert!(!is_category_key(VK_LEFT.0, true, false, false, true));
+        assert!(!is_category_key(VK_UP.0, true, false, false, false));
+    }
+
+    #[test]
+    fn category_key_cycles_all_and_each_category_in_both_directions() {
+        let categories = vec![
+            ("c1".to_string(), "A".to_string()),
+            ("c2".to_string(), "B".to_string()),
+        ];
+        assert_eq!(
+            stepped_category(&categories, &None, 1),
+            Some(Some("c1".to_string()))
+        );
+        assert_eq!(
+            stepped_category(&categories, &Some("c1".to_string()), 1),
+            Some(Some("c2".to_string()))
+        );
+        assert_eq!(
+            stepped_category(&categories, &Some("c2".to_string()), 1),
+            Some(None)
+        );
+        assert_eq!(
+            stepped_category(&categories, &None, -1),
+            Some(Some("c2".to_string()))
+        );
+        assert_eq!(stepped_category(&categories, &None, 0), None);
+        assert_eq!(
+            stepped_category(&categories, &Some("c1".to_string()), -1),
+            Some(None)
+        );
+        assert_eq!(
+            stepped_category(&categories, &Some("gone".to_string()), 1),
+            Some(Some("c1".to_string()))
+        );
+        let single = vec![("only".to_string(), "Only".to_string())];
+        assert_eq!(
+            stepped_category(&single, &None, 1),
+            Some(Some("only".to_string()))
+        );
+        assert_eq!(
+            stepped_category(&single, &Some("only".to_string()), 1),
+            Some(None)
+        );
+        assert_eq!(stepped_category(&[], &None, 1), None);
     }
 
     #[test]
