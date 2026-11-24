@@ -3183,6 +3183,24 @@ pub fn confirm_exit() -> bool {
     })
 }
 
+/// Reset the editor to the saved state after the user accepted discarding
+/// changes at session end. The session may still be cancelled by another app,
+/// in which case the already-discarded draft must not come back as dirty.
+pub fn discard_draft() {
+    MANAGE.with(|slot| {
+        if let Ok(mut guard) = slot.try_borrow_mut() {
+            if let Some(manage) = guard.as_mut() {
+                if manage.dirty {
+                    let id = manage.editing.clone();
+                    load_editor(manage, id.as_deref());
+                }
+            }
+        } else {
+            logging::warn("manage: discard_draft skipped while a dialog is open");
+        }
+    });
+}
+
 fn point_in(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }

@@ -30,7 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::Report;
 use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
-use crate::{inject, logging, platform, theme, ui};
+use crate::{context, inject, logging, platform, theme, ui};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
 const EDIT_ID: i32 = 100;
@@ -638,20 +638,34 @@ pub fn hide_only() {
     hide(false);
 }
 
+fn window_identity(hwnd: HWND) -> Option<(u32, u64, u32)> {
+    let mut pid = 0u32;
+    let tid = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    if pid == 0 {
+        return None;
+    }
+    Some((pid, context::process_created(pid)?, tid))
+}
+
 fn hide(restore: bool) {
-    let (hwnd, target, quit) = PANEL.with(|slot| {
+    let (hwnd, target, identity, quit) = PANEL.with(|slot| {
         let mut guard = slot.borrow_mut();
         let Some(panel) = guard.as_mut() else {
-            return (HWND::default(), HWND::default(), false);
+            return (HWND::default(), HWND::default(), (0, 0, 0), false);
         };
         panel.hiding = true;
         ENTER_ARMED.store(false, Ordering::Relaxed);
-        let target = panel
+        let (target, identity) = panel
             .report
             .as_ref()
-            .map(|report| HWND(report.target.hwnd as *mut core::ffi::c_void))
-            .unwrap_or_default();
-        (panel.hwnd, target, panel.quit_on_hide)
+            .map(|report| {
+                (
+                    HWND(report.target.hwnd as *mut core::ffi::c_void),
+                    (report.target.pid, report.target.created, report.target.tid),
+                )
+            })
+            .unwrap_or((HWND::default(), (0, 0, 0)));
+        (panel.hwnd, target, identity, panel.quit_on_hide)
     });
 
     if hwnd.0.is_null() {
@@ -679,12 +693,16 @@ fn hide(restore: bool) {
     drop(monitor);
 
     if restore && !target.0.is_null() {
-        if unsafe { IsWindow(Some(target)) }.as_bool() {
+        // A reused HWND still passes IsWindow; require the same process
+        // generation and owning thread as the captured target before
+        // activating it again.
+        let same_target = window_identity(target) == Some(identity);
+        if same_target {
             if !unsafe { SetForegroundWindow(target) }.as_bool() {
                 logging::warn("restore foreground failed");
             }
         } else {
-            logging::warn("restore target no longer exists");
+            logging::warn("restore target no longer exists or was replaced");
         }
     }
 
@@ -920,6 +938,11 @@ fn commit() {
         return;
     };
 
+    if crate::app::exit_pending() {
+        logging::warn("panel commit ignored: exit or session end pending");
+        return;
+    }
+
     let monitor_ok = PANEL.with(|slot| {
         slot.borrow()
             .as_ref()
@@ -981,7 +1004,8 @@ fn commit() {
     if std::env::var_os("QUICKPHRASE_TEST_NO_INJECT").is_some() {
         logging::info("inject skipped by test flag");
         let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
-        if unsafe { IsWindow(Some(target)) }.as_bool() {
+        let expected = (report.target.pid, report.target.created, report.target.tid);
+        if window_identity(target) == Some(expected) {
             unsafe {
                 let _ = SetForegroundWindow(target);
             }

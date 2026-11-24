@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows::core::{w, PCWSTR};
@@ -46,6 +47,45 @@ struct State {
 }
 
 static DIRECT_INJECTING: AtomicBool = AtomicBool::new(false);
+
+/// Where the app is in the exit/session-end flow. New injections stay blocked
+/// from the moment a prompt opens until that prompt is answered or the
+/// session-end decision is revoked. There is deliberately no timeout: reopening
+/// injections while a shutdown is pending can kill one midway.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExitGate {
+    None,
+    Confirming,
+    SessionEnding,
+}
+
+static EXIT_GATE: Mutex<ExitGate> = Mutex::new(ExitGate::None);
+
+fn exit_gate() -> ExitGate {
+    EXIT_GATE.lock().map_or(ExitGate::None, |gate| *gate)
+}
+
+fn set_exit_gate(gate: ExitGate) {
+    if let Ok(mut slot) = EXIT_GATE.lock() {
+        *slot = gate;
+    }
+}
+
+fn clear_exit_gate(expected: ExitGate) {
+    if let Ok(mut slot) = EXIT_GATE.lock() {
+        if *slot == expected {
+            *slot = ExitGate::None;
+        }
+    }
+}
+
+pub(crate) fn exit_pending() -> bool {
+    exit_gate_blocks(exit_gate())
+}
+
+fn exit_gate_blocks(gate: ExitGate) -> bool {
+    !matches!(gate, ExitGate::None)
+}
 
 thread_local! {
     static STATE: RefCell<State> = RefCell::new(State::default());
@@ -409,10 +449,40 @@ unsafe extern "system" fn window_proc(
             PostQuitMessage(0);
             LRESULT(0)
         }
-        WM_QUERYENDSESSION => LRESULT(1),
+        WM_QUERYENDSESSION => {
+            if exit_pending() {
+                logging::warn("session end deferred: exit or session end already pending");
+                return LRESULT(0);
+            }
+            if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
+                logging::warn("session end deferred: injection in flight");
+                return LRESULT(0);
+            }
+            set_exit_gate(ExitGate::Confirming);
+            if !manage::confirm_exit() {
+                clear_exit_gate(ExitGate::Confirming);
+                return LRESULT(0);
+            }
+            // The confirmation card pumps messages; a snippet hotkey can start
+            // an injection while it is open. Re-check before allowing the end.
+            if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
+                clear_exit_gate(ExitGate::Confirming);
+                logging::warn("session end deferred: injection started during confirmation");
+                return LRESULT(0);
+            }
+            manage::discard_draft();
+            // Keep blocking new injections until WM_ENDSESSION says whether
+            // the end is real; a new injection before then could be killed
+            // midway by the system.
+            set_exit_gate(ExitGate::SessionEnding);
+            LRESULT(1)
+        }
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 storage::flush_usage();
+            } else {
+                // Another app cancelled the session end; resume normal use.
+                clear_exit_gate(ExitGate::SessionEnding);
             }
             LRESULT(0)
         }
@@ -483,6 +553,10 @@ fn handle_command(id: u32) {
 /// an injection is in flight, ask about unsaved management changes, then
 /// destroy the main window (which triggers `WM_DESTROY` and the usage flush).
 fn request_exit() {
+    if exit_pending() {
+        logging::warn("exit ignored: exit or session end already pending");
+        return;
+    }
     if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
         logging::warn("exit deferred: injection in flight");
         let hwnd = STATE.with(|state| state.borrow().hwnd);
@@ -491,7 +565,20 @@ fn request_exit() {
         }
         return;
     }
+    set_exit_gate(ExitGate::Confirming);
     if !manage::confirm_exit() {
+        clear_exit_gate(ExitGate::Confirming);
+        return;
+    }
+    // The confirmation card pumps messages; a snippet hotkey can start an
+    // injection while it is open. Re-check before destroying the window.
+    if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
+        clear_exit_gate(ExitGate::Confirming);
+        logging::warn("exit deferred: injection started during confirmation");
+        let hwnd = STATE.with(|state| state.borrow().hwnd);
+        if !hwnd.0.is_null() {
+            tray::balloon(hwnd, "QuickPhrase", "正在输入，请稍候再退出");
+        }
         return;
     }
     let hwnd = STATE.with(|state| state.borrow().hwnd);
@@ -616,6 +703,10 @@ pub fn apply_hotkey(text: &str) -> Result<(), String> {
 }
 
 fn hotkey_panel() {
+    if exit_pending() {
+        logging::warn("panel activation ignored: exit or session end pending");
+        return;
+    }
     if DIRECT_INJECTING.load(Ordering::Relaxed) {
         logging::warn("panel activation ignored: snippet injection in flight");
         let main = STATE.with(|state| state.borrow().hwnd);
@@ -649,6 +740,10 @@ fn hotkey_snippet(snippet_id: &str) {
     let paused = STATE.with(|state| state.borrow().paused);
     if paused {
         logging::warn("snippet hotkey ignored: hotkeys are paused");
+        return;
+    }
+    if exit_pending() {
+        logging::warn("snippet hotkey ignored: exit or session end pending");
         return;
     }
     if DIRECT_INJECTING.load(Ordering::Relaxed) || panel::is_injecting() {
@@ -795,6 +890,10 @@ fn copy_only_direct(main: HWND, snippet_id: &str, content: &str, reason: &str) {
 
 /// Menu, tray and second-instance entry: open (or focus) the panel, never close it.
 fn open_panel() {
+    if exit_pending() {
+        logging::warn("panel activation ignored: exit or session end pending");
+        return;
+    }
     if panel::is_injecting() || DIRECT_INJECTING.load(Ordering::Relaxed) {
         logging::warn("panel activation ignored: injection in flight");
         let main = STATE.with(|state| state.borrow().hwnd);
@@ -1004,4 +1103,16 @@ fn toggle_hotkey() {
 
 fn about() {
     crate::about_ui::show();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exit_gate_blocks, ExitGate};
+
+    #[test]
+    fn exit_gate_blocks_until_the_flow_is_resolved() {
+        assert!(!exit_gate_blocks(ExitGate::None));
+        assert!(exit_gate_blocks(ExitGate::Confirming));
+        assert!(exit_gate_blocks(ExitGate::SessionEnding));
+    }
 }

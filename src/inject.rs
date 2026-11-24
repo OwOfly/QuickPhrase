@@ -11,10 +11,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetWindowTextW, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW, RegisterClassW,
-    SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage, ES_MULTILINE, HMENU,
-    IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
+    GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW,
+    RegisterClassW, SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage,
+    ES_MULTILINE, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::capture::{Report, Target, Timings};
@@ -104,9 +104,9 @@ impl Outcome {
 /// Insert into the captured target, or copy from the application's `owner` window.
 pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options, owner: HWND) -> Outcome {
     let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
-    unsafe {
-        let _ = SetForegroundWindow(target);
-    }
+    // Do not activate the target here: guard() validates IsWindow/process
+    // identity first and only then restores the foreground. A stale/reused
+    // HWND must not steal focus before it is rejected.
 
     if !monitor_ok {
         let (copied, snapshot) = clipboard::set_text_with_snapshot(owner, raw);
@@ -286,11 +286,24 @@ fn has_forbidden_control(text: &str) -> bool {
     })
 }
 
+/// `IsWindow` stays true when a handle is recycled. Require that the handle is
+/// still owned by the captured process and thread before activating or typing
+/// into it.
+fn same_window(report: &Report, target: HWND) -> bool {
+    let mut pid = 0u32;
+    let tid = unsafe { GetWindowThreadProcessId(target, Some(&mut pid)) };
+    pid == report.target.pid && (report.target.tid == 0 || tid == report.target.tid)
+}
+
 fn guard(report: &Report) -> Result<(), &'static str> {
     let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
 
     if !unsafe { IsWindow(Some(target)) }.as_bool() {
         return Err("target_gone");
+    }
+
+    if !same_window(report, target) {
+        return Err("target_replaced");
     }
 
     if context::process_created(report.target.pid) != Some(report.target.created) {
@@ -356,6 +369,9 @@ fn guard(report: &Report) -> Result<(), &'static str> {
 }
 
 fn final_check(report: &Report, target: HWND) -> bool {
+    if !same_window(report, target) {
+        return false;
+    }
     if unsafe { GetForegroundWindow() } != target {
         return false;
     }

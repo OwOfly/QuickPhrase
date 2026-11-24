@@ -29,6 +29,20 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
 }
 
+# Without a foreground window the selftest cannot establish or restore focus,
+# and would report a misleading code failure instead of an environment skip.
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class QPInjectSmoke {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+}
+"@
+if ([QPInjectSmoke]::GetForegroundWindow() -eq [IntPtr]::Zero) {
+    "SKIP: no foreground window in this desktop session"
+    exit 3
+}
+
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 
