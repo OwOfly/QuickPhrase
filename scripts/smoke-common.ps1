@@ -93,3 +93,12 @@ function Test-QPTestWindow([IntPtr]$Window) {
     [void][QPTestNative]::GetWindowThreadProcessId($Window, [ref]$windowPid)
     $windowPid -ne 0 -and $windowPid -eq $script:qpTestWindowsPid
 }
+
+function Wait-Until([scriptblock]$Condition, [int]$TimeoutMs = 3000, [int]$IntervalMs = 50) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (& $Condition) { return $true }
+        Start-Sleep -Milliseconds $IntervalMs
+    }
+    return [bool](& $Condition)
+}

@@ -1,7 +1,7 @@
 # M0-1 smoke test
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\smoke.ps1 [-SkipBuild]
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$AllowHotkeySkip)
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "smoke-common.ps1")
@@ -64,7 +64,7 @@ function Close-MainWindow([int]$ProcessId) {
 }
 
 $before = 0
-if (Test-Path $log) { $before = (Get-Content $log).Count }
+if (Test-Path $log) { $before = (Get-Content $log -Encoding UTF8).Count }
 
 $results = New-Object System.Collections.Generic.List[object]
 $skipped = 0
@@ -98,7 +98,9 @@ $hotkeyTestable = $true
 try {
     Add-Type -AssemblyName System.Windows.Forms
     [System.Windows.Forms.SendKeys]::SendWait("^%q")
-    Start-Sleep -Milliseconds 700
+    [void](Wait-Until {
+        (Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Skip $before) -join "`n" -match "hotkey fired"
+    } 2000)
 } catch {
     $hotkeyTestable = $false
     $hotkeyError = $_.Exception.Message
@@ -107,7 +109,7 @@ try {
 $hotkeyObserved = $false
 if ($hotkeyTestable) {
     $hotkeyLines = @()
-    if (Test-Path $log) { $hotkeyLines = Get-Content $log | Select-Object -Skip $before }
+    if (Test-Path $log) { $hotkeyLines = Get-Content $log -Encoding UTF8 | Select-Object -Skip $before }
     $hotkeyObserved = ($hotkeyLines -join "`n") -match "hotkey fired"
 }
 
@@ -140,7 +142,7 @@ Check "hotkey released after exit" ($again.ExitCode -eq 0) ("selftest exit=" + $
 
 # 6. log assertions (this run only)
 $newLines = @()
-if (Test-Path $log) { $newLines = Get-Content $log | Select-Object -Skip $before }
+if (Test-Path $log) { $newLines = Get-Content $log -Encoding UTF8 | Select-Object -Skip $before }
 $newText = $newLines -join "`n"
 Check "hotkey registered in log" ($newText -match "hotkey registered: Ctrl\+Alt\+Q") ""
 Check "second instance signalled" ($newText -match "second instance activation requested") ""
@@ -149,14 +151,22 @@ $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
 
 "--- log tail ---"
-if (Test-Path $log) { Get-Content $log -Tail 12 }
+if (Test-Path $log) { Get-Content $log -Encoding UTF8 -Tail 12 }
 
 if ($failed.Count -gt 0) {
     "FAIL: $($failed.Count) check(s)"
     exit 1
 }
+if ($skipped -gt 0 -and -not $AllowHotkeySkip) {
+    "SKIP: hotkey trigger was not observed; run on an interactive desktop or pass -AllowHotkeySkip"
+    exit 3
+}
 $executed = $results.Count - $skipped
-"PASS: $executed checks ($skipped skipped)"
+if ($skipped -gt 0) {
+    "PASS (HOTKEY SKIPPED, ALLOWED): $executed checks ($skipped skipped)"
+    exit 4
+}
+"PASS: $executed checks"
 exit 0
 } finally {
     Stop-QPTestRun
