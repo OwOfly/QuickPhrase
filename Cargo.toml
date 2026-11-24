@@ -1,6 +1,6 @@
 [package]
 name = "quickphrase"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "QuickPhrase - global quick phrase inserter"
 license = "MIT"
