@@ -19,6 +19,8 @@ function New-QPTestRun([string]$SourceExe) {
     $data = Join-Path $dir 'data'
     New-Item -ItemType Directory -Path $data | Out-Null
     Write-Host "Isolated smoke data: $dir"
+    Write-Host "Source EXE: $SourceExe"
+    Write-Host ("Source SHA256: " + (Get-FileHash $SourceExe -Algorithm SHA256).Hash.ToLower())
     [pscustomobject]@{
         Directory = $dir
         Exe = $exe

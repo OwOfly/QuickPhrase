@@ -70,9 +70,12 @@ fn main() {
     ));
 
     if search_bench {
-        let (p50, p95, max) = search::bench(1_000, 100);
+        let large = has(&args, "--large");
+        let documents = if large { 10_000 } else { 1_000 };
+        let queries = if large { 1_000 } else { 100 };
+        let (p50, p95, max) = search::bench(documents, queries);
         logging::info(&format!(
-            "search bench: n=1000 queries=100 p50={p50}us p95={p95}us max={max}us"
+            "search bench: n={documents} queries={queries} p50={p50}us p95={p95}us max={max}us"
         ));
         return;
     }
@@ -176,11 +179,15 @@ fn main() {
     }
 
     if panel_bench {
-        let (p50, p95, max) = panel::bench(100);
+        let (p50, p95, max, failures) = panel::bench(100);
         logging::info(&format!(
-            "panel bench: n=100 p50={p50}us p95={p95}us max={max}us"
+            "panel bench: n=100 failures={failures} p50={p50}us p95={p95}us max={max}us"
         ));
         panel::shutdown();
+        if failures > 0 {
+            logging::error("panel bench: one or more frames failed to render");
+            std::process::exit(2);
+        }
         return;
     }
 

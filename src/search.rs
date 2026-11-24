@@ -284,7 +284,8 @@ fn find_range(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// 1,000 documents, 100 queries; returns (p50, p95, max) in microseconds.
+/// Benchmarks search over the requested corpus (`--search-bench --large` uses
+/// 10,000 documents x 1,000 queries); returns (p50, p95, max) in microseconds.
 pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
     if queries == 0 {
         return (0, 0, 0);

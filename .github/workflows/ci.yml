@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly-2025-12-04
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --release -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Package (unreleased smoke build)
+        run: powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -AllowUnreleased
+      - uses: actions/upload-artifact@v4
+        with:
+          name: quickphrase-unreleased
+          path: dist/QuickPhrase-*-win-x64.zip

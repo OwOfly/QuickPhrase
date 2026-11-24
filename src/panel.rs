@@ -29,7 +29,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::Report;
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
 use crate::{context, inject, logging, platform, theme, ui};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
@@ -190,10 +190,6 @@ pub fn take_inject_result() -> Option<String> {
 
 pub fn is_injecting() -> bool {
     INJECTING.load(Ordering::Relaxed)
-}
-
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
 }
 
 fn animations_enabled() -> bool {
@@ -2924,9 +2920,9 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-pub fn bench(iterations: u32) -> (u128, u128, u128) {
+pub fn bench(iterations: u32) -> (u128, u128, u128, u32) {
     if iterations == 0 {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     }
     let base_items: Vec<Item> = (0..50)
         .map(|index| Item {
@@ -2947,6 +2943,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
         })
         .collect();
     let mut samples = Vec::with_capacity(iterations as usize);
+    let mut failures = 0u32;
     for _ in 0..iterations {
         let elapsed = present(
             None,
@@ -2967,6 +2964,9 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
             false,
         );
         samples.push(elapsed);
+        if elapsed == 0 {
+            failures += 1;
+        }
         hide_and_restore();
     }
     samples.sort_unstable();
@@ -2974,7 +2974,7 @@ pub fn bench(iterations: u32) -> (u128, u128, u128) {
     let p95_rank = (samples.len() * 95).div_ceil(100);
     let p95 = samples[p95_rank.saturating_sub(1).min(samples.len() - 1)];
     let max = *samples.last().unwrap_or(&0);
-    (p50, p95, max)
+    (p50, p95, max, failures)
 }
 
 pub fn shutdown() {
