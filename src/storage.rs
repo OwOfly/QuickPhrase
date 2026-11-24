@@ -1776,9 +1776,9 @@ impl Store {
 
     // The confirmed recovery path may persist data without unlocking the store.
     fn persist_data(&mut self, rotate_backup: bool) -> Result<(), String> {
-        for snippet in &mut self.data.snippets {
-            snippet.rebuild_blob();
-        }
+        // Content mutators rebuild the affected search blob themselves. The
+        // blob is derived and is not serialized; `load_from` rebuilds it
+        // unconditionally, so persistence never carries a stale blob.
         let previous_revision = self.data.revision;
         let next_revision = self
             .data
@@ -3307,6 +3307,62 @@ mod tests {
     }
 
     #[test]
+    fn record_use_does_not_rebuild_search_blob() {
+        let dir = temp_dir("blob-usage");
+        let mut store = Store::load_from(&dir);
+        let id = store.snippets()[0].id.clone();
+        let position = store
+            .data
+            .snippets
+            .iter()
+            .position(|snippet| snippet.id == id)
+            .unwrap();
+        store.data.snippets[position].search_blob = "sentinel".to_string();
+        store.record_use(&id, "accepted").unwrap();
+        assert_eq!(store.data.snippets[position].search_blob, "sentinel");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn content_mutations_refresh_search_blob() {
+        let dir = temp_dir("blob-mutations");
+        let mut store = Store::load_from(&dir);
+        let check = |store: &Store, id: &str| {
+            let snippet = store
+                .data
+                .snippets
+                .iter()
+                .find(|snippet| snippet.id == id)
+                .unwrap();
+            assert_eq!(
+                snippet.search_blob,
+                build_search_blob(&snippet.title, &snippet.content, &snippet.tags)
+            );
+        };
+        let id = store.add_snippet("标题A", "正文A", None, false).unwrap();
+        check(&store, &id);
+
+        store
+            .update_snippet(&id, "标题B", "正文B", None, true)
+            .unwrap();
+        check(&store, &id);
+
+        store
+            .add_tags(&[id.clone()], &["标签".to_string()])
+            .unwrap();
+        check(&store, &id);
+
+        store
+            .remove_tags(&[id.clone()], &["标签".to_string()])
+            .unwrap();
+        check(&store, &id);
+
+        store.record_use(&id, "accepted").unwrap();
+        check(&store, &id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn backups_are_pruned_to_five() {
         let dir = temp_dir("prune");
         let mut store = Store::load_from(&dir);
@@ -3674,6 +3730,12 @@ mod tests {
             .is_some_and(|snippet| {
                 snippet.pinned && snippet.tags == vec!["support".to_string(), "refund".to_string()]
             }));
+        for snippet in target.data().snippets.iter() {
+            assert_eq!(
+                snippet.search_blob,
+                build_search_blob(&snippet.title, &snippet.content, &snippet.tags)
+            );
+        }
 
         let invalid = br#"{"schemaVersion":99,"revision":0,"categories":[],"snippets":[]}"#;
         assert_eq!(
@@ -3710,6 +3772,12 @@ mod tests {
             .snippets()
             .iter()
             .any(|snippet| snippet.title == "导入短语"));
+        for snippet in store.data().snippets.iter() {
+            assert_eq!(
+                snippet.search_blob,
+                build_search_blob(&snippet.title, &snippet.content, &snippet.tags)
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
