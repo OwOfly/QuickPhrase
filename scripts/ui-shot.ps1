@@ -3,10 +3,10 @@
 param([ValidateSet("light", "dark")] [string]$Theme = "light")
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$outDir = Join-Path $root "dist\ui-shots"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition @"
@@ -39,16 +39,21 @@ public class QPShot {
 }
 "@
 
-$settings = Join-Path $env:LOCALAPPDATA "QuickPhrase\settings.json"
-$original = [IO.File]::ReadAllText($settings)
+$qpRun = New-QPTestRun $exe
+$outDir = Join-Path $qpRun.Directory 'shots'
+New-Item -ItemType Directory -Path $outDir | Out-Null
+$settings = Join-Path $qpRun.Data 'settings.json'
 try {
-    $updated = $original -replace '"theme"\s*:\s*"[^"]*"', ('"theme":  "' + $Theme + '"')
-    [IO.File]::WriteAllText($settings, $updated, (New-Object Text.UTF8Encoding($false)))
-
+    $seed = Start-QPTest -Arguments '--bench' -Wait
+    if ($seed.ExitCode -ne 0) { throw "Could not seed the test settings: $($seed.ExitCode)" }
+    $testSettings = Get-Content -LiteralPath $settings -Raw | ConvertFrom-Json
+    $testSettings.theme = $Theme
+    [IO.File]::WriteAllText($settings, ($testSettings | ConvertTo-Json))
     function Find-Window([string]$Class) {
         $script:found = [IntPtr]::Zero
         $callback = [QPShot+EnumProc]{
-            param($hwnd, $lparam)
+            param($hwnd, $unused)
+            if (-not (Test-QPTestWindow $hwnd)) { return $true }
             $name = New-Object System.Text.StringBuilder 256
             [void][QPShot]::GetClassName($hwnd, $name, 256)
             if ($name.ToString() -eq $Class) { $script:found = $hwnd }
@@ -80,14 +85,8 @@ try {
         Write-Output ("saved {0} {1}x{2}" -f (Split-Path $Path -Leaf), $width, $height)
     }
 
-    Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-    Start-Sleep -Milliseconds 400
-
     # Panel
-    $env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
-    $env:QUICKPHRASE_TEST_NO_INJECT = "1"
-    $env:QUICKPHRASE_TEST_NO_ANIMATION = "1"
-    $app = Start-Process -FilePath $exe -PassThru
+    $app = Start-QPTest -PanelWithoutInjection
     Start-Sleep -Milliseconds 900
     $main = Find-Window "QuickPhrase.MainWindow"
     if ($main -ne [IntPtr]::Zero) {
@@ -107,11 +106,11 @@ try {
         Write-Output "main window not found"
     }
     Start-Sleep -Milliseconds 300
-    Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-QPTestProcess $app
     Start-Sleep -Milliseconds 500
 
     # Management window: default and minimum size.
-    $manage = Start-Process -FilePath $exe -ArgumentList "--manage-test" -PassThru
+    $manage = Start-QPTest -Arguments "--manage-test"
     Start-Sleep -Milliseconds 900
     $hwnd = Find-Window "QuickPhrase.ManageWindow"
     if ($hwnd -ne [IntPtr]::Zero) {
@@ -125,11 +124,11 @@ try {
     } else {
         Write-Output "manage window not found"
     }
-    Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-QPTestProcess $manage
     Start-Sleep -Milliseconds 500
 
     # Settings window: default and minimum size.
-    $settingsProc = Start-Process -FilePath $exe -ArgumentList "--settings-test" -PassThru
+    $settingsProc = Start-QPTest -Arguments "--settings-test"
     Start-Sleep -Milliseconds 900
     $hwnd = Find-Window "QuickPhrase.SettingsWindow"
     if ($hwnd -ne [IntPtr]::Zero) {
@@ -143,8 +142,7 @@ try {
     } else {
         Write-Output "settings window not found"
     }
-    Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-QPTestProcess $settingsProc
 } finally {
-    [IO.File]::WriteAllText($settings, $original, (New-Object Text.UTF8Encoding($false)))
-    Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
+    Stop-QPTestRun
 }

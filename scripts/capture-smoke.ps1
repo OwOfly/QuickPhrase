@@ -4,10 +4,10 @@
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
-$captures = Join-Path $env:LOCALAPPDATA "QuickPhrase\captures"
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -21,16 +21,20 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+try {
 $results = New-Object System.Collections.Generic.List[object]
 function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
 }
 
+$captures = Join-Path $qpRun.Data "captures"
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 $startedAt = Get-Date
 
-$process = Start-Process -FilePath $exe -ArgumentList "--capture-test", "--delay", "600" -PassThru -Wait
+$process = Start-QPTest -Arguments @("--capture-test", "--delay", "600") -Wait
 Check "capture-test exit 0" ($process.ExitCode -eq 0) ("exit=" + $process.ExitCode)
 
 $newLog = @()
@@ -103,3 +107,6 @@ if ($failed.Count -gt 0) {
 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

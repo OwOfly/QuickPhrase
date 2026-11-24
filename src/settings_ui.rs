@@ -2580,7 +2580,8 @@ fn rule_error_text(code: &str) -> &'static str {
 fn data_error_text(code: &str) -> &'static str {
     match code {
         "read_only" => "只读模式，无法导入",
-        "import_too_large" => "导入文件过大或条目过多",
+        "import_too_large" => "文件超过合并上限；如需还原整库，可选择替换",
+        code if code.starts_with("read:") => "无法读取选中的文件",
         "import_invalid_json" => "文件不是有效的 QuickPhrase JSON",
         "import_schema" => "文件版本不受支持",
         "import_category_id" | "import_category_name" | "import_category_missing" => {
@@ -2599,7 +2600,13 @@ fn data_error_text(code: &str) -> &'static str {
 
 fn handle_data_action(hwnd: HWND, action: DataAction) {
     let (save, initial, title) = match action {
-        DataAction::Export => (true, platform::data_dir(), "导出 QuickPhrase 数据"),
+        DataAction::Export => {
+            let dir = platform::data_dir();
+            let outside = dir
+                .parent()
+                .map_or_else(|| dir.clone(), std::path::Path::to_path_buf);
+            (true, outside, "导出 QuickPhrase 数据")
+        }
         DataAction::Import => (false, platform::data_dir(), "导入 QuickPhrase 数据"),
         DataAction::RestoreBackup => {
             let dir = storage::backups_dir().unwrap_or_else(platform::data_dir);
@@ -2612,10 +2619,15 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
 
     match action {
         DataAction::Export => {
-            let result = storage::export_json()
-                .and_then(|json| std::fs::write(&path, json).map_err(|err| format!("write:{err}")));
+            let result = storage::export_to(&path);
             match result {
                 Ok(()) => set_data_status(hwnd, &format!("已导出：{}", path.display())),
+                Err(err) if err == "export_data_unavailable" => {
+                    set_data_status(hwnd, "当前短语库损坏或版本不受支持，无法导出");
+                }
+                Err(err) if err == "export_protected" => {
+                    set_data_status(hwnd, "不能覆盖数据目录、备份或其链接，请选择其他位置");
+                }
                 Err(err) => {
                     logging::error(&format!("settings: export failed: {err}"));
                     set_data_status(hwnd, "导出失败，请检查路径或权限");
@@ -2623,22 +2635,10 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
             }
         }
         DataAction::Import => {
-            let bytes = match storage::read_import_file(&path) {
-                Ok(bytes) => bytes,
-                Err(err) if err == "import_too_large" => {
-                    set_data_status(hwnd, "导入文件过大或条目过多");
-                    return;
-                }
-                Err(err) => {
-                    logging::error(&format!("settings: import read failed: {err}"));
-                    set_data_status(hwnd, "无法读取导入文件");
-                    return;
-                }
-            };
             let choice = unsafe {
                 MessageBoxW(
                     Some(hwnd),
-                    w!("导入方式：\n\n是：合并到当前数据（按标题去重）\n否：替换当前全部数据\n取消：不导入"),
+                    w!("导入方式：\n\n是：合并到当前数据（按标题去重）\n否：替换当前全部数据（支持较大的本地导出文件）\n取消：不导入"),
                     w!("导入 QuickPhrase 数据"),
                     MB_YESNOCANCEL | MB_ICONQUESTION,
                 )
@@ -2650,16 +2650,27 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
             } else {
                 return;
             };
-            match storage::import_bytes(&bytes, mode) {
+            if mode == storage::ImportMode::Replace && !crate::manage::confirm_exit() {
+                return;
+            }
+            match storage::import_file(&path, mode) {
                 Ok(summary) => {
+                    if mode == storage::ImportMode::Replace {
+                        crate::manage::library_replaced();
+                    }
                     crate::app::refresh_snippet_hotkeys();
                     set_data_status(
                         hwnd,
                         &format!(
-                            "导入完成：分类 +{}，短语 +{}，跳过 {}；重开面板/管理窗口生效",
+                            "导入完成：分类 +{}，短语 +{}，跳过 {}{}",
                             summary.categories_added,
                             summary.snippets_added,
-                            summary.snippets_skipped
+                            summary.snippets_skipped,
+                            if mode == storage::ImportMode::Merge {
+                                "；重开管理窗口查看"
+                            } else {
+                                ""
+                            },
                         ),
                     )
                 }
@@ -2670,33 +2681,29 @@ fn handle_data_action(hwnd: HWND, action: DataAction) {
             }
         }
         DataAction::RestoreBackup => {
-            let bytes = match storage::read_import_file(&path) {
-                Ok(bytes) => bytes,
-                Err(err) if err == "import_too_large" => {
-                    set_data_status(hwnd, "备份文件过大，无法恢复");
-                    return;
-                }
-                Err(err) => {
-                    logging::error(&format!("settings: backup read failed: {err}"));
-                    set_data_status(hwnd, "无法读取备份文件");
-                    return;
-                }
-            };
             let answer = unsafe {
                 MessageBoxW(
                     Some(hwnd),
-                    w!("恢复备份会用备份内容替换当前数据，且无法撤销。继续吗？"),
+                    w!("恢复备份会替换当前数据。若短语快捷键重复或与当前面板热键冲突，恢复时会清除冲突绑定，正文不受影响。继续吗？"),
                     w!("恢复 QuickPhrase 备份"),
                     MB_YESNO | MB_ICONWARNING,
                 )
             };
-            if answer != IDYES {
+            if answer != IDYES || !crate::manage::confirm_exit() {
                 return;
             }
-            match storage::import_bytes(&bytes, storage::ImportMode::Replace) {
-                Ok(_) => {
+            match storage::restore_file(&path) {
+                Ok(removed) => {
+                    crate::manage::library_replaced();
                     crate::app::refresh_snippet_hotkeys();
-                    set_data_status(hwnd, "备份已恢复；重开面板/管理窗口生效")
+                    let mut status = "备份已恢复".to_string();
+                    if removed != 0 {
+                        status.push_str(&format!("，已清除 {removed} 个冲突快捷键"));
+                    }
+                    if storage::read_only_notice().is_some() {
+                        status.push_str("；设置或规则异常，仍为只读");
+                    }
+                    set_data_status(hwnd, &status);
                 }
                 Err(err) => {
                     logging::error(&format!("settings: restore failed: {err}"));
@@ -3016,19 +3023,26 @@ unsafe extern "system" fn window_proc(
                     }
                     ID_RESTORE_CLIP if notification == BN_CLICKED => {
                         match crate::clipboard::last_snapshot() {
-                            Some(snapshot) if snapshot.text.is_some() => {
-                                if crate::clipboard::restore(&snapshot) {
+                            Some(snapshot) if snapshot.can_restore() => {
+                                if crate::clipboard::restore(hwnd, &snapshot) {
                                     set_status(ui, "已恢复上次剪贴板内容");
                                 } else {
-                                    set_status(ui, "无法恢复：剪贴板内容已变化");
+                                    set_status(ui, "无法恢复：剪贴板已变化或当前不可用");
                                 }
                             }
                             _ => set_status(ui, "没有可恢复的剪贴板内容"),
                         }
                     }
                     ID_COPY_DIR if notification == BN_CLICKED => {
-                        let _ = crate::clipboard::set_text_with_snapshot(&ui.data_dir);
-                        set_status(ui, "已复制本地数据目录路径");
+                        let copied = crate::clipboard::set_text_with_snapshot(hwnd, &ui.data_dir).0;
+                        set_status(
+                            ui,
+                            if copied {
+                                "已复制本地数据目录路径"
+                            } else {
+                                "复制路径失败"
+                            },
+                        );
                     }
                     ID_OPEN_DIR if notification == BN_CLICKED => {
                         let path = platform::wide(&ui.data_dir);

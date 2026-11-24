@@ -541,8 +541,7 @@ unsafe extern "system" fn window_proc(
                             env!("CARGO_PKG_VERSION"),
                             about.data_dir
                         );
-                        let _ = crate::clipboard::set_text_with_snapshot(&summary);
-                        about.copied = true;
+                        about.copied = crate::clipboard::set_text_with_snapshot(hwnd, &summary).0;
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 });

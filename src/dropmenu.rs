@@ -149,11 +149,8 @@ fn pad(dpi: u32) -> i32 {
     scaled(PAD, dpi)
 }
 
-/// Keep the keyboard highlight visible after a wheel or scrollbar drag.
-///
-/// Down must scroll the view back when the highlight sits above the visible
-/// range, and forward when it passes the last row.
-fn scroll_down_top(current_top: usize, next: usize, visible: usize, max_top: usize) -> usize {
+/// Keep either direction of keyboard movement visible after wheel/drag scrolling.
+fn keyboard_top(current_top: usize, next: usize, visible: usize, max_top: usize) -> usize {
     if next >= current_top + visible {
         (next + 1).saturating_sub(visible).min(max_top)
     } else if next < current_top {
@@ -161,6 +158,11 @@ fn scroll_down_top(current_top: usize, next: usize, visible: usize, max_top: usi
     } else {
         current_top
     }
+}
+
+/// Enter never commits a row hidden by scrolling.
+fn visible_pick(index: Option<usize>, top: usize, visible: usize, len: usize) -> Option<usize> {
+    index.filter(|&index| index >= top && index < top + visible && index < len)
 }
 
 pub fn is_open() -> bool {
@@ -599,15 +601,13 @@ unsafe extern "system" fn window_proc(
                             .unwrap_or(0);
                         let next = current.min(menu.items.len().saturating_sub(1));
                         menu.hovered = Some(next);
-                        menu.top = scroll_down_top(menu.top, next, menu.visible, max_top);
+                        menu.top = keyboard_top(menu.top, next, menu.visible, max_top);
                     }
                     key if key == VK_UP.0 => {
                         let current = menu.hovered.or(menu.selected).unwrap_or(0);
                         let next = current.saturating_sub(1);
                         menu.hovered = Some(next);
-                        if next < menu.top {
-                            menu.top = next;
-                        }
+                        menu.top = keyboard_top(menu.top, next, menu.visible, max_top);
                     }
                     key if key == VK_HOME.0 => {
                         menu.hovered = Some(0);
@@ -619,7 +619,12 @@ unsafe extern "system" fn window_proc(
                         menu.top = max_top;
                     }
                     key if key == VK_RETURN.0 => {
-                        picked = menu.hovered.or(menu.selected);
+                        picked = visible_pick(
+                            menu.hovered.or(menu.selected),
+                            menu.top,
+                            menu.visible,
+                            menu.items.len(),
+                        );
                     }
                     key if key == VK_ESCAPE.0 || key == VK_TAB.0 => {
                         picked = None;
@@ -691,24 +696,31 @@ unsafe extern "system" fn window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::scroll_down_top;
+    use super::{keyboard_top, visible_pick};
 
     #[test]
     fn down_scrolls_back_to_offscreen_highlight() {
         // 23 items, 8 visible, wheel/drag left the view at the bottom while
         // the highlight was still on index 0; Down moves to 1.
-        assert_eq!(scroll_down_top(15, 1, 8, 15), 1);
+        assert_eq!(keyboard_top(15, 1, 8, 15), 1);
     }
 
     #[test]
     fn down_scrolls_forward_past_the_last_visible_row() {
-        assert_eq!(scroll_down_top(0, 8, 8, 15), 1);
-        assert_eq!(scroll_down_top(5, 15, 8, 15), 8);
+        assert_eq!(keyboard_top(0, 8, 8, 15), 1);
+        assert_eq!(keyboard_top(5, 15, 8, 15), 8);
     }
 
     #[test]
     fn down_keeps_a_visible_highlight_in_place() {
-        assert_eq!(scroll_down_top(3, 4, 8, 15), 3);
-        assert_eq!(scroll_down_top(15, 15, 8, 15), 15);
+        assert_eq!(keyboard_top(3, 4, 8, 15), 3);
+        assert_eq!(keyboard_top(15, 15, 8, 15), 15);
+    }
+    #[test]
+    fn enter_only_commits_a_visible_row() {
+        assert_eq!(visible_pick(Some(2), 5, 4, 12), None);
+        assert_eq!(visible_pick(Some(9), 5, 4, 12), None);
+        assert_eq!(visible_pick(Some(8), 5, 4, 12), Some(8));
+        assert_eq!(visible_pick(Some(8), 5, 4, 8), None);
     }
 }

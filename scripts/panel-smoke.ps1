@@ -1,16 +1,13 @@
-﻿# M0-3 panel smoke test
+# M0-3 panel smoke test
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\panel-smoke.ps1 [-SkipBuild]
 
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
-
-# A resident instance locks the release binary, so stop it before building.
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 400
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -23,6 +20,9 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -50,7 +50,8 @@ function Find-Windows {
     $script:main = [IntPtr]::Zero
     $script:panel = [IntPtr]::Zero
     $callback = [QPPanelSmoke+EnumProc]{
-        param($hwnd, $lparam)
+        param($hwnd, $unused)
+        if (-not (Test-QPTestWindow $hwnd)) { return $true }
         $class = New-Object System.Text.StringBuilder 256
         [void][QPPanelSmoke]::GetClassName($hwnd, $class, 256)
         if ($class.ToString() -eq "QuickPhrase.MainWindow") { $script:main = $hwnd }
@@ -91,10 +92,10 @@ function Find-Edit([IntPtr]$Panel) {
 }
 
 # 1. panel bench
-$benchLog = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
+$benchLog = $log
 $beforeBench = 0
 if (Test-Path $benchLog) { $beforeBench = (Get-Content $benchLog).Count }
-$bench = Start-Process -FilePath $exe -ArgumentList "--panel-bench" -PassThru -Wait
+$bench = Start-QPTest -Arguments "--panel-bench" -Wait
 $benchLines = @()
 if (Test-Path $benchLog) { $benchLines = Get-Content $benchLog | Select-Object -Skip $beforeBench }
 $benchText = $benchLines -join "`n"
@@ -110,10 +111,7 @@ if ([QPPanelSmoke]::GetForegroundWindow() -eq [IntPtr]::Zero) {
 }
 
 # 2. show via hotkey message
-$env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
-$env:QUICKPHRASE_TEST_NO_INJECT = "1"
-$env:QUICKPHRASE_TEST_NO_ANIMATION = "1"
-$app = Start-Process -FilePath $exe -PassThru
+$app = Start-QPTest -PanelWithoutInjection
 Start-Sleep -Milliseconds 900
 $beforeForeground = [QPPanelSmoke]::GetForegroundWindow()
 $before = 0
@@ -160,8 +158,6 @@ Check "Enter restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $re
 [void][QPPanelSmoke]::PostMessage($main, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
 Start-Sleep -Milliseconds 700
 Check "app exits 0" ($app.HasExited -and $app.ExitCode -eq 0) ("exit=" + $(if ($app.HasExited) { $app.ExitCode } else { "n/a" }))
-Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL -ErrorAction SilentlyContinue
-Remove-Item Env:QUICKPHRASE_TEST_NO_INJECT, Env:QUICKPHRASE_TEST_NO_ANIMATION -ErrorAction SilentlyContinue
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
@@ -174,3 +170,6 @@ if ($failed.Count -gt 0) {
 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

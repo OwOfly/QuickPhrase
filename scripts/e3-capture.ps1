@@ -1,18 +1,22 @@
-﻿# M0-5 experiment E3: capture latency distribution for a live host.
+# M0-5 experiment E3: capture latency distribution for a live host.
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\e3-capture.ps1 [-Runs 30]
 
 param([int]$Runs = 30)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
 $probe = Join-Path $root "target\host-probe.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
-$outDir = Join-Path $env:TEMP "qp-e3"
 
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 if (-not (Test-Path $probe)) { throw "missing $probe (build scripts\host-probe.rs first)" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+$outDir = $qpRun.Directory
+try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -49,12 +53,10 @@ function Focus-Window([IntPtr]$Window) {
     return ([QPE3]::GetForegroundWindow() -eq $Window)
 }
 
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $hwndFile = Join-Path $outDir "host-hwnd.txt"
 $textFile = Join-Path $outDir "host-text.txt"
-Remove-Item $hwndFile -ErrorAction SilentlyContinue
 
-$hostProcess = Start-Process -FilePath $probe -ArgumentList @($textFile, $hwndFile) -PassThru
+$hostProcess = Start-QPTest -Probe $probe -Arguments @($textFile, $hwndFile)
 for ($i = 0; $i -lt 40 -and -not (Test-Path $hwndFile); $i++) { Start-Sleep -Milliseconds 250 }
 if (-not (Test-Path $hwndFile)) { throw "host probe did not start" }
 $hostWindow = [IntPtr][int64](Get-Content $hwndFile -Raw).Trim()
@@ -66,9 +68,10 @@ $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 
 for ($i = 0; $i -lt $Runs; $i++) {
-    [void](Focus-Window $hostWindow)
+    if (-not (Focus-Window $hostWindow)) { throw "Cannot focus the host probe" }
     Start-Sleep -Milliseconds 120
-    & $exe --capture-test --delay 120 | Out-Null
+    $sample = Start-QPTest -Arguments @("--capture-test", "--delay", "120") -Wait
+    if ($sample.ExitCode -ne 0) { throw "Capture probe failed: $($sample.ExitCode)" }
 }
 
 $lines = @()
@@ -81,8 +84,6 @@ foreach ($line in $lines) {
     }
 }
 
-try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
-
 if ($samples.Count -eq 0) { "FAIL: no capture samples"; exit 1 }
 $sorted = $samples | Sort-Object
 $p50 = $sorted[[int][Math]::Floor($sorted.Count * 0.5)]
@@ -93,3 +94,6 @@ $max = $sorted[$sorted.Count - 1]
 "identity=verified: $identity / $($samples.Count)"
 "region=text_editor: $region / $($samples.Count)"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

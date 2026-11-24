@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
+use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,9 +17,11 @@ use pinyin::ToPinyin;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    MoveFileExW, ReplaceFileW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    REPLACEFILE_IGNORE_MERGE_ERRORS, REPLACEFILE_WRITE_THROUGH,
+    GetFileInformationByHandle, MoveFileExW, ReplaceFileW, BY_HANDLE_FILE_INFORMATION,
+    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_MERGE_ERRORS,
+    REPLACEFILE_WRITE_THROUGH,
 };
 
 use crate::{logging, platform};
@@ -204,6 +207,14 @@ impl Default for RulesFile {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DataState {
+    Ready,
+    Corrupt,
+    Incompatible,
+    Unavailable,
+}
+
 pub struct Store {
     dir: PathBuf,
     data: DataFile,
@@ -211,6 +222,8 @@ pub struct Store {
     rules: RulesFile,
     read_only: bool,
     notice: Option<String>,
+    data_state: DataState,
+    other_read_only: bool,
 }
 
 static STORE: std::sync::OnceLock<std::sync::Mutex<Store>> = std::sync::OnceLock::new();
@@ -401,31 +414,41 @@ pub fn active_count() -> usize {
     .unwrap_or(0)
 }
 
-pub fn export_json() -> Result<String, String> {
-    with_store(|store| store.export_json())
-        .unwrap_or_else(|| Err("storage_unavailable".to_string()))
+/// Export a snapshot outside the store without touching live files or backups.
+pub fn export_to(path: &Path) -> Result<(), String> {
+    with_store(|store| store.export_to(path)).unwrap_or_else(|| Err("storage_unavailable".into()))
 }
 
-pub fn import_bytes(bytes: &[u8], mode: ImportMode) -> Result<ImportSummary, String> {
-    match with_store(|store| store.import_bytes(bytes, mode)) {
-        Some(result) => result,
-        None => Err("storage_unavailable".to_string()),
-    }
+/// Import a selected JSON file. Only merge uses the external import quota;
+/// a confirmed whole-library replacement can also open large local exports.
+pub fn import_file(path: &Path, mode: ImportMode) -> Result<ImportSummary, String> {
+    let bytes = if mode == ImportMode::Merge {
+        read_merge_file(path)?
+    } else {
+        fs::read(path).map_err(|err| format!("read:{err}"))?
+    };
+    with_store(|store| store.import_bytes(&bytes, mode))
+        .unwrap_or_else(|| Err("storage_unavailable".into()))
 }
 
-/// Read an import/backup file with the size limit applied before allocating
-/// the whole payload. Metadata is checked first, then the read itself is
-/// capped so a file that grows between the two checks still cannot exceed it.
-pub fn read_import_file(path: &Path) -> Result<Vec<u8>, String> {
-    let metadata = fs::metadata(path).map_err(|err| err.to_string())?;
+/// Restore a user-confirmed backup, returning the number of removed bindings.
+pub fn restore_file(path: &Path) -> Result<usize, String> {
+    let bytes = fs::read(path).map_err(|err| format!("read:{err}"))?;
+    with_store(|store| store.restore_bytes(&bytes))
+        .unwrap_or_else(|| Err("storage_unavailable".into()))
+}
+
+/// Bound merge input even if the file grows after the metadata check.
+fn read_merge_file(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::metadata(path).map_err(|err| format!("read:{err}"))?;
     if metadata.len() > IMPORT_MAX_BYTES as u64 {
         return Err("import_too_large".to_string());
     }
-    let file = fs::File::open(path).map_err(|err| err.to_string())?;
+    let file = fs::File::open(path).map_err(|err| format!("read:{err}"))?;
     let mut bytes = Vec::new();
     file.take(IMPORT_MAX_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| format!("read:{err}"))?;
     if bytes.len() > IMPORT_MAX_BYTES {
         return Err("import_too_large".to_string());
     }
@@ -551,11 +574,23 @@ const IMPORT_MAX_BYTES: usize = 20 * 1024 * 1024;
 const IMPORT_MAX_SNIPPETS: usize = 10_000;
 const IMPORT_MAX_CATEGORIES: usize = 1_000;
 
-fn validate_import(mut data: DataFile) -> Result<DataFile, String> {
-    if data.schema_version == 0 || data.schema_version > SCHEMA_VERSION {
+fn parse_import(bytes: &[u8], merge: bool) -> Result<DataFile, String> {
+    if merge && bytes.len() > IMPORT_MAX_BYTES {
+        return Err("import_too_large".into());
+    }
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let imported = serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
+    validate_import(imported, merge)
+}
+
+fn validate_import(mut data: DataFile, merge: bool) -> Result<DataFile, String> {
+    if data.schema_version != SCHEMA_VERSION {
         return Err("import_schema".to_string());
     }
-    if data.snippets.len() > IMPORT_MAX_SNIPPETS || data.categories.len() > IMPORT_MAX_CATEGORIES {
+    if merge
+        && (data.snippets.len() > IMPORT_MAX_SNIPPETS
+            || data.categories.len() > IMPORT_MAX_CATEGORIES)
+    {
         return Err("import_too_large".to_string());
     }
 
@@ -631,25 +666,79 @@ impl Store {
             .collect()
     }
 
-    pub fn export_json(&self) -> Result<String, String> {
+    fn export_json(&self) -> Result<String, String> {
         serde_json::to_string_pretty(&self.data).map_err(|err| err.to_string())
     }
 
-    pub fn import_bytes(
-        &mut self,
-        bytes: &[u8],
-        mode: ImportMode,
-    ) -> Result<ImportSummary, String> {
+    fn export_to(&self, path: &Path) -> Result<(), String> {
+        let target = export_target(&self.dir, path)?;
+        if self.data_state != DataState::Ready {
+            return Err("export_data_unavailable".into());
+        }
+        let json = self.export_json()?;
+        let temp = target.with_file_name(format!(".quickphrase-export-{}.tmp", new_id()));
+        write_new_file(&temp, json.as_bytes())?;
+        let result = move_file(&temp, &target, true);
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    /// Restore data independently of settings/rules; unrelated read-only
+    /// guards remain active. Never rotate an unreadable main into the backups.
+    fn restore_bytes(&mut self, bytes: &[u8]) -> Result<usize, String> {
+        let corrupt = self.data_state == DataState::Corrupt;
+        if self.read_only && !corrupt {
+            return Err("read_only".into());
+        }
+        let mut imported = parse_import(bytes, false)?;
+        let panel = crate::hotkey::parse(&self.settings.hotkey);
+        let mut used = HashSet::new();
+        let mut removed = 0;
+        for snippet in &mut imported.snippets {
+            if let Some(binding) = &snippet.hotkey {
+                if crate::hotkey::parse(binding) == panel || !used.insert(binding.clone()) {
+                    snippet.hotkey = None;
+                    removed += 1;
+                }
+            }
+        }
+        if corrupt {
+            let main = self.path(DATA_FILE);
+            match fs::read(&main) {
+                Ok(original) => {
+                    // Recheck the schema before replacing a file changed since startup.
+                    if json_version(&original, "schemaVersion")
+                        .is_some_and(|version| version != u64::from(SCHEMA_VERSION))
+                        || serde_json::from_slice::<DataFile>(&original).is_ok()
+                    {
+                        return Err("read_only".into());
+                    }
+                    let preserved = self.path(&format!("data-corrupt-{}.json", new_id()));
+                    write_new_file(&preserved, &original)?;
+                    logging::warn(&format!("storage: preserved {}", preserved.display()));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        self.import_replace(imported, !corrupt)?;
+        if corrupt {
+            self.data_state = DataState::Ready;
+            self.read_only = self.other_read_only;
+            if !self.other_read_only {
+                self.notice = None;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn import_bytes(&mut self, bytes: &[u8], mode: ImportMode) -> Result<ImportSummary, String> {
         if self.read_only {
             return Err("read_only".to_string());
         }
-        if bytes.len() > IMPORT_MAX_BYTES {
-            return Err("import_too_large".to_string());
-        }
-        let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-        let imported: DataFile =
-            serde_json::from_slice(bytes).map_err(|_| "import_invalid_json".to_string())?;
-        let imported = validate_import(imported)?;
+        let imported = parse_import(bytes, mode == ImportMode::Merge)?;
         {
             // Merge skips active title duplicates; their hotkeys must not block
             // the import. Everything actually inserted is then checked for
@@ -703,24 +792,28 @@ impl Store {
             }
         }
         match mode {
-            ImportMode::Replace => self.import_replace(imported),
+            ImportMode::Replace => self.import_replace(imported, true),
             ImportMode::Merge => self.import_merge(imported),
         }
     }
 
-    fn import_replace(&mut self, imported: DataFile) -> Result<ImportSummary, String> {
+    fn import_replace(
+        &mut self,
+        imported: DataFile,
+        rotate_backup: bool,
+    ) -> Result<ImportSummary, String> {
         let summary = ImportSummary {
             categories_added: imported.categories.len(),
             snippets_added: imported.snippets.len(),
             snippets_skipped: 0,
         };
-        let previous = self.data.clone();
+
         let mut imported = imported;
         // Keep the local in-memory revision as a floor in case revision.hwm is
         // missing or unreadable; the next write must never go backwards.
-        imported.revision = previous.revision;
-        self.data = imported;
-        match self.save_data() {
+        imported.revision = self.data.revision;
+        let previous = std::mem::replace(&mut self.data, imported);
+        match self.persist_data(rotate_backup) {
             Ok(()) => Ok(summary),
             Err(err) => {
                 self.data = previous;
@@ -1363,19 +1456,20 @@ impl Store {
                 rules: RulesFile::default(),
                 read_only: true,
                 notice: Some("data_dir_unavailable".to_string()),
+                data_state: DataState::Unavailable,
+                other_read_only: true,
             };
         }
 
         let mut notice = None;
         let mut read_only = false;
+        let mut data_state = DataState::Ready;
 
         clean_stale_temp(dir);
 
-        // Peek the version before any recovery: a file written by a newer
-        // program must never be replaced by an older backup.
-        let future_data = peek_version(&dir.join(DATA_FILE), "schemaVersion")
-            .map(|version| version > u64::from(SCHEMA_VERSION))
-            .unwrap_or(false);
+        // Check even incompatible layouts before considering a backup.
+        let incompatible_data = peek_version(&dir.join(DATA_FILE), "schemaVersion")
+            .filter(|&version| version != u64::from(SCHEMA_VERSION));
         let future_settings = peek_version(&dir.join(SETTINGS_FILE), "schemaVersion")
             .map(|version| version > u64::from(SCHEMA_VERSION))
             .unwrap_or(false);
@@ -1383,8 +1477,8 @@ impl Store {
             .map(|version| version > 1)
             .unwrap_or(false);
 
-        let (mut data, recovered) = if future_data {
-            logging::warn("storage: data.json schema is newer; skipping recovery");
+        let (mut data, recovered) = if incompatible_data.is_some() {
+            logging::warn("storage: data.json schema unsupported; skipping recovery");
             (
                 read_json::<DataFile>(&dir.join(DATA_FILE)).unwrap_or_default(),
                 None,
@@ -1396,30 +1490,25 @@ impl Store {
                 Err(err) => {
                     logging::error(&format!("storage: data.json unusable: {err}"));
                     notice = Some("data_recovery_failed".to_string());
-                    read_only = true;
+                    data_state = DataState::Corrupt;
                     (DataFile::default(), None)
                 }
             }
         };
 
-        if future_data {
-            notice = Some("schema_newer".to_string());
-            read_only = true;
-        }
-        if data.schema_version > SCHEMA_VERSION {
+        let data_version = incompatible_data.unwrap_or(u64::from(data.schema_version));
+        if data_version > u64::from(SCHEMA_VERSION) {
             logging::warn(&format!(
-                "storage: schema {} is newer than {SCHEMA_VERSION}; read-only",
-                data.schema_version
+                "storage: schema {data_version} is newer than {SCHEMA_VERSION}; read-only"
             ));
             notice = Some("schema_newer".to_string());
-            read_only = true;
-        } else if data.schema_version < SCHEMA_VERSION {
+            data_state = DataState::Incompatible;
+        } else if data_version < u64::from(SCHEMA_VERSION) {
             logging::warn(&format!(
-                "storage: schema {} predates {SCHEMA_VERSION}; read-only until migrated",
-                data.schema_version
+                "storage: schema {data_version} predates {SCHEMA_VERSION}; read-only until migrated"
             ));
             notice = Some("schema_older".to_string());
-            read_only = true;
+            data_state = DataState::Incompatible;
         }
 
         let (settings, settings_recovered) = if future_settings {
@@ -1482,6 +1571,8 @@ impl Store {
             snippet.rebuild_blob();
         }
 
+        let other_read_only = read_only;
+        let read_only = data_state != DataState::Ready || other_read_only;
         let mut store = Self {
             dir: dir.to_path_buf(),
             data,
@@ -1489,6 +1580,8 @@ impl Store {
             rules,
             read_only,
             notice,
+            data_state,
+            other_read_only,
         };
         store.data.revision = store.data.revision.max(read_hwm(dir));
 
@@ -1673,11 +1766,21 @@ impl Store {
         if self.read_only {
             return Err("read_only".to_string());
         }
+        self.persist_data(rotate_backup)
+    }
+
+    // The confirmed recovery path may persist data without unlocking the store.
+    fn persist_data(&mut self, rotate_backup: bool) -> Result<(), String> {
         for snippet in &mut self.data.snippets {
             snippet.rebuild_blob();
         }
         let previous_revision = self.data.revision;
-        let next_revision = self.data.revision.max(read_hwm(&self.dir)) + 1;
+        let next_revision = self
+            .data
+            .revision
+            .max(read_hwm(&self.dir))
+            .checked_add(1)
+            .ok_or("revision_exhausted")?;
         write_hwm(&self.dir, next_revision)?;
         self.data.revision = next_revision;
         match self.write_typed(DATA_FILE, &self.data, rotate_backup) {
@@ -1711,7 +1814,8 @@ impl Store {
             }
             snippet.last_insert_status = Some(status.to_string());
         }
-        match self.save_data() {
+        // Usage metadata must not consume a content restore point.
+        match self.save_data_with(false) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.data.snippets[position] = previous;
@@ -1879,7 +1983,12 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, String> {
 /// as corrupt and replaced by an older backup.
 fn peek_version(path: &Path, key: &str) -> Option<u64> {
     let bytes = fs::read(path).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json_version(&bytes, key)
+}
+
+fn json_version(bytes: &[u8], key: &str) -> Option<u64> {
+    let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     value.get(key)?.as_u64()
 }
 
@@ -1973,20 +2082,66 @@ fn sync_file(path: &Path) -> Result<(), String> {
 }
 
 fn clean_stale_temp(dir: &Path) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(|value| value.ends_with(".tmp"))
-            .unwrap_or(false)
-        {
-            let _ = fs::remove_file(path);
-        }
+    for name in [DATA_FILE, SETTINGS_FILE, RULES_FILE, HWM_FILE] {
+        let _ = fs::remove_file(dir.join(format!("{name}.tmp")));
     }
+}
+
+/// Resolve junctions and alternate spellings before allowing an export.
+fn export_target(dir: &Path, path: &Path) -> Result<PathBuf, String> {
+    fn inside(path: &Path, dir: &Path) -> bool {
+        path.ancestors().any(|part| {
+            part.to_string_lossy().to_uppercase() == dir.to_string_lossy().to_uppercase()
+        })
+    }
+    let name = path.file_name().ok_or("export_path")?;
+    let name_text = name.to_string_lossy();
+    if name_text.contains(':') || name_text.ends_with(['.', ' ']) {
+        return Err("export_path".into());
+    }
+    let resolve = |p: &Path| fs::canonicalize(p).map_err(|err| err.to_string());
+    let parent = resolve(path.parent().ok_or("export_path")?)?;
+    let root = resolve(dir)?;
+    let backup_root = fs::canonicalize(dir.join("backups")).ok();
+    let protected =
+        |p: &Path| inside(p, &root) || backup_root.as_ref().is_some_and(|b| inside(p, b));
+    let target = parent.join(name);
+    if protected(&target) {
+        return Err("export_protected".into());
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(meta) => {
+            if !meta.is_file() || protected(&resolve(&target)?) {
+                return Err("export_protected".into());
+            }
+            // Refuse hard-link aliases too; the export must be a separate file.
+            let file = fs::File::open(&target).map_err(|err| err.to_string())?;
+            let mut info = BY_HANDLE_FILE_INFORMATION::default();
+            unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+                .map_err(|err| err.to_string())?;
+            if info.nNumberOfLinks > 1 {
+                return Err("export_protected".into());
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
+    }
+    Ok(target)
+}
+
+/// Create an exclusive, flushed file; never remove a pre-existing name.
+fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    let result = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result.map_err(|err| err.to_string())
 }
 
 fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Result<(), String> {
@@ -2048,8 +2203,8 @@ fn replace_file(target: &Path, replacement: &Path) -> Result<(), String> {
 }
 
 fn move_file(source: &Path, target: &Path, replace: bool) -> Result<(), String> {
-    let source = platform::wide(&source.to_string_lossy());
-    let target = platform::wide(&target.to_string_lossy());
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
+    let target: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
     let flags = if replace {
         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
     } else {
@@ -2214,6 +2369,179 @@ mod tests {
     }
 
     #[test]
+    fn export_protects_local_files_even_for_an_unreadable_future_library() {
+        let outer = temp_dir("export-protect");
+        let dir = outer.join("library");
+        let store = Store::load_from(&dir);
+        let main = dir.join(DATA_FILE);
+        let future = br#"{"schemaVersion":99,"snippets":{"future":true}}"#;
+        fs::write(&main, future).unwrap();
+        let alias = outer.join("alias.json");
+        fs::hard_link(&main, &alias).unwrap();
+        let backups = dir.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        let unrelated = dir.join("user.tmp");
+        fs::write(&unrelated, b"keep me").unwrap();
+        let locked = Store::load_from(&dir);
+        assert!(locked.is_read_only());
+        for dest in [
+            main,
+            dir.join("DATA.JSON"),
+            dir.join(HWM_FILE),
+            backups.join("data-example.json"),
+            alias.clone(),
+        ] {
+            assert_eq!(locked.export_to(&dest), Err("export_protected".into()));
+        }
+        assert_eq!(fs::read(alias).unwrap(), future);
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep me");
+        let export = outer.join("export.json");
+        fs::write(&export, b"previous export").unwrap();
+        assert_eq!(
+            locked.export_to(&export),
+            Err("export_data_unavailable".into())
+        );
+        assert_eq!(fs::read(&export).unwrap(), b"previous export");
+        store.export_to(&export).unwrap();
+        assert!(read_json::<DataFile>(&export).is_ok());
+        let _ = fs::remove_dir_all(outer);
+    }
+
+    #[test]
+    fn usage_updates_keep_all_content_restore_points() {
+        let dir = temp_dir("usage-backups");
+        let mut store = Store::load_from(&dir);
+        let id = store
+            .add_snippet("usage", "stored text", None, false)
+            .unwrap();
+        let before = backups(&dir, DATA_FILE);
+        assert!(!before.is_empty());
+        for _ in 0..BACKUP_KEEP + 1 {
+            store.record_use(&id, "rejected").unwrap();
+        }
+        store.record_use(&id, "accepted").unwrap();
+        assert_eq!(backups(&dir, DATA_FILE), before);
+        assert_eq!(Store::load_from(&dir).get(&id).unwrap().use_count, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn confirmed_recovery_preserves_corrupt_main_and_removes_conflicting_hotkey() {
+        let dir = temp_dir("manual-recovery");
+        let original = Store::load_from(&dir);
+        let mut backup = original.data.clone();
+        backup.snippets[0].hotkey = Some(original.settings.hotkey.clone());
+        let bytes = serde_json::to_vec(&backup).unwrap();
+        let main = dir.join(DATA_FILE);
+        fs::write(&main, b"damaged library").unwrap();
+        let mut broken = Store::load_from(&dir);
+        assert!(broken.is_read_only());
+        assert_eq!(
+            broken.import_bytes(&bytes, ImportMode::Replace),
+            Err("read_only".into())
+        );
+        let blocked_temp = dir.join("data.json.tmp");
+        fs::create_dir(&blocked_temp).unwrap();
+        assert!(broken.restore_bytes(&bytes).is_err());
+        assert!(broken.is_read_only());
+        assert_eq!(fs::read(&main).unwrap(), b"damaged library");
+        fs::remove_dir(&blocked_temp).unwrap();
+        assert_eq!(broken.restore_bytes(&bytes), Ok(1));
+        assert!(!broken.is_read_only());
+        assert!(backups(&dir, DATA_FILE).is_empty());
+        assert!(fs::read_dir(&dir).unwrap().flatten().any(|file| {
+            file.file_name()
+                .to_string_lossy()
+                .starts_with("data-corrupt-")
+                && fs::read(file.path()).unwrap() == b"damaged library"
+        }));
+        let reloaded = Store::load_from(&dir);
+        assert_eq!(
+            reloaded.data.snippets[0].content,
+            backup.snippets[0].content
+        );
+        assert_eq!(reloaded.data.snippets[0].hotkey, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_does_not_unlock_unrelated_settings_protection_or_replace_incompatible_data() {
+        let dir = temp_dir("manual-recovery-guards");
+        let initial = Store::load_from(&dir);
+        let bytes = initial.export_json().unwrap();
+        let main = dir.join(DATA_FILE);
+        let settings = dir.join(SETTINGS_FILE);
+        fs::write(&main, b"damaged library").unwrap();
+        fs::write(&settings, b"damaged settings").unwrap();
+        let mut broken = Store::load_from(&dir);
+        assert_eq!(broken.restore_bytes(bytes.as_bytes()), Ok(0));
+        assert!(broken.is_read_only());
+        assert_eq!(fs::read(&settings).unwrap(), b"damaged settings");
+        assert_eq!(
+            fs::read_dir(dir.join("backups"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0
+        );
+        for version in [0, SCHEMA_VERSION + 1] {
+            let incompatible = format!(r#"{{"schemaVersion":{version},"snippets":{{}}}}"#);
+            fs::write(&main, &incompatible).unwrap();
+            let mut locked = Store::load_from(&dir);
+            assert_eq!(
+                locked.restore_bytes(bytes.as_bytes()),
+                Err("read_only".into())
+            );
+            assert_eq!(fs::read_to_string(&main).unwrap(), incompatible);
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn combined_exports_above_merge_quota_can_be_replaced_or_restored() {
+        let dir = temp_dir("large-library");
+        let mut store = Store::load_from(&dir);
+        let prototype = store.data.snippets[0].clone();
+        for batch in 0..2 {
+            // Two independently valid merge inputs whose combined UTF-8 body is over 20 MiB.
+            let batch = DataFile {
+                snippets: (0..360)
+                    .map(|index| Snippet {
+                        id: format!("bulk-{batch}-{index}"),
+                        title: format!("Library {batch} / {index}"),
+                        content: "字".repeat(CONTENT_MAX_UNITS),
+                        category_id: None,
+                        ..prototype.clone()
+                    })
+                    .collect(),
+                ..DataFile::default()
+            };
+            let bytes = serde_json::to_vec(&batch).unwrap();
+            assert!(bytes.len() < IMPORT_MAX_BYTES);
+            store.import_bytes(&bytes, ImportMode::Merge).unwrap();
+        }
+        let export = store.export_json().unwrap();
+        let count = store.data.snippets.len();
+        assert!(export.len() > IMPORT_MAX_BYTES);
+        assert_eq!(
+            store.import_bytes(export.as_bytes(), ImportMode::Merge),
+            Err("import_too_large".into())
+        );
+        let target_dir = temp_dir("large-library-target");
+        let mut target = Store::load_from(&target_dir);
+        assert_eq!(
+            target
+                .import_bytes(export.as_bytes(), ImportMode::Replace)
+                .unwrap()
+                .snippets_added,
+            count
+        );
+        assert_eq!(target.restore_bytes(export.as_bytes()), Ok(0));
+        assert_eq!(target.data.snippets.len(), count);
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(target_dir);
+    }
+
+    #[test]
     fn old_settings_without_insertion_mode_stay_writable() {
         let dir = temp_dir("oldmode");
         let store = Store::load_from(&dir);
@@ -2251,12 +2579,13 @@ mod tests {
             .find(|snippet| snippet.title == "退款说明")
             .expect("stored snippet");
         assert_eq!(snippet.tags, vec!["退款", "客服", "support"]);
-        let docs = vec![crate::search::Doc {
+        let docs = [crate::search::Doc {
             id: &snippet.id,
             title: &snippet.title,
             content: &snippet.content,
             blob: &snippet.search_blob,
             pinned: false,
+            use_count: snippet.use_count,
             last_used_at: None,
             updated_at: &snippet.updated_at,
             sort_order: snippet.sort_order,
@@ -2312,26 +2641,29 @@ mod tests {
         );
         assert!(store.get(&first).unwrap().search_blob.contains("y"));
         assert_eq!(store.get(&second).unwrap().tags, vec!["y".to_string()]);
-        assert_eq!(store.add_tags(&[second.clone()], &["Y".to_string()]), Ok(0));
         assert_eq!(
-            store.remove_tags(&[first.clone()], &["x".to_string()]),
+            store.add_tags(std::slice::from_ref(&second), &["Y".to_string()]),
+            Ok(0)
+        );
+        assert_eq!(
+            store.remove_tags(std::slice::from_ref(&first), &["x".to_string()]),
             Ok(1)
         );
         assert_eq!(store.get(&first).unwrap().tags, vec!["y".to_string()]);
 
         let too_many: Vec<String> = (0..10).map(|index| format!("z{index}")).collect();
         assert_eq!(
-            store.add_tags(&[second.clone()], &too_many),
+            store.add_tags(std::slice::from_ref(&second), &too_many),
             Err("too_many_tags".to_string())
         );
         assert_eq!(store.get(&second).unwrap().tags, vec!["y".to_string()]);
         assert_eq!(
-            store.add_tags(&[first.clone()], &[]),
+            store.add_tags(std::slice::from_ref(&first), &[]),
             Err("tag_empty".to_string())
         );
         store.read_only = true;
         assert_eq!(
-            store.remove_tags(&[second.clone()], &["y".to_string()]),
+            store.remove_tags(std::slice::from_ref(&second), &["y".to_string()]),
             Err("read_only".to_string())
         );
         store.read_only = false;
@@ -2342,7 +2674,7 @@ mod tests {
         assert!(!store.get(&first).unwrap().tags.contains(&"z".to_string()));
         store.soft_delete(&first).expect("delete");
         assert_eq!(
-            store.add_tags(&[first.clone()], &["deleted".to_string()]),
+            store.add_tags(std::slice::from_ref(&first), &["deleted".to_string()]),
             Ok(1)
         );
         assert!(store
@@ -2660,12 +2992,13 @@ mod tests {
             .iter()
             .find(|snippet| snippet.title == "退款说明")
             .expect("stored snippet");
-        let docs = vec![crate::search::Doc {
+        let docs = [crate::search::Doc {
             id: &snippet.id,
             title: &snippet.title,
             content: &snippet.content,
             blob: &snippet.search_blob,
             pinned: false,
+            use_count: snippet.use_count,
             last_used_at: None,
             updated_at: &snippet.updated_at,
             sort_order: snippet.sort_order,

@@ -1,22 +1,20 @@
 ﻿# Per-snippet hotkey smoke test.
-# Uses an isolated LOCALAPPDATA, posts WM_HOTKEY for the one snippet hotkey and
+# Uses isolated portable data, posts WM_HOTKEY for the one snippet hotkey and
 # asserts that the direct injection reached the separate host process exactly.
 #
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\snippet-hotkey-smoke.ps1 [-SkipBuild]
+# Usage: powershell -ExecutionPolicy Bypass -File scripts\snippet-hotkey-smoke.ps1 -IsolatedDesktop [-SkipBuild]
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$IsolatedDesktop)
 
 $ErrorActionPreference = "Stop"
+if (-not $IsolatedDesktop) { throw "Run only on an isolated interactive desktop, with -IsolatedDesktop. Clipboard contents may change." }
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
 $probe = Join-Path $root "target\host-probe.exe"
-$isolated = Join-Path $env:TEMP "qp-snippet-hotkey-smoke"
-$dataDir = Join-Path $isolated "QuickPhrase"
 $expected = "快捷键直出内容"
 $hotkey = "Ctrl+Shift+F9"
-
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -28,8 +26,11 @@ if (-not $SkipBuild) {
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 if (-not (Test-Path $probe)) { throw "missing $probe (build scripts\host-probe.rs first)" }
 
-Remove-Item -Recurse -Force $isolated -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+$outDir = $qpRun.Directory
+try {
+$dataDir = $qpRun.Data
 $data = @{
     schemaVersion = 1
     revision = 0
@@ -55,11 +56,6 @@ $data = @{
 }
 $json = $data | ConvertTo-Json -Depth 8
 [IO.File]::WriteAllText((Join-Path $dataDir "data.json"), $json, (New-Object Text.UTF8Encoding($false)))
-
-$env:LOCALAPPDATA = $isolated
-$log = Join-Path $dataDir ("logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
-$outDir = Join-Path $env:TEMP "qp-host-probe"
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
 Add-Type -TypeDefinition @"
 using System;
@@ -90,7 +86,8 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
 function Find-WindowByClass([string]$Class) {
     $script:found = [IntPtr]::Zero
     $cb = [QPSnippetHotkey+EnumProc]{
-        param($h, $l)
+        param($h, $unused)
+        if (-not (Test-QPTestWindow $h)) { return $true }
         $sb = New-Object System.Text.StringBuilder 256
         [void][QPSnippetHotkey]::GetClassName($h, $sb, 256)
         if ($sb.ToString() -eq $Class) { $script:found = $h; return $false }
@@ -120,7 +117,7 @@ function Focus-Window([IntPtr]$Window) {
     return ([QPSnippetHotkey]::GetForegroundWindow() -eq $Window)
 }
 
-$qp = Start-Process -FilePath $exe -PassThru
+$qp = Start-QPTest
 Start-Sleep -Milliseconds 1500
 $main = Find-WindowByClass "QuickPhrase.MainWindow"
 Check "main window found" ($main -ne [IntPtr]::Zero) ("hwnd=" + $main)
@@ -128,8 +125,7 @@ if ($main -eq [IntPtr]::Zero) { throw "QuickPhrase main window not found" }
 
 $hwndFile = Join-Path $outDir "snippet-hotkey-hwnd.txt"
 $textFile = Join-Path $outDir "snippet-hotkey-text.txt"
-Remove-Item $hwndFile, $textFile -ErrorAction SilentlyContinue
-$hostProcess = Start-Process -FilePath $probe -ArgumentList @($textFile, $hwndFile) -PassThru
+$hostProcess = Start-QPTest -Probe $probe -Arguments @($textFile, $hwndFile)
 for ($i = 0; $i -lt 40 -and -not (Test-Path $hwndFile); $i++) { Start-Sleep -Milliseconds 250 }
 if (-not (Test-Path $hwndFile)) { throw "host probe did not publish its HWND" }
 $hostWindow = [IntPtr][int64](Get-Content $hwndFile -Raw).Trim()
@@ -138,18 +134,13 @@ Check "host window created" ($hostWindow -ne [IntPtr]::Zero) ("hwnd=" + $hostWin
 $focused = Focus-Window $hostWindow
 Check "host focused" $focused ("fg=" + [QPSnippetHotkey]::GetForegroundWindow())
 if (-not $focused) {
-    try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
     "FAIL: cannot bring the host probe to the foreground"
     exit 2
 }
 Start-Sleep -Milliseconds 400
 
-$clipboardOk = $false
-try {
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.Clipboard]::SetText("QP_SNIPPET_HOTKEY_SENTINEL")
-    $clipboardOk = $true
-} catch { }
+# Observe the sequence without replacing the user's clipboard with a sentinel.
+$clipboardBefore = [QPTestNative]::GetClipboardSequenceNumber()
 
 $before = 0
 if (Test-Path $log) { $before = @(Get-Content $log -Encoding UTF8).Count }
@@ -180,12 +171,8 @@ $panel = Find-WindowByClass "QuickPhrase.Panel"
 $panelVisible = $panel -ne [IntPtr]::Zero -and [QPSnippetHotkey]::IsWindowVisible($panel)
 Check "panel not opened" (-not $panelVisible) ("visible=" + $panelVisible)
 
-if ($clipboardOk) {
-    $clip = [System.Windows.Forms.Clipboard]::GetText()
-    Check "clipboard untouched on accepted path" ($clip -eq "QP_SNIPPET_HOTKEY_SENTINEL") ("clipboard=" + $clip)
-} else {
-    Check "clipboard access available" $false "clipboard access unavailable"
-}
+$clipboardAfter = [QPTestNative]::GetClipboardSequenceNumber()
+Check "clipboard untouched on accepted path" ($clipboardBefore -ne 0 -and $clipboardBefore -eq $clipboardAfter) "sequence=$clipboardBefore -> $clipboardAfter"
 
 # --- self-window guard: pressing the snippet hotkey inside QuickPhrase must
 # not copy, inject, or bump useCount.
@@ -210,17 +197,17 @@ if ($manage -ne [IntPtr]::Zero -and $selfFocused) {
     $dataPath = Join-Path $dataDir "data.json"
     $beforeData = [IO.File]::ReadAllText($dataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     $beforeUseCount = [int64]$beforeData.snippets[0].useCount
-    [System.Windows.Forms.Clipboard]::SetText("QP_SELF_SENTINEL")
+    $selfClipboardBefore = [QPTestNative]::GetClipboardSequenceNumber()
     $selfBefore = 0
     if (Test-Path $log) { $selfBefore = @(Get-Content $log -Encoding UTF8).Count }
     [void][QPSnippetHotkey]::PostMessage($main, $WM_HOTKEY, [IntPtr]1000, [IntPtr]::Zero)
     Start-Sleep -Milliseconds 1200
-    $selfClip = [System.Windows.Forms.Clipboard]::GetText()
+    $selfClip = [QPTestNative]::GetClipboardSequenceNumber()
     $afterData = [IO.File]::ReadAllText($dataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
     $afterUseCount = [int64]$afterData.snippets[0].useCount
     $selfLines = if (Test-Path $log) { (@(Get-Content $log -Encoding UTF8 | Select-Object -Skip $selfBefore)) -join "`n" } else { "" }
     Check "self hotkey ignored" ($selfLines -match "foreground is QuickPhrase itself") ""
-    Check "self clipboard untouched" ($selfClip -eq "QP_SELF_SENTINEL") ("clipboard=" + $selfClip)
+    Check "self clipboard untouched" ($selfClipboardBefore -ne 0 -and $selfClip -eq $selfClipboardBefore) "sequence=$selfClipboardBefore -> $selfClip"
     Check "self useCount unchanged" ($afterUseCount -eq $beforeUseCount) ("before=$beforeUseCount after=$afterUseCount")
 } else {
     Check "self hotkey ignored" $false "manage window unavailable or unfocused"
@@ -228,12 +215,12 @@ if ($manage -ne [IntPtr]::Zero -and $selfFocused) {
     Check "self useCount unchanged" $false "manage window unavailable or unfocused"
 }
 
-try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
 
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

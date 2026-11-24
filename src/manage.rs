@@ -293,6 +293,7 @@ fn active_rows(
             content: &snippet.content,
             blob: &snippet.search_blob,
             pinned: snippet.pinned,
+            use_count: snippet.use_count,
             last_used_at: snippet.last_used_at.as_deref(),
             updated_at: &snippet.updated_at,
             sort_order: snippet.sort_order,
@@ -2727,7 +2728,7 @@ fn create(owner: HWND) -> Option<Manage> {
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
     ui::install_smooth_edit(content_edit);
     ui::theme_scrollbar(content_edit, palette.dark);
-    ui::cue_banner(search, "搜索标题、正文、标签或拼音…");
+    ui::cue_banner(search, "搜索标题、正文、标签或拼音；\\# 搜索井号");
     ui::cue_banner(title_edit, "例如：项目进度回复、会议纪要模板…");
     ui::cue_banner(cat_name, "新分类名称…");
     ui::cue_banner(content_edit, "在此输入短语正文，支持多行文本…");
@@ -2938,39 +2939,48 @@ pub fn show(owner: HWND) {
         unsafe {
             let _ = SetFocus(Some(manage.search));
         }
-        reload_left(manage);
-        reload_categories(manage);
-        reload_tag_filter(manage);
-        reload_list(manage);
-        // Reopen a clean editor from the store, so an import or restore cannot
-        // leave stale text that overwrites a new snippet on save. An unsaved
-        // draft is left untouched: silently replacing it here would lose the
-        // user's edits, and other navigation paths already ask before
-        // discarding.
-        if !manage.dirty {
-            let editing = manage.editing.clone();
-            let still_exists = editing
-                .as_deref()
-                .map(|id| manage.phrase_rows.iter().any(|row| row.id == id))
-                .unwrap_or(false);
-            let next = if still_exists {
-                editing
-            } else {
-                manage.phrase_rows.first().map(|row| row.id.clone())
-            };
-            if let Some(id) = next.as_deref() {
-                if let Some(position) = manage.phrase_rows.iter().position(|row| row.id == id) {
-                    manage.selected = Some(position);
-                    select_list_row(manage, position);
-                }
-            }
-            load_editor(manage, next.as_deref());
-        }
-        relayout(manage);
-        unsafe {
-            let _ = InvalidateRect(Some(manage.hwnd), None, true);
+        refresh_library(manage, false);
+    });
+}
+
+/// Refresh an open editor after a confirmed replacement without changing focus.
+/// Call only after `confirm_exit` accepted discarding any unsaved draft.
+pub fn library_replaced() {
+    MANAGE.with(|slot| {
+        if let Some(manage) = slot.borrow_mut().as_mut() {
+            refresh_library(manage, true);
         }
     });
+}
+
+fn refresh_library(manage: &mut Manage, replace_editor: bool) {
+    reload_left(manage);
+    reload_categories(manage);
+    reload_tag_filter(manage);
+    reload_list(manage);
+    if replace_editor || !manage.dirty {
+        let editing = manage.editing.clone();
+        let still_exists = editing
+            .as_deref()
+            .map(|id| manage.phrase_rows.iter().any(|row| row.id == id))
+            .unwrap_or(false);
+        let next = if still_exists {
+            editing
+        } else {
+            manage.phrase_rows.first().map(|row| row.id.clone())
+        };
+        if let Some(id) = next.as_deref() {
+            if let Some(position) = manage.phrase_rows.iter().position(|row| row.id == id) {
+                manage.selected = Some(position);
+                select_list_row(manage, position);
+            }
+        }
+        load_editor(manage, next.as_deref());
+    }
+    relayout(manage);
+    unsafe {
+        let _ = InvalidateRect(Some(manage.hwnd), None, true);
+    }
 }
 
 /// Open management with a blank editor, used by the tray "quick add" entry.

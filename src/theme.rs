@@ -244,8 +244,8 @@ mod tests {
 
     #[test]
     fn explicit_preferences_resolve() {
-        assert_eq!(resolve("light").dark, false);
-        assert_eq!(resolve("dark").dark, true);
+        assert!(!resolve("light").dark);
+        assert!(resolve("dark").dark);
         assert!(contrast_ratio(LIGHT.heading, LIGHT.card) >= 4.5);
         assert!(contrast_ratio(DARK.heading, DARK.card) >= 4.5);
     }

@@ -55,10 +55,24 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     let _mutex = match single_instance::acquire() {
         single_instance::Acquire::First(handle) => handle,
         single_instance::Acquire::AlreadyRunning => {
-            if single_instance::signal_existing() {
+            // Smoke runs may signal only their own known primary process.
+            let expected_pid = std::env::var_os("QUICKPHRASE_TEST_WAKE_PID").map(|value| {
+                value
+                    .to_str()
+                    .and_then(|text| text.parse::<u32>().ok())
+                    .unwrap_or(0)
+            });
+            if expected_pid == Some(0) {
+                logging::warn("another instance is running; isolated test will not signal it");
+                return 2;
+            }
+            if single_instance::signal_existing(expected_pid) {
                 logging::info("signalled the running instance");
             } else {
                 logging::warn("another instance is running but did not respond to activation");
+                if expected_pid.is_some() {
+                    return 2;
+                }
                 platform::error_box(
                     "QuickPhrase 已在运行",
                     "另一个 QuickPhrase 实例正在运行，但未能唤起它。请通过托盘图标打开。",
@@ -436,17 +450,13 @@ fn handle_command(id: u32) {
         ID_RESTORE_CLIP => {
             let hwnd = STATE.with(|state| state.borrow().hwnd);
             match clipboard::last_snapshot() {
-                Some(snapshot) if snapshot.text.is_some() => {
-                    if clipboard::restore(&snapshot) {
+                Some(snapshot) if snapshot.can_restore() => {
+                    if clipboard::restore(hwnd, &snapshot) {
                         if !hwnd.0.is_null() {
                             tray::balloon(hwnd, "QuickPhrase", "已恢复上次剪贴板内容");
                         }
                     } else if !hwnd.0.is_null() {
-                        tray::balloon(
-                            hwnd,
-                            "QuickPhrase",
-                            "无法恢复：剪贴板内容已变化（可能已恢复过，或被其他程序修改）",
-                        );
+                        tray::balloon(hwnd, "QuickPhrase", "无法恢复：剪贴板已变化或当前不可用");
                     }
                 }
                 _ => {
@@ -711,7 +721,13 @@ fn hotkey_snippet(snippet_id: &str) {
                 },
                 keep_tabs,
             };
-            let outcome = inject::run(&report, &content, monitor_ok, options);
+            let outcome = inject::run(
+                &report,
+                &content,
+                monitor_ok,
+                options,
+                HWND(notify_raw as *mut core::ffi::c_void),
+            );
             let message = outcome.describe();
             logging::info(&format!(
                 "snippet hotkey inject outcome: {message} ({} ms)",
@@ -748,7 +764,7 @@ fn foreground_is_self() -> bool {
 }
 
 fn copy_only_direct(main: HWND, snippet_id: &str, content: &str, reason: &str) {
-    let (copied, snapshot) = clipboard::set_text_with_snapshot(content);
+    let (copied, snapshot) = clipboard::set_text_with_snapshot(main, content);
     storage::record_use(snippet_id, "rejected");
     logging::info(&format!(
         "snippet hotkey copy-only: reason={reason} copied={copied} non_text={} read_ok={}",
@@ -759,14 +775,8 @@ fn copy_only_direct(main: HWND, snippet_id: &str, content: &str, reason: &str) {
     }
     let message = if !copied {
         format!("复制失败（{reason}）")
-    } else if !snapshot.read_ok {
-        format!("已复制（{reason}；原剪贴板内容无法确认，可能不可恢复）")
-    } else if snapshot.had_non_text {
-        format!("已复制（{reason}；原剪贴板含非文本内容，仅文本可恢复）")
-    } else if snapshot.text.is_some() {
-        format!("已复制（{reason}；原剪贴板内容已被替换）")
     } else {
-        format!("已复制（{reason}）")
+        format!("已复制（{reason}；{}）", snapshot.previous_text_status())
     };
     tray::balloon(main, "QuickPhrase", &message);
 }

@@ -12,9 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
     GetWindowTextW, IsHungAppWindow, IsWindow, LoadCursorW, PeekMessageW, RegisterClassW,
-    SetForegroundWindow, ShowWindow, TranslateMessage, ES_MULTILINE, HMENU, IDC_ARROW, MSG,
-    PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE, WS_VSCROLL,
+    SetForegroundWindow, SetWindowTextW, ShowWindow, TranslateMessage, ES_MULTILINE, HMENU,
+    IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE, WS_VSCROLL,
 };
 
 use crate::capture::{Report, Target, Timings};
@@ -83,7 +83,7 @@ impl Outcome {
                 if !*read_ok {
                     format!("未输入，已复制（{reason}；原剪贴板内容无法确认）")
                 } else if *restorable {
-                    format!("未输入，已复制（{reason}；原剪贴板内容可在托盘恢复）")
+                    format!("未输入，已复制（{reason}；原纯文本可在托盘恢复，其他格式不可恢复）")
                 } else {
                     format!("未输入，已复制（{reason}；原剪贴板无可恢复的纯文本）")
                 }
@@ -101,19 +101,20 @@ impl Outcome {
     }
 }
 
-pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Outcome {
+/// Insert into the captured target, or copy from the application's `owner` window.
+pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options, owner: HWND) -> Outcome {
     let target = HWND(report.target.hwnd as *mut core::ffi::c_void);
     unsafe {
         let _ = SetForegroundWindow(target);
     }
 
     if !monitor_ok {
-        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(owner, raw);
         logging::warn("inject rejected: foreground monitor unavailable");
         return Outcome::Rejected {
             reason: "monitor_unavailable",
             copied,
-            restorable: snapshot.text.is_some(),
+            restorable: snapshot.can_restore(),
             read_ok: snapshot.read_ok,
         };
     }
@@ -131,41 +132,41 @@ pub fn run(report: &Report, raw: &str, monitor_ok: bool, options: Options) -> Ou
     let (text, paste) = match plan {
         Plan::Insert { text, paste } => (text, paste),
         Plan::CopyOnly(reason) => {
-            let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
+            let (copied, snapshot) = clipboard::set_text_with_snapshot(owner, raw);
             logging::info(&format!("inject copy-only: {reason} copied={copied}"));
             return Outcome::Rejected {
                 reason,
                 copied,
-                restorable: snapshot.text.is_some(),
+                restorable: snapshot.can_restore(),
                 read_ok: snapshot.read_ok,
             };
         }
     };
 
     if let Err(reason) = guard(report) {
-        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(owner, raw);
         logging::warn(&format!("inject rejected: {reason} copied={copied}"));
         return Outcome::Rejected {
             reason,
             copied,
-            restorable: snapshot.text.is_some(),
+            restorable: snapshot.can_restore(),
             read_ok: snapshot.read_ok,
         };
     }
 
     if !final_check(report, target) {
-        let (copied, snapshot) = clipboard::set_text_with_snapshot(raw);
+        let (copied, snapshot) = clipboard::set_text_with_snapshot(owner, raw);
         logging::warn("inject rejected: foreground_changed_at_send");
         return Outcome::Rejected {
             reason: "foreground_changed_at_send",
             copied,
-            restorable: snapshot.text.is_some(),
+            restorable: snapshot.can_restore(),
             read_ok: snapshot.read_ok,
         };
     }
 
     if paste {
-        return run_paste(&text, target);
+        return run_paste(&text, report, target, owner);
     }
 
     let inputs = build_inputs(&text);
@@ -415,10 +416,10 @@ fn modifier_down(key: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY) 
     unsafe { GetAsyncKeyState(key.0 as i32) < 0 }
 }
 
-fn run_paste(text: &str, target: HWND) -> Outcome {
+fn run_paste(text: &str, report: &Report, target: HWND, owner: HWND) -> Outcome {
     // Writing the clipboard is the compatibility mode's core cost; the snapshot
     // keeps the previous plain text restorable from tray/settings.
-    let (stored, snapshot) = clipboard::set_text_with_snapshot(text);
+    let (stored, snapshot) = clipboard::set_text_with_snapshot(owner, text);
     if !stored {
         logging::warn("paste mode: clipboard write failed");
         return Outcome::Rejected {
@@ -430,21 +431,16 @@ fn run_paste(text: &str, target: HWND) -> Outcome {
     }
     let written_sequence = snapshot.sequence;
 
-    // The clipboard write can take a few milliseconds; verify the target still
-    // owns the foreground right before Ctrl+V goes out.
-    if unsafe { GetForegroundWindow() } != target {
-        logging::warn("paste mode: foreground changed before Ctrl+V");
-        return Outcome::Rejected {
-            reason: "foreground_changed_before_paste",
-            copied: true,
-            restorable: snapshot.text.is_some(),
-            read_ok: snapshot.read_ok,
-        };
-    }
-
+    let inputs = build_paste_inputs();
+    // Writing or rendering clipboard data may block. Check the actual control
+    // again (including same-window focus changes), then verify the clipboard.
+    let target_ok = final_check(report, target)
+        && ![VK_CONTROL, VK_MENU, VK_SHIFT, VK_LWIN, VK_RWIN]
+            .into_iter()
+            .any(modifier_down);
     // Someone replaced the clipboard after our write: paste would insert their
     // text. Abort instead of pasting the wrong content.
-    if clipboard::sequence() != written_sequence {
+    if written_sequence == 0 || clipboard::sequence() != written_sequence {
         logging::warn("paste mode: clipboard changed before Ctrl+V");
         return Outcome::Rejected {
             reason: "clipboard_changed_before_paste",
@@ -454,7 +450,16 @@ fn run_paste(text: &str, target: HWND) -> Outcome {
         };
     }
 
-    let inputs = build_paste_inputs();
+    if !target_ok {
+        logging::warn("paste mode: target or modifiers changed before Ctrl+V");
+        return Outcome::Rejected {
+            reason: "target_changed_before_paste",
+            copied: true,
+            restorable: snapshot.can_restore(),
+            read_ok: snapshot.read_ok,
+        };
+    }
+
     let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
 
     if sent == 0 {
@@ -554,7 +559,9 @@ unsafe extern "system" fn test_wndproc(
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
-pub fn selftest() -> bool {
+/// Drive a disposable Win32 EDIT; `with_paste` also writes the clipboard and
+/// must only be used on an isolated interactive desktop.
+pub fn selftest(with_paste: bool) -> bool {
     unsafe {
         let module = match GetModuleHandleW(None) {
             Ok(module) => module,
@@ -657,21 +664,95 @@ pub fn selftest() -> bool {
             foreground_events: Vec::new(),
         };
 
-        let outcome = run(&report, "Injected 测试\r\n第二行", true, Options::default());
+        let outcome = run(
+            &report,
+            "Injected 测试\r\n第二行",
+            true,
+            Options::default(),
+            window,
+        );
         pump(Duration::from_millis(400));
 
-        let mut buffer = [0u16; 512];
-        let length = GetWindowTextW(edit, &mut buffer);
-        let text = String::from_utf16_lossy(&buffer[..length.max(0) as usize]);
-        let _ = DestroyWindow(window);
-
-        let ok = matches!(outcome, Outcome::Accepted) && text == "Injected 测试\r\n第二行";
+        let text = test_edit_text(edit);
+        let unicode_ok = matches!(outcome, Outcome::Accepted) && text == "Injected 测试\r\n第二行";
         logging::info(&format!(
             "inject selftest: outcome={} text={text:?}",
             outcome.describe()
         ));
-        ok
+        let paste_ok =
+            !with_paste || (unicode_ok && paste_selftest(window, edit, instance, &report));
+        let _ = DestroyWindow(window);
+        unicode_ok && paste_ok
     }
+}
+
+unsafe fn test_edit_text(edit: HWND) -> String {
+    let mut buffer = [0u16; 512];
+    let length = GetWindowTextW(edit, &mut buffer);
+    String::from_utf16_lossy(&buffer[..length.max(0) as usize])
+}
+
+unsafe fn paste_selftest(window: HWND, edit: HWND, instance: HINSTANCE, report: &Report) -> bool {
+    const TEXT: &str = "Paste 测试";
+    let Ok(other_edit) = CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        w!("EDIT"),
+        w!(""),
+        WS_CHILD | WS_VISIBLE,
+        10,
+        153,
+        480,
+        24,
+        Some(window),
+        Some(HMENU(std::ptr::without_provenance_mut(2))),
+        Some(instance),
+        None,
+    ) else {
+        return false;
+    };
+    if SetWindowTextW(edit, w!("")).is_err() {
+        return false;
+    }
+    let _ = SetFocus(Some(edit));
+    let outcome = run(
+        report,
+        TEXT,
+        true,
+        Options {
+            mode: InsertionMode::Paste,
+            keep_tabs: false,
+        },
+        window,
+    );
+    pump(Duration::from_millis(400));
+    let normal_ok = matches!(outcome, Outcome::Accepted) && test_edit_text(edit) == TEXT;
+    logging::info(&format!("inject selftest paste: normal={normal_ok}"));
+    if !normal_ok {
+        return false;
+    }
+    // Model a focus change after the original guard, while still in the same
+    // top-level window. Only run_paste's final guard can reject this commit.
+    let _ = SetFocus(Some(other_edit));
+    if GetForegroundWindow() != window
+        || context::focused_window(report.target.tid) != Some(other_edit)
+    {
+        return false;
+    }
+    let outcome = run_paste("must not paste", report, window, window);
+    pump(Duration::from_millis(400));
+    let focus_ok = matches!(
+        outcome,
+        Outcome::Rejected {
+            reason: "target_changed_before_paste",
+            copied: true,
+            ..
+        }
+    ) && test_edit_text(other_edit).is_empty()
+        && test_edit_text(edit) == TEXT;
+    logging::info(&format!(
+        "inject selftest paste: focus_change_rejected={focus_ok}"
+    ));
+    focus_ok
 }
 
 fn force_foreground(window: HWND) {

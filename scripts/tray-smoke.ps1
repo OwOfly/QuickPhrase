@@ -1,20 +1,13 @@
-﻿# M1-6 tray smoke test
+# M1-6 tray smoke test
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\tray-smoke.ps1 [-SkipBuild]
 
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
-
-# The panel may open on a locked desktop; keep injection out of the smoke run.
-$env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
-$env:QUICKPHRASE_TEST_NO_INJECT = "1"
-$env:QUICKPHRASE_TEST_NO_ANIMATION = "1"
-
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 400
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -27,6 +20,9 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -58,7 +54,8 @@ function Test-HotkeyFree {
 function Find-Class([string]$Class) {
     $script:found = [IntPtr]::Zero
     $cb = [QPTray+EnumProc]{
-        param($h, $l)
+        param($h, $unused)
+        if (-not (Test-QPTestWindow $h)) { return $true }
         $sb = New-Object System.Text.StringBuilder 256
         [void][QPTray]::GetClassName($h, $sb, 256)
         if ($sb.ToString() -eq $Class) {
@@ -127,7 +124,7 @@ function Wait-PanelVisible([int]$TimeoutMs) {
 $before = 0
 if (Test-Path $log) { $before = (Get-Item $log).Length }
 
-$app = Start-Process -FilePath $exe -PassThru
+$app = Start-QPTest -PanelWithoutInjection
 Start-Sleep -Milliseconds 1500
 $main = Find-Main
 Check "app running" (-not $app.HasExited) ("pid=" + $app.Id)
@@ -152,11 +149,11 @@ Check "pause hotkey" ($text -match "hotkey paused") ""
 Check "resume hotkey" ($text -match "hotkey resumed") ""
 
 # Second instance opens the panel and exits; a second run must not close it.
-$second = Start-Process -FilePath $exe -PassThru
+$second = Start-QPTest -WakePid $app.Id
 $secondExited = Wait-Exit $second 10000
 Check "second instance exits" $secondExited ("exit=" + $(if ($second.HasExited) { $second.ExitCode } else { "running" }))
 Check "second instance exits 0" ($second.HasExited -and $second.ExitCode -eq 0) ("exit=" + $(if ($second.HasExited) { $second.ExitCode } else { "running" }))
-if (-not $second.HasExited) { Stop-Process -Id $second.Id -Force }
+if (-not $second.HasExited) { Stop-QPTestProcess $second }
 Start-Sleep -Milliseconds 900
 $lines = Read-NewLog $before $log
 $text = $lines -join "`n"
@@ -170,10 +167,10 @@ if ($panel -eq [IntPtr]::Zero -or -not [QPTray]::IsWindowVisible($panel)) {
     $panel = Wait-PanelVisible 3000
 }
 
-$second2 = Start-Process -FilePath $exe -PassThru
+$second2 = Start-QPTest -WakePid $app.Id
 $second2Exited = Wait-Exit $second2 10000
 Check "second instance (panel open) exits 0" ($second2Exited -and $second2.ExitCode -eq 0) ("exit=" + $(if ($second2.HasExited) { $second2.ExitCode } else { "running" }))
-if (-not $second2.HasExited) { Stop-Process -Id $second2.Id -Force }
+if (-not $second2.HasExited) { Stop-QPTestProcess $second2 }
 Start-Sleep -Milliseconds 900
 $panel = Find-Class "QuickPhrase.Panel"
 Check "second instance keeps an open panel" ($panel -ne [IntPtr]::Zero -and [QPTray]::IsWindowVisible($panel)) ""
@@ -193,15 +190,16 @@ $lines = Read-NewLog $before $log
 $text = $lines -join "`n"
 Check "message loop ended" ($text -match "message loop ended") ""
 
-if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+if (-not $app.HasExited) { Stop-QPTestProcess $app }
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
 "--- tray log ---"
 $lines | Where-Object { $_ -match "tray|hotkey|second instance|exit" } | ForEach-Object { $_ }
 
-Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL, Env:QUICKPHRASE_TEST_NO_INJECT, Env:QUICKPHRASE_TEST_NO_ANIMATION -ErrorAction SilentlyContinue
-
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

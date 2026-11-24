@@ -2,20 +2,16 @@
 # A separate process (target\host-probe.exe) owns a plain Win32 EDIT. QuickPhrase
 # must capture it, show the panel, and inject the first hard-coded phrase into it.
 #
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\host-matrix.ps1 [-SkipBuild]
+# Usage: powershell -ExecutionPolicy Bypass -File scripts\host-matrix.ps1 -IsolatedDesktop [-SkipBuild]
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$IsolatedDesktop)
 
 $ErrorActionPreference = "Stop"
+if (-not $IsolatedDesktop) { throw "Run only on an isolated interactive desktop, with -IsolatedDesktop. Clipboard contents may change." }
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format "yyyy-MM-dd"))
-$outDir = Join-Path $env:TEMP "qp-host-probe"
-
-# The resident instance locks target\release\quickphrase.exe, so stop it before
-# building; the test starts a fresh process afterwards.
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 400
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -26,6 +22,10 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+$outDir = $qpRun.Directory
+try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -62,7 +62,8 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
 function Find-WindowByClass([string]$Class) {
     $script:found = [IntPtr]::Zero
     $cb = [QPHost+EnumProc]{
-        param($h, $l)
+        param($h, $unused)
+        if (-not (Test-QPTestWindow $h)) { return $true }
         $sb = New-Object System.Text.StringBuilder 256
         [void][QPHost]::GetClassName($h, $sb, 256)
         if ($sb.ToString() -eq $Class) { $script:found = $h; return $false }
@@ -95,13 +96,10 @@ function Focus-Window([IntPtr]$Window) {
 # The automation desktop refuses foreground handoff to the panel. Allow it to
 # stay visible without focus; the probe window keeps the real focus, so the
 # injection guards still run against a live target.
-$env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL = "1"
-Remove-Item Env:QUICKPHRASE_TEST_NO_INJECT -ErrorAction SilentlyContinue
 
 # --- start QuickPhrase ---------------------------------------------------
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
 Start-Sleep -Milliseconds 400
-$qp = Start-Process -FilePath $exe -PassThru
+$qp = Start-QPTest -AllowUnfocusedPanel
 Start-Sleep -Milliseconds 1200
 $main = Find-WindowByClass "QuickPhrase.MainWindow"
 if ($main -eq [IntPtr]::Zero) { throw "QuickPhrase main window not found" }
@@ -112,10 +110,8 @@ if (-not (Test-Path $probe)) { throw "missing $probe (build scripts\host-probe.r
 
 $hwndFile = Join-Path $outDir "host-hwnd.txt"
 $textFile = Join-Path $outDir "host-text.txt"
-Remove-Item $hwndFile, $textFile -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-$hostProcess = Start-Process -FilePath $probe -ArgumentList @($textFile, $hwndFile) -PassThru
+$hostProcess = Start-QPTest -Probe $probe -Arguments @($textFile, $hwndFile)
 for ($i = 0; $i -lt 40 -and -not (Test-Path $hwndFile); $i++) { Start-Sleep -Milliseconds 250 }
 if (-not (Test-Path $hwndFile)) { throw "host probe did not publish its HWND" }
 $hostWindow = [IntPtr][int64](Get-Content $hwndFile -Raw).Trim()
@@ -124,19 +120,13 @@ Check "host window created" ($hostWindow -ne [IntPtr]::Zero) ("hwnd=" + $hostWin
 $focused = Focus-Window $hostWindow
 Check "host focused" $focused ("fg=" + [QPHost]::GetForegroundWindow())
 if (-not $focused) {
-    try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
     "FAIL: cannot bring the host probe to the foreground (locked desktop or foreground lock)"
     exit 2
 }
 Start-Sleep -Milliseconds 500
 
-# Clipboard sentinel: an accepted injection must not touch the clipboard.
-$clipboardOk = $false
-try {
-    Add-Type -AssemblyName System.Windows.Forms
-    [System.Windows.Forms.Clipboard]::SetText("QP_CLIPBOARD_SENTINEL")
-    $clipboardOk = $true
-} catch { }
+# Observe the sequence without replacing the user's clipboard with a sentinel.
+$clipboardBefore = [QPTestNative]::GetClipboardSequenceNumber()
 
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
@@ -178,15 +168,8 @@ Check "SendInput accepted" ($newText -match "inject accepted:") ""
 Check "outcome reported" ($newText -match "inject outcome:") ""
 Check "inserted text matches exactly" ($text -eq $EXPECTED) ("got=" + ($text -replace "`r", "\r" -replace "`n", "\n"))
 
-if ($clipboardOk) {
-    $clip = [System.Windows.Forms.Clipboard]::GetText()
-    Check "clipboard untouched on accepted path" ($clip -eq "QP_CLIPBOARD_SENTINEL") ("clipboard=" + $clip)
-} else {
-    Check "clipboard untouched on accepted path" $true "clipboard access unavailable"
-}
-
-try { Stop-Process -Id $hostProcess.Id -Force -ErrorAction SilentlyContinue } catch { }
-Remove-Item Env:QUICKPHRASE_TEST_ALLOW_UNFOCUSED_PANEL -ErrorAction SilentlyContinue
+$clipboardAfter = [QPTestNative]::GetClipboardSequenceNumber()
+Check "clipboard untouched on accepted path" ($clipboardBefore -ne 0 -and $clipboardBefore -eq $clipboardAfter) "sequence=$clipboardBefore -> $clipboardAfter"
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
@@ -198,3 +181,6 @@ $newLines | Where-Object { $_ -match "capture:|inject|panel commit|position" } |
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

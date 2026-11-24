@@ -1,16 +1,14 @@
 # M0-4 injection smoke test
-# Usage: powershell -ExecutionPolicy Bypass -File scripts\inject-smoke.ps1 [-SkipBuild]
+# Usage: powershell -ExecutionPolicy Bypass -File scripts\inject-smoke.ps1 -IsolatedDesktop [-SkipBuild]
 
-param([switch]$SkipBuild)
+param([switch]$SkipBuild, [switch]$IsolatedDesktop)
 
 $ErrorActionPreference = "Stop"
+if (-not $IsolatedDesktop) { throw "Run only on an isolated interactive desktop, with -IsolatedDesktop. Clipboard contents may change." }
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
-
-# A resident instance locks the release binary, so stop it before building.
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 400
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -23,6 +21,9 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+try {
 $results = New-Object System.Collections.Generic.List[object]
 function Check([string]$Name, [bool]$Ok, [string]$Detail) {
     $results.Add([pscustomobject]@{ Name = $Name; Ok = $Ok; Detail = $Detail })
@@ -31,7 +32,7 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
 $before = 0
 if (Test-Path $log) { $before = (Get-Content $log).Count }
 
-$process = Start-Process -FilePath $exe -ArgumentList "--inject-test" -PassThru -Wait
+$process = Start-QPTest -Arguments @("--inject-test", "--with-paste") -Wait
 Check "inject-test exit 0" ($process.ExitCode -eq 0) ("exit=" + $process.ExitCode)
 
 $newLines = @()
@@ -41,6 +42,8 @@ $newText = $newLines -join "`n"
 Check "SendInput accepted" ($newText -match "inject accepted:") ""
 Check "text read back" ($newText -match "Injected" -and $newText -match "text=") ""
 Check "selftest passed" ($newText -match "inject-test: PASS") ""
+Check "paste reaches the original edit" ($newText -match "paste: normal=true") ""
+Check "paste rejects focus moved within the same window" ($newText -match "paste: focus_change_rejected=true") ""
 
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
@@ -54,3 +57,6 @@ if ($failed.Count -gt 0) {
 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

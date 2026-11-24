@@ -4,9 +4,10 @@
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$log = Join-Path $env:LOCALAPPDATA ("QuickPhrase\logs\qp-{0}.log" -f (Get-Date -Format yyyy-MM-dd))
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -20,6 +21,9 @@ if (-not $SkipBuild) {
 
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
+$qpRun = New-QPTestRun $exe
+$log = $qpRun.Log
+try {
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
@@ -71,13 +75,9 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
 # 1. cold start
 $times = @()
 foreach ($i in 1..5) {
-    $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = $exe
-    $psi.Arguments = "--bench"
-    $psi.UseShellExecute = $false
     $sw = [Diagnostics.Stopwatch]::StartNew()
-    $p = [Diagnostics.Process]::Start($psi)
-    $p.WaitForExit()
+    $p = Start-QPTest -Arguments '--bench' -Wait
+    if ($p.ExitCode -ne 0) { throw "Cold start check failed: $($p.ExitCode)" }
     $sw.Stop()
     $times += $sw.ElapsedMilliseconds
 }
@@ -86,7 +86,7 @@ $median = $sorted[2]
 Check "cold start median <= 1500 ms" ($median -le 1500) ("runs=" + ($times -join ",") + " ms; median=$median")
 
 # 2. first instance
-$first = Start-Process -FilePath $exe -PassThru
+$first = Start-QPTest
 Start-Sleep -Milliseconds 900
 Check "first instance alive" (-not $first.HasExited) ("pid=" + $first.Id)
 $workingSetMb = [math]::Round((Get-Process -Id $first.Id).WorkingSet64 / 1MB, 2)
@@ -124,7 +124,7 @@ if ($hotkeyObserved) {
 }
 
 # 3. second instance
-$second = Start-Process -FilePath $exe -PassThru -Wait
+$second = Start-QPTest -WakePid $first.Id -Wait
 Start-Sleep -Milliseconds 300
 Check "second instance exits 0" ($second.ExitCode -eq 0) ("exit=" + $second.ExitCode)
 Check "first instance survives" (-not $first.HasExited) ("pid=" + $first.Id)
@@ -135,7 +135,7 @@ Start-Sleep -Milliseconds 900
 Check "WM_CLOSE closes main window" ($closed -and $first.HasExited) ("closed=$closed; alive=" + (-not $first.HasExited))
 
 # 5. hotkey released
-$again = Start-Process -FilePath $exe -ArgumentList "--selftest" -PassThru -Wait
+$again = Start-QPTest -Arguments "--selftest" -Wait
 Check "hotkey released after exit" ($again.ExitCode -eq 0) ("selftest exit=" + $again.ExitCode)
 
 # 6. log assertions (this run only)
@@ -158,3 +158,6 @@ if ($failed.Count -gt 0) {
 $executed = $results.Count - $skipped
 "PASS: $executed checks ($skipped skipped)"
 exit 0
+} finally {
+    Stop-QPTestRun
+}

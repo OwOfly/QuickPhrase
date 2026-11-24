@@ -829,7 +829,7 @@ fn create() -> Option<Panel> {
     ui::theme_control(edit, palette.dark);
     ui::install_smooth_listbox(list, ui::ListSurface::Card);
 
-    let cue = platform::wide("搜索标题、正文、标签、拼音；#标签 筛选");
+    let cue = platform::wide("搜索标题、正文、标签、拼音；#标签 筛选，\\# 搜索井号");
     unsafe {
         let _ = send(edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize);
         let _ = send(edit, EM_LIMITTEXT, 200, 0);
@@ -936,7 +936,7 @@ fn commit() {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         let reason = copy_only.as_deref().unwrap_or("no_target");
-        let (copied, snapshot) = crate::clipboard::set_text_with_snapshot(&content);
+        let (copied, snapshot) = crate::clipboard::set_text_with_snapshot(hwnd, &content);
         crate::storage::record_use(&item_id, "rejected");
         logging::info(&format!(
             "panel copy-only commit: index={item_index} category={category_id} copied={copied} non_text={} read_ok={}",
@@ -946,14 +946,8 @@ fn commit() {
         if !notify.0.is_null() {
             let message = if !copied {
                 format!("复制失败（{reason}）")
-            } else if !snapshot.read_ok {
-                format!("已复制（{reason}；原剪贴板内容无法确认，可能不可恢复）")
-            } else if snapshot.had_non_text {
-                format!("已复制（{reason}；原剪贴板含非文本内容，仅文本可恢复）")
-            } else if snapshot.text.is_some() {
-                format!("已复制（{reason}；原剪贴板内容已被替换）")
             } else {
-                format!("已复制（{reason}）")
+                format!("已复制（{reason}；{}）", snapshot.previous_text_status())
             };
             crate::tray::balloon(notify, "QuickPhrase", &message);
         }
@@ -1004,7 +998,13 @@ fn commit() {
     let spawned = std::thread::Builder::new()
         .name("quickphrase-inject".into())
         .spawn(move || {
-            let outcome = inject::run(&report, &content, monitor_ok, options);
+            let outcome = inject::run(
+                &report,
+                &content,
+                monitor_ok,
+                options,
+                HWND(notify_raw as *mut core::ffi::c_void),
+            );
             let message = outcome.describe();
             logging::info(&format!("inject outcome: {message}"));
             crate::storage::record_use(&item_id, outcome.status());
@@ -1985,6 +1985,7 @@ fn filter_items_mode(
                 content: &item.content,
                 blob: &item.blob,
                 pinned: item.pinned,
+                use_count: item.use_count,
                 last_used_at: item.last_used_at.as_deref(),
                 updated_at: &item.updated_at,
                 sort_order: item.sort_order,
@@ -1992,35 +1993,13 @@ fn filter_items_mode(
         })
         .collect();
 
-    let limit = if sort_mode == crate::search::SortMode::MostUsed {
-        usize::MAX
-    } else {
-        crate::search::DEFAULT_LIMIT
-    };
-    let hits = crate::search::rank(&docs, text_query, limit);
-    let mut ordered: Vec<(crate::search::Hit, usize)> = hits
-        .into_iter()
-        .map(|hit| {
-            let item_index = subset[hit.index];
-            (hit, item_index)
-        })
-        .collect();
-    if sort_mode == crate::search::SortMode::MostUsed {
-        ordered.sort_by(|left, right| {
-            right
-                .0
-                .score
-                .cmp(&left.0.score)
-                .then_with(|| items[right.1].pinned.cmp(&items[left.1].pinned))
-                .then_with(|| items[right.1].use_count.cmp(&items[left.1].use_count))
-        });
-        ordered.truncate(crate::search::DEFAULT_LIMIT);
-    }
-    let mut filtered = Vec::with_capacity(ordered.len());
-    let mut title_highlights = Vec::with_capacity(ordered.len());
-    let mut content_highlights = Vec::with_capacity(ordered.len());
-    for (hit, item_index) in ordered {
-        filtered.push(item_index);
+    let hits =
+        crate::search::rank_with_mode(&docs, text_query, crate::search::DEFAULT_LIMIT, sort_mode);
+    let mut filtered = Vec::with_capacity(hits.len());
+    let mut title_highlights = Vec::with_capacity(hits.len());
+    let mut content_highlights = Vec::with_capacity(hits.len());
+    for hit in hits {
+        filtered.push(subset[hit.index]);
         title_highlights.push(hit.title_highlight);
         content_highlights.push(hit.content_highlight);
     }
@@ -2860,6 +2839,26 @@ mod tests {
     }
 
     #[test]
+    fn most_used_considers_items_beyond_the_recent_limit() {
+        let count = crate::search::DEFAULT_LIMIT + 5;
+        let sample = items().remove(0);
+        let mut many: Vec<_> = (0..count)
+            .map(|index| {
+                let mut item = sample.clone();
+                item.id = index.to_string();
+                item.sort_order = index as i32;
+                item
+            })
+            .collect();
+        many[count - 1].use_count = 10;
+        let (filtered, highlights, _) =
+            filter_items_mode(&many, None, "项目", &[], crate::search::SortMode::MostUsed);
+        assert_eq!(filtered.len(), crate::search::DEFAULT_LIMIT);
+        assert_eq!(filtered[0], count - 1);
+        assert_eq!(highlights[0], Some((0, "项目".len())));
+    }
+
+    #[test]
     fn most_used_mode_keeps_recent_order_for_ties() {
         let mut items = items();
         items[0].use_count = 5;
@@ -2910,7 +2909,12 @@ mod tests {
         assert_eq!(rank_ids(&items, "#support #refund"), vec![0]);
         assert_eq!(rank_ids(&items, "#refund"), vec![0, 1]);
         assert_eq!(rank_ids(&items, "#support 项目"), vec![0]);
-        assert_eq!(rank_ids(&items, "#"), vec![0, 1, 2]);
+        assert!(rank_ids(&items, "#").is_empty());
+        items[0].content.push_str(" #include <stdio.h>");
+        items[0].blob.push_str(" #include <stdio.h>");
+        assert_eq!(rank_ids(&items, "#"), vec![0]);
+        assert_eq!(rank_ids(&items, r"#refund \#include"), vec![0]);
+        assert!(rank_ids(&items, r"#unknown \#include").is_empty());
         let (filtered, _, _) = filter_items(&items, Some("c1"), "#support");
         assert_eq!(filtered, vec![0]);
         let (filtered, _, _) = filter_items_mode(

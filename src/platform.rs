@@ -116,25 +116,6 @@ pub fn data_dir() -> PathBuf {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn portable_marker_switches_data_dir_next_to_exe() {
-        let dir = std::env::temp_dir().join(format!("qp-portable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert_eq!(portable_data_dir(&dir), None);
-        std::fs::write(dir.join("portable.txt"), b"").unwrap();
-        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
-        std::fs::remove_file(dir.join("portable.txt")).unwrap();
-        std::fs::write(dir.join("portable"), b"").unwrap();
-        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
 pub fn error_box(title: &str, text: &str) {
     message_box(title, text, MB_OK | MB_ICONERROR);
 }
@@ -153,5 +134,24 @@ fn message_box(
     let text = wide(text);
     unsafe {
         MessageBoxW(None, PCWSTR(text.as_ptr()), PCWSTR(title.as_ptr()), flags);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_marker_switches_data_dir_next_to_exe() {
+        let dir = std::env::temp_dir().join(format!("qp-portable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(portable_data_dir(&dir), None);
+        std::fs::write(dir.join("portable.txt"), b"").unwrap();
+        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
+        std::fs::remove_file(dir.join("portable.txt")).unwrap();
+        std::fs::write(dir.join("portable"), b"").unwrap();
+        assert_eq!(portable_data_dir(&dir), Some(dir.join("data")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

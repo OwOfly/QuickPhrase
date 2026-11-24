@@ -78,7 +78,6 @@ fn main() {
     }
 
     if about_test {
-        storage::init();
         if !about_ui::show_test() {
             logging::error("about-test: window creation failed");
             std::process::exit(4);
@@ -168,7 +167,7 @@ fn main() {
     }
 
     if inject_test {
-        let ok = inject::selftest();
+        let ok = inject::selftest(has(&args, "--with-paste"));
         logging::info(&format!(
             "inject-test: {}",
             if ok { "PASS" } else { "FAIL" }

@@ -2,19 +2,21 @@
 //!
 //! Score: title exact 400, title prefix 300, title contains 200,
 //! body contains 100, title-pinyin blob-only 90, tag-only 85 (no highlight).
-//! Ties break by pinned, lastUsedAt, updatedAt, sortOrder, id. At most
+//! Ties break by pinned, useCount (MostUsed only), lastUsedAt, updatedAt, sortOrder, id. At most
 //! `limit` hits are returned.
 
 use std::time::Instant;
 
 pub const DEFAULT_LIMIT: usize = 50;
 
+/// Borrowed searchable fields and deterministic ranking tie-breakers.
 pub struct Doc<'a> {
     pub id: &'a str,
     pub title: &'a str,
     pub content: &'a str,
     pub blob: &'a str,
     pub pinned: bool,
+    pub use_count: u64,
     pub last_used_at: Option<&'a str>,
     pub updated_at: &'a str,
     pub sort_order: i32,
@@ -46,11 +48,15 @@ pub struct Hit {
 
 /// Splits leading `#tag` tokens from a query. Tags are lowercased; the
 /// returned text is the remaining keyword query. Stops at the first token that
-/// is not `#`-prefixed, so a literal `#` inside text stays searchable.
+/// is not `#`-prefixed. A leading `\#` escapes tag syntax; a bare `#`
+/// and hashes within plain text stay searchable.
 pub fn split_tag_query(query: &str) -> (Vec<String>, &str) {
     let mut rest = query.trim();
     let mut tags = Vec::new();
     loop {
+        if rest.starts_with(r"\#") {
+            return (tags, &rest[1..]);
+        }
         let Some(after) = rest.strip_prefix('#') else {
             break;
         };
@@ -60,7 +66,7 @@ pub fn split_tag_query(query: &str) -> (Vec<String>, &str) {
             .unwrap_or(after.len());
         let tag = after[..end].trim().to_lowercase();
         if tag.is_empty() {
-            return (tags, "");
+            break;
         }
         tags.push(tag);
         rest = after[end..].trim_start();
@@ -68,7 +74,14 @@ pub fn split_tag_query(query: &str) -> (Vec<String>, &str) {
     (tags, rest)
 }
 
+/// Rank by relevance and recency.
 pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
+    rank_with_mode(docs, query, limit, SortMode::Recent)
+}
+
+/// Rank by relevance and pinning first, comparing usage before recency only
+/// in MostUsed mode. Compute highlights only after limiting the result set.
+pub fn rank_with_mode(docs: &[Doc<'_>], query: &str, limit: usize, mode: SortMode) -> Vec<Hit> {
     let allow_blob_fallback = !query.contains(['\n', '\r']);
     let needle = query.trim().to_lowercase();
     let mut scored: Vec<(u32, usize)> = Vec::new();
@@ -127,6 +140,10 @@ pub fn rank(docs: &[Doc<'_>], query: &str, limit: usize) -> Vec<Hit> {
             .0
             .cmp(&left.0)
             .then_with(|| b.pinned.cmp(&a.pinned))
+            .then_with(|| match mode {
+                SortMode::Recent => std::cmp::Ordering::Equal,
+                SortMode::MostUsed => b.use_count.cmp(&a.use_count),
+            })
             .then_with(|| cmp_last_used(a.last_used_at, b.last_used_at))
             .then_with(|| b.updated_at.cmp(a.updated_at))
             .then_with(|| a.sort_order.cmp(&b.sort_order))
@@ -237,6 +254,7 @@ pub fn bench(documents: usize, queries: usize) -> (u128, u128, u128) {
                 content: &contents[index],
                 blob: &blobs[index],
                 pinned: index % 7 == 0,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: index as i32,
@@ -276,6 +294,7 @@ mod tests {
             content,
             blob: "",
             pinned,
+            use_count: 0,
             last_used_at,
             updated_at,
             sort_order,
@@ -348,6 +367,7 @@ mod tests {
                 content: contents[index],
                 blob: &blobs[index],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: index as i32,
@@ -362,13 +382,14 @@ mod tests {
     fn case_insensitive_and_highlight_ranges() {
         let titles = ["JSON 接口"];
         let contents = ["返回 Json 数据"];
-        let blobs = vec!["json 接口\n返回 json 数据".to_string()];
-        let docs = vec![Doc {
+        let blobs = ["json 接口\n返回 json 数据".to_string()];
+        let docs = [Doc {
             id: "1",
             title: titles[0],
             content: contents[0],
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -395,6 +416,7 @@ mod tests {
                 content: contents[0],
                 blob: &blobs[0],
                 pinned: false,
+                use_count: 0,
                 last_used_at: Some("2026-02-01T00:00:00Z"),
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 2,
@@ -405,6 +427,7 @@ mod tests {
                 content: contents[1],
                 blob: &blobs[1],
                 pinned: false,
+                use_count: 0,
                 last_used_at: Some("2026-03-01T00:00:00Z"),
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 1,
@@ -415,6 +438,7 @@ mod tests {
                 content: contents[2],
                 blob: &blobs[2],
                 pinned: false,
+                use_count: 0,
                 last_used_at: Some("2026-03-01T00:00:00Z"),
                 updated_at: "2026-04-01T00:00:00Z",
                 sort_order: 0,
@@ -438,6 +462,7 @@ mod tests {
                 content: "",
                 blob: &blobs[index],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 79 - index as i32,
@@ -452,7 +477,7 @@ mod tests {
     #[test]
     fn empty_last_used_sorts_last() {
         let titles = ["同名", "同名"];
-        let blobs = vec!["同名".to_string(), "同名".to_string()];
+        let blobs = ["同名".to_string(), "同名".to_string()];
         let docs: Vec<Doc> = vec![
             Doc {
                 id: "never",
@@ -460,6 +485,7 @@ mod tests {
                 content: "",
                 blob: &blobs[0],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-09-01T00:00:00Z",
                 sort_order: 0,
@@ -470,6 +496,7 @@ mod tests {
                 content: "",
                 blob: &blobs[1],
                 pinned: false,
+                use_count: 0,
                 last_used_at: Some("2026-01-01T00:00:00Z"),
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 1,
@@ -485,13 +512,14 @@ mod tests {
         let literal_title = "其他";
         let pinyin_blob = build_search_blob(pinyin_title, "", &[]);
         let literal_blob = build_search_blob(literal_title, "tk", &[]);
-        let docs = vec![
+        let docs = [
             Doc {
                 id: "pinyin",
                 title: pinyin_title,
                 content: "",
                 blob: &pinyin_blob,
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 0,
@@ -502,6 +530,7 @@ mod tests {
                 content: "tk",
                 blob: &literal_blob,
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 1,
@@ -520,12 +549,13 @@ mod tests {
         let title = "说明";
         let content = "返回";
         let blob = "说明\n返回".to_string();
-        let docs = vec![Doc {
+        let docs = [Doc {
             id: "1",
             title,
             content,
             blob: &blob,
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -535,13 +565,14 @@ mod tests {
 
     #[test]
     fn empty_title_matches_body_without_title_highlight() {
-        let blobs = vec!["\n返回格式为 json".to_string()];
-        let docs = vec![Doc {
+        let blobs = ["\n返回格式为 json".to_string()];
+        let docs = [Doc {
             id: "1",
             title: "",
             content: "返回格式为 JSON",
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -561,13 +592,14 @@ mod tests {
 
     #[test]
     fn query_is_trimmed() {
-        let blobs = vec!["项目".to_string()];
-        let docs = vec![Doc {
+        let blobs = ["项目".to_string()];
+        let docs = [Doc {
             id: "1",
             title: "项目",
             content: "",
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -578,13 +610,14 @@ mod tests {
     #[test]
     fn cjk_highlight_covers_whole_characters() {
         let titles = ["项目进度"];
-        let blobs = vec!["项目进度".to_string()];
-        let docs = vec![Doc {
+        let blobs = ["项目进度".to_string()];
+        let docs = [Doc {
             id: "1",
             title: titles[0],
             content: "",
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -598,13 +631,14 @@ mod tests {
     fn expanding_lowercase_maps_back_to_the_original_character() {
         // U+0130 lowercases to "i" plus a combining dot.
         let title = "İab";
-        let blobs = vec!["i\u{307}ab".to_string()];
-        let docs = vec![Doc {
+        let blobs = ["i\u{307}ab".to_string()];
+        let docs = [Doc {
             id: "1",
             title,
             content: "",
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -618,13 +652,14 @@ mod tests {
     #[test]
     fn final_sigma_matches_through_whole_string_lowercase() {
         let title = "λόγος";
-        let blobs = vec![title.to_lowercase()];
-        let docs = vec![Doc {
+        let blobs = [title.to_lowercase()];
+        let docs = [Doc {
             id: "1",
             title,
             content: "",
             blob: &blobs[0],
             pinned: false,
+            use_count: 0,
             last_used_at: None,
             updated_at: "2026-01-01T00:00:00Z",
             sort_order: 0,
@@ -646,6 +681,7 @@ mod tests {
                 content: "",
                 blob: &blobs[0],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 1,
@@ -656,6 +692,7 @@ mod tests {
                 content: "",
                 blob: &blobs[1],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 0,
@@ -666,6 +703,7 @@ mod tests {
                 content: "",
                 blob: &blobs[2],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 0,
@@ -676,6 +714,7 @@ mod tests {
                 content: "",
                 blob: &blobs[3],
                 pinned: false,
+                use_count: 0,
                 last_used_at: None,
                 updated_at: "2026-01-01T00:00:00Z",
                 sort_order: 0,
@@ -701,7 +740,15 @@ mod tests {
             (vec!["support".to_string()], "")
         );
         assert_eq!(split_tag_query("普通 #tag"), (Vec::new(), "普通 #tag"));
-        assert_eq!(split_tag_query("#"), (Vec::new(), ""));
+        assert_eq!(split_tag_query("#"), (Vec::new(), "#"));
+        assert_eq!(split_tag_query(r"\#include"), (Vec::new(), "#include"));
+        assert_eq!(
+            split_tag_query(r"#dev #cpp \#include <stdio.h>"),
+            (
+                vec!["dev".to_string(), "cpp".to_string()],
+                "#include <stdio.h>"
+            )
+        );
     }
 
     #[test]

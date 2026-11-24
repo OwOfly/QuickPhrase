@@ -1,5 +1,5 @@
-﻿# Tag filter and batch tag edit smoke test.
-# Uses an isolated LOCALAPPDATA, seeds three tagged snippets, then drives the
+# Tag filter and batch tag edit smoke test.
+# Uses isolated portable data, seeds three tagged snippets, then drives the
 # management window: filter by tag, Ctrl-select two rows, add/remove a tag.
 #
 # Usage: powershell -ExecutionPolicy Bypass -File scripts\tag-batch-smoke.ps1 [-SkipBuild]
@@ -7,14 +7,10 @@
 param([switch]$SkipBuild)
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "smoke-common.ps1")
+Assert-QPTestIdle
 $root = Split-Path $PSScriptRoot -Parent
 $exe = Join-Path $root "target\release\quickphrase.exe"
-$isolated = Join-Path $env:TEMP "qp-tag-batch-smoke"
-$dataDir = Join-Path $isolated "QuickPhrase"
-$dataPath = Join-Path $dataDir "data.json"
-
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
 
 if (-not $SkipBuild) {
     Push-Location $root
@@ -25,14 +21,12 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exe)) { throw "missing $exe" }
 
-$env:LOCALAPPDATA = $isolated
-Remove-Item -Recurse -Force $isolated -ErrorAction SilentlyContinue
-New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+$qpRun = New-QPTestRun $exe
+try {
 # First launch seeds data/settings, then the test replaces the tags.
-Start-Process -FilePath $exe | Out-Null
-Start-Sleep -Milliseconds 1200
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 300
+$dataPath = Join-Path $qpRun.Data 'data.json'
+$seed = Start-QPTest -Arguments '--bench' -Wait
+if ($seed.ExitCode -ne 0) { throw "Could not seed the test library: $($seed.ExitCode)" }
 $data = [IO.File]::ReadAllText($dataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
 $data.snippets[0].tags = @("support", "refund")
 $data.snippets[1].tags = @("support")
@@ -75,7 +69,8 @@ function Check([string]$Name, [bool]$Ok, [string]$Detail) {
 function Find-Window([string]$class) {
     $script:found = [IntPtr]::Zero
     $cb = [QPTagBatchSmoke+EnumProc]{
-        param($h, $l)
+        param($h, $unused)
+        if (-not (Test-QPTestWindow $h)) { return $true }
         $sb = New-Object System.Text.StringBuilder 256
         [void][QPTagBatchSmoke]::GetClassName($h, $sb, 256)
         if ($sb.ToString() -eq $class) { $script:found = $h; return $false }
@@ -88,7 +83,7 @@ function Read-Data {
     return [IO.File]::ReadAllText($dataPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
 }
 
-Start-Process -FilePath $exe -ArgumentList "--manage-test" | Out-Null
+Start-QPTest -Arguments "--manage-test" | Out-Null
 Start-Sleep -Milliseconds 1500
 $manage = Find-Window "QuickPhrase.ManageWindow"
 if ($manage -eq [IntPtr]::Zero) { throw "manage window missing" }
@@ -161,9 +156,11 @@ Start-Sleep -Milliseconds 400
 $selectedAll = [int64][QPTagBatchSmoke]::SendMessageRaw($list, 0x0190, [IntPtr]::Zero, [IntPtr]::Zero)
 Check "select all filtered rows" ($selectedAll -eq 3) ("selected=" + $selectedAll)
 
-Get-Process quickphrase -ErrorAction SilentlyContinue | Stop-Process -Force
 $failed = @($results | Where-Object { -not $_.Ok })
 $results | Format-Table -AutoSize
 if ($failed.Count -gt 0) { "FAIL: $($failed.Count) check(s)"; exit 1 }
 "PASS: $($results.Count) checks"
 exit 0
+} finally {
+    Stop-QPTestRun
+}
