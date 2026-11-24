@@ -444,7 +444,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            let dpi = (wparam.0 & 0xffff) as u32;
+            let dpi = crate::ui::dpi_from_wparam(wparam);
             let suggested = &*(lparam.0 as *const RECT);
             let (left, top) = (suggested.left, suggested.top);
             let (width, height) = (

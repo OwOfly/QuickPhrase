@@ -98,6 +98,16 @@ pub fn scaled(value: i32, dpi: u32) -> i32 {
     (value * dpi as i32 + 48) / 96
 }
 
+/// New DPI from a `WM_DPICHANGED` message, with a defensive 96 fallback.
+pub fn dpi_from_wparam(wparam: WPARAM) -> u32 {
+    let dpi = ((wparam.0 >> 16) & 0xffff) as u32;
+    if dpi == 0 {
+        96
+    } else {
+        dpi
+    }
+}
+
 fn round_radius(dpi: u32, height: i32) -> f32 {
     d2d::scaled_f(9.0, dpi).min((height as f32 / 2.6).max(4.0))
 }
@@ -1771,4 +1781,19 @@ unsafe extern "system" fn smooth_edit_proc(
         _ => {}
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dpi_from_wparam;
+    use windows::Win32::Foundation::WPARAM;
+
+    #[test]
+    fn dpi_from_wparam_reads_hiword_with_fallback() {
+        assert_eq!(dpi_from_wparam(WPARAM(120usize << 16)), 120);
+        assert_eq!(dpi_from_wparam(WPARAM(144usize << 16)), 144);
+        assert_eq!(dpi_from_wparam(WPARAM(0)), 96);
+        // Low word is the x DPI and is ignored.
+        assert_eq!(dpi_from_wparam(WPARAM(0x0000_0078)), 96);
+    }
 }

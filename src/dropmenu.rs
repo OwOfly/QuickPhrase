@@ -145,6 +145,21 @@ fn row_height(dpi: u32) -> i32 {
     scaled(ROW_HEIGHT, dpi)
 }
 
+fn menu_height(dpi: u32, visible: usize) -> i32 {
+    pad(dpi) * 2 + visible as i32 * row_height(dpi)
+}
+
+fn menu_width(suggested: i32, dpi: u32) -> i32 {
+    suggested.max(scaled(MIN_WIDTH, dpi))
+}
+
+fn scale_drag_offset(offset: i32, old_dpi: u32, new_dpi: u32) -> i32 {
+    if old_dpi == 0 || old_dpi == new_dpi {
+        return offset;
+    }
+    ((offset as i64 * new_dpi as i64 + old_dpi as i64 / 2) / old_dpi as i64) as i32
+}
+
 fn pad(dpi: u32) -> i32 {
     scaled(PAD, dpi)
 }
@@ -211,9 +226,9 @@ pub fn show(owner: HWND, anchor: HWND, items: &[String], selected: Option<usize>
     unsafe {
         let _ = GetWindowRect(anchor, &mut anchor_rect);
     }
-    let width = (anchor_rect.right - anchor_rect.left).max(scaled(MIN_WIDTH, dpi));
+    let width = menu_width(anchor_rect.right - anchor_rect.left, dpi);
     let visible = items.len().min(MAX_VISIBLE);
-    let height = pad(dpi) * 2 + visible as i32 * row_height(dpi);
+    let height = menu_height(dpi, visible);
 
     let monitor = unsafe { MonitorFromWindow(anchor, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
@@ -437,6 +452,50 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_DPICHANGED => {
+            let new_dpi = crate::ui::dpi_from_wparam(wparam);
+            let suggested = unsafe { &*(lparam.0 as *const RECT) };
+            let geometry = MENU.with(|slot| {
+                let mut borrow = slot.borrow_mut();
+                let menu = borrow.as_mut()?;
+                let old_dpi = menu.dpi;
+                if menu.drag {
+                    menu.drag_offset = scale_drag_offset(menu.drag_offset, old_dpi, new_dpi);
+                }
+                menu.dpi = new_dpi;
+                let width = menu_width(suggested.right - suggested.left, new_dpi);
+                let height = menu_height(new_dpi, menu.visible);
+                Some((width, height))
+            });
+            let Some((width, height)) = geometry else {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            };
+            let mut x = suggested.left;
+            let mut y = suggested.top;
+            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                let work = info.rcWork;
+                x = x.clamp(work.left, (work.right - width).max(work.left));
+                y = y.clamp(work.top, (work.bottom - height).max(work.top));
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
@@ -696,7 +755,31 @@ unsafe extern "system" fn window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::{keyboard_top, visible_pick};
+    use super::{keyboard_top, menu_height, menu_width, scale_drag_offset, visible_pick};
+
+    #[test]
+    fn menu_height_scales_with_dpi() {
+        assert_eq!(menu_height(96, 8), 284);
+        assert_eq!(menu_height(120, 8), 360);
+        assert_eq!(menu_height(144, 8), 426);
+        assert_eq!(menu_height(96, 0), 12);
+    }
+
+    #[test]
+    fn menu_width_keeps_the_minimum_scaled() {
+        assert_eq!(menu_width(260, 96), 260);
+        assert_eq!(menu_width(100, 96), 200);
+        assert_eq!(menu_width(100, 120), 250);
+        assert_eq!(menu_width(200, 144), 300);
+    }
+
+    #[test]
+    fn drag_offset_follows_the_dpi_ratio() {
+        assert_eq!(scale_drag_offset(10, 96, 144), 15);
+        assert_eq!(scale_drag_offset(10, 144, 96), 7);
+        assert_eq!(scale_drag_offset(10, 96, 96), 10);
+        assert_eq!(scale_drag_offset(10, 0, 144), 10);
+    }
 
     #[test]
     fn down_scrolls_back_to_offscreen_highlight() {

@@ -413,6 +413,50 @@ unsafe extern "system" fn window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match message {
+        WM_DPICHANGED => {
+            let new_dpi = crate::ui::dpi_from_wparam(wparam);
+            let suggested = unsafe { &*(lparam.0 as *const RECT) };
+            let handled = CONFIRM.with(|slot| match slot.borrow_mut().as_mut() {
+                Some(dialog) => {
+                    dialog.dpi = new_dpi;
+                    true
+                }
+                None => false,
+            });
+            if !handled {
+                return unsafe { DefWindowProcW(hwnd, message, wparam, lparam) };
+            }
+            let width = scaled(WIDTH, new_dpi);
+            let height = scaled(HEIGHT, new_dpi);
+            let mut x = suggested.left;
+            let mut y = suggested.top;
+            let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+                let work = info.rcWork;
+                x = x.clamp(work.left, (work.right - width).max(work.left));
+                y = y.clamp(work.top, (work.bottom - height).max(work.top));
+            }
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                layout(client.right, client.bottom);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
