@@ -25,7 +25,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
+use crate::ui::point_in;
 use crate::{hotkey, logging, platform, storage, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.SettingsWindow");
@@ -172,10 +173,6 @@ thread_local! {
 }
 
 static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
-
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
-}
 
 fn make_font(dpi: u32) -> HFONT {
     ui::make_font(ui::FontRole::BodyInput, dpi)
@@ -1758,22 +1755,7 @@ fn create_input(
 }
 
 fn control_text(hwnd: HWND) -> String {
-    let length = unsafe { SendMessageW(hwnd, WM_GETTEXTLENGTH, Some(WPARAM(0)), Some(LPARAM(0))) }
-        .0
-        .max(0) as usize;
-    if length == 0 {
-        return String::new();
-    }
-    let mut buffer = vec![0u16; length + 1];
-    unsafe {
-        SendMessageW(
-            hwnd,
-            WM_GETTEXT,
-            Some(WPARAM(buffer.len())),
-            Some(LPARAM(buffer.as_mut_ptr() as isize)),
-        );
-    }
-    String::from_utf16_lossy(&buffer[..length])
+    crate::ui::control_text(hwnd)
 }
 
 fn reload_apps_rules(ui: &SettingsUi) {
@@ -2303,10 +2285,6 @@ fn save(ui: &mut SettingsUi) {
     }
     apply_live_theme(ui, &ui.theme_pref.clone());
     set_status(ui, "全部设置已保存并生效");
-}
-
-fn point_in(r: &RECT, x: i32, y: i32) -> bool {
-    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
 }
 
 /// Ordered Tab stops for the active page. Custom-drawn cards and native

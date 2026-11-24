@@ -2211,6 +2211,12 @@ fn clean_stale_temp(dir: &Path) {
     for name in [DATA_FILE, SETTINGS_FILE, RULES_FILE, HWM_FILE] {
         let _ = fs::remove_file(dir.join(format!("{name}.tmp")));
     }
+    // A crash during backup rotation can leave one of these in backups/.
+    let backups = dir.join("backups");
+    for name in [DATA_FILE, SETTINGS_FILE, RULES_FILE] {
+        let stem = name.trim_end_matches(".json");
+        let _ = fs::remove_file(backups.join(format!("{stem}.tmp")));
+    }
 }
 
 /// Resolve junctions and alternate spellings before allowing an export.
@@ -3503,6 +3509,21 @@ mod tests {
         assert_eq!(store.soft_delete(&id), Err("read_only".to_string()));
         assert_eq!(store.add_category("分类"), Err("read_only".to_string()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_load_cleans_stale_backup_temp_files() {
+        let dir = temp_dir("backup-temp-clean");
+        let backups = dir.join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        for name in ["data.tmp", "settings.tmp", "rules-user.tmp"] {
+            fs::write(backups.join(name), b"stale").unwrap();
+        }
+        let _store = Store::load_from(&dir);
+        for name in ["data.tmp", "settings.tmp", "rules-user.tmp"] {
+            assert!(!backups.join(name).exists(), "{name} survived");
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

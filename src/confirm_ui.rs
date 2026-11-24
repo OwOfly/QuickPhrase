@@ -16,7 +16,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
 use crate::{logging, platform, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.Confirm");
@@ -41,10 +41,6 @@ thread_local! {
     static CONFIRM: RefCell<Option<Confirm>> = const { RefCell::new(None) };
     static RESULT: Cell<bool> = const { Cell::new(false) };
     static DONE: Cell<bool> = const { Cell::new(false) };
-}
-
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
 }
 
 fn wide(text: &str) -> Vec<u16> {

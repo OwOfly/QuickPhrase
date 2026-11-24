@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::capture::Report;
 use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
+use crate::ui::point_in;
 use crate::{context, inject, logging, platform, theme, ui};
 
 const PANEL_CLASS: PCWSTR = w!("QuickPhrase.Panel");
@@ -1366,10 +1367,6 @@ fn tag_chips(panel: &Panel, rects: &LayoutRects, width: i32) -> Vec<TagChip> {
     chips
 }
 
-fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
-    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
-}
-
 fn paint_panel(panel: &Panel, hdc: HDC, client: RECT) {
     let dpi = panel.dpi;
     let palette = panel.palette;
@@ -2331,13 +2328,7 @@ fn populate(query: &str) {
 }
 
 fn read_text(hwnd: HWND) -> String {
-    let mut buffer = [0u16; 256];
-    let length = unsafe { GetWindowTextW(hwnd, &mut buffer) };
-    if length <= 0 {
-        String::new()
-    } else {
-        String::from_utf16_lossy(&buffer[..length as usize])
-    }
+    crate::ui::control_text(hwnd)
 }
 
 fn modifiers_down() -> bool {

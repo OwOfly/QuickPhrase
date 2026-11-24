@@ -224,8 +224,11 @@ Check "Esc hides panel" (-not [QPPanelSmoke]::IsWindowVisible($panel)) ""
 Check "Esc restores foreground" ([QPPanelSmoke]::GetForegroundWindow() -eq $restoreTarget) ""
 
 # 5. Enter commits the selected item and hides
+$reopenMarker = 0
+if (Test-Path $log) { $reopenMarker = (Get-Content $log -Encoding UTF8).Count }
 $opened = Open-Panel 3
 Check "panel reopens" $opened ""
+[void](Wait-Until { (Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Skip $reopenMarker) -join "`n" -match "panel shown in" } 1500)
 $edit = Find-Edit $panel
 [void][QPPanelSmoke]::PostMessage($edit, 0x0100, [IntPtr]0x0D, [IntPtr]::Zero)
 [void][QPPanelSmoke]::PostMessage($edit, 0x0101, [IntPtr]0x0D, [IntPtr]::Zero)

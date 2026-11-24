@@ -192,6 +192,17 @@ fn main() {
     }
 
     if panel_test {
+        let _panel_guard = match single_instance::acquire() {
+            single_instance::Acquire::First(handle) => handle,
+            single_instance::Acquire::AlreadyRunning => {
+                logging::error("panel-test: another QuickPhrase instance is running");
+                std::process::exit(4);
+            }
+            single_instance::Acquire::Failed(code) => {
+                logging::error(&format!("panel-test: mutex failed ({code})"));
+                std::process::exit(4);
+            }
+        };
         if panel::show_test() == 0 {
             logging::error("panel-test failed to create or show the panel");
             panel::shutdown();

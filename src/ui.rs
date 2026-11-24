@@ -29,15 +29,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, GetClientRect, GetParent, GetSystemMetrics, GetWindowLongPtrW,
-    GetWindowTextW, LoadIconW, LoadImageW, SendMessageW, SetWindowLongPtrW, CB_GETCOUNT,
-    CB_GETLBTEXT, GWLP_WNDPROC, HICON, ICON_BIG, ICON_SMALL, IDI_APPLICATION, IMAGE_ICON,
-    LR_DEFAULTCOLOR, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, WM_CAPTURECHANGED,
-    WM_CHAR, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_VSCROLL,
+    GetWindowTextLengthW, GetWindowTextW, LoadIconW, LoadImageW, SendMessageW, SetWindowLongPtrW,
+    CB_GETCOUNT, CB_GETLBTEXT, GWLP_WNDPROC, HICON, ICON_BIG, ICON_SMALL, IDI_APPLICATION,
+    IMAGE_ICON, LR_DEFAULTCOLOR, LR_SHARED, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON,
+    WM_CAPTURECHANGED, WM_CHAR, WM_ENABLE, WM_ERASEBKGND, WM_GETFONT, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_PAINT, WM_PRINTCLIENT, WM_SETFOCUS, WM_SETICON, WM_SIZE, WM_VSCROLL,
 };
 
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
 use crate::theme::Palette;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -94,10 +94,6 @@ thread_local! {
     static HOVERED: RefCell<HashSet<isize>> = RefCell::new(HashSet::new());
 }
 
-pub fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
-}
-
 /// New DPI from a `WM_DPICHANGED` message, with a defensive 96 fallback.
 pub fn dpi_from_wparam(wparam: WPARAM) -> u32 {
     let dpi = ((wparam.0 >> 16) & 0xffff) as u32;
@@ -106,6 +102,21 @@ pub fn dpi_from_wparam(wparam: WPARAM) -> u32 {
     } else {
         dpi
     }
+}
+
+pub fn point_in(rect: &RECT, x: i32, y: i32) -> bool {
+    x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom
+}
+
+/// Full text of a (possibly cross-thread) control, sized from its current length.
+pub fn control_text(hwnd: HWND) -> String {
+    let length = unsafe { GetWindowTextLengthW(hwnd) };
+    if length <= 0 {
+        return String::new();
+    }
+    let mut buffer = vec![0u16; length as usize + 1];
+    let copied = unsafe { GetWindowTextW(hwnd, &mut buffer) };
+    String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
 }
 
 fn round_radius(dpi: u32, height: i32) -> f32 {
@@ -1796,7 +1807,22 @@ unsafe extern "system" fn smooth_edit_proc(
 #[cfg(test)]
 mod tests {
     use super::dpi_from_wparam;
-    use windows::Win32::Foundation::WPARAM;
+    use super::point_in;
+    use windows::Win32::Foundation::{RECT, WPARAM};
+
+    #[test]
+    fn point_in_is_inclusive_on_the_edges() {
+        let rect = RECT {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        assert!(point_in(&rect, 10, 20));
+        assert!(point_in(&rect, 30, 40));
+        assert!(!point_in(&rect, 9, 30));
+        assert!(!point_in(&rect, 20, 41));
+    }
 
     #[test]
     fn dpi_from_wparam_reads_hiword_with_fallback() {

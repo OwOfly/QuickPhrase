@@ -17,7 +17,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus, VK_ESCAPE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::d2d::{self, AlignH, AlignV, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, TextStyle};
 use crate::{logging, platform, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.AboutWindow");
@@ -44,10 +44,6 @@ thread_local! {
 }
 
 static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
-
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
-}
 
 fn make_font(dpi: u32) -> HFONT {
     ui::make_font(ui::FontRole::BodyInput, dpi)

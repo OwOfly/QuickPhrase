@@ -1872,8 +1872,8 @@ fn build_icon_geometry(factory: &ID2D1Factory, icon: Icon) -> Option<ID2D1PathGe
 #[cfg(test)]
 mod tests {
     use super::{
-        build_icon_geometry, create_engine, mono_font_family, paint_buffered, ui_font_family, Icon,
-        TextStyle, BUFFER_CREATES, ENGINE,
+        build_icon_geometry, create_engine, mono_font_family, paint_buffered, scaled,
+        ui_font_family, Icon, TextStyle, BUFFER_CREATES, ENGINE,
     };
     use windows::Win32::Foundation::{COLORREF, RECT};
     use windows::Win32::Graphics::Gdi::{
@@ -1905,6 +1905,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn scaled_matches_the_shared_formula() {
+        assert_eq!(scaled(520, 120), 650);
+        assert_eq!(scaled(34, 125), 44);
+        assert_eq!(scaled(420, 200), 875);
+        assert_eq!(scaled(-1, 96), 0);
+        assert_eq!(scaled(-100, 120), -124);
     }
 
     #[test]

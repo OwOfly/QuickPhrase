@@ -19,9 +19,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
 use crate::search::{self, Doc};
 use crate::storage::{self, Snippet};
+use crate::ui::point_in;
 use crate::{logging, platform, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.ManageWindow");
@@ -208,10 +209,6 @@ static QUIT_ON_CLOSE: AtomicBool = AtomicBool::new(false);
 /// A theme refresh arrived while a modal owned the MANAGE borrow.
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
-}
-
 fn parse_tags(text: &str) -> Vec<String> {
     text.split([',', '，'])
         .map(str::trim)
@@ -221,13 +218,7 @@ fn parse_tags(text: &str) -> Vec<String> {
 }
 
 fn wide_text(control: HWND) -> String {
-    let length = unsafe { GetWindowTextLengthW(control) };
-    if length <= 0 {
-        return String::new();
-    }
-    let mut buffer = vec![0u16; length as usize + 1];
-    let copied = unsafe { GetWindowTextW(control, &mut buffer) };
-    String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
+    crate::ui::control_text(control)
 }
 
 fn set_text(control: HWND, text: &str) {
@@ -3290,10 +3281,6 @@ pub fn discard_draft() {
     });
 }
 
-fn point_in(r: &RECT, x: i32, y: i32) -> bool {
-    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-}
-
 unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -3996,7 +3983,14 @@ unsafe extern "system" fn window_proc(
 
 #[cfg(test)]
 mod tests {
-    use super::preview_text;
+    use super::{parse_tags, preview_text};
+
+    #[test]
+    fn parse_tags_trims_and_drops_empty_segments() {
+        assert_eq!(parse_tags(" a, b ,,c "), vec!["a", "b", "c"]);
+        assert_eq!(parse_tags(" , , "), Vec::<String>::new());
+        assert_eq!(parse_tags("a，b"), vec!["a", "b"]);
+    }
 
     #[test]
     fn preview_bounds_and_maps_newlines() {

@@ -21,7 +21,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::d2d::{self, AlignH, AlignV, Icon, TextStyle};
+use crate::d2d::{self, scaled, AlignH, AlignV, Icon, TextStyle};
 use crate::{logging, theme, ui};
 
 const CLASS: PCWSTR = w!("QuickPhrase.DropMenu");
@@ -135,10 +135,6 @@ unsafe extern "system" fn combo_proc(
     let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
         std::mem::transmute(old);
     proc(hwnd, message, wparam, lparam)
-}
-
-fn scaled(value: i32, dpi: u32) -> i32 {
-    (value * dpi as i32 + 48) / 96
 }
 
 fn row_height(dpi: u32) -> i32 {
