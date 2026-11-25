@@ -446,6 +446,26 @@ fn reload_left(manage: &mut Manage) {
     }
 }
 
+fn combo_items_match(combo: HWND, items: &[String]) -> bool {
+    let count = unsafe { SendMessageW(combo, CB_GETCOUNT, 0, 0) }.0 as usize;
+    if count != items.len() {
+        return false;
+    }
+    for (index, item) in items.iter().enumerate() {
+        let mut buffer = [0u16; 256];
+        let length =
+            unsafe { SendMessageW(combo, CB_GETLBTEXT, index, buffer.as_mut_ptr() as isize) }.0;
+        if length <= 0 {
+            return false;
+        }
+        let length = (length as usize).min(buffer.len() - 1);
+        if String::from_utf16_lossy(&buffer[..length]) != *item {
+            return false;
+        }
+    }
+    true
+}
+
 fn reload_categories(manage: &mut Manage) {
     let draft = manage.draft_category.clone();
     let Some((categories, index)) = storage::with_data(|data| {
@@ -468,29 +488,37 @@ fn reload_categories(manage: &mut Manage) {
     }) else {
         return;
     };
+    let mut items: Vec<String> = Vec::with_capacity(categories.len() + 1);
+    items.push("未分类".to_string());
+    items.extend(categories.iter().map(|(_, name)| name.clone()));
+    let wanted = index.unwrap_or(0);
+    let current = unsafe { SendMessageW(manage.category, CB_GETCURSEL, 0, 0) }.0;
+    if combo_items_match(manage.category, &items) {
+        if current != wanted as isize {
+            unsafe {
+                let _ = SendMessageW(manage.category, CB_SETCURSEL, wanted, 0);
+            }
+        }
+        if index.is_none() && draft.is_some() {
+            manage.draft_category = None;
+        }
+        return;
+    }
     unsafe {
+        // One silent rebuild: resetting a visible combo paints the box empty
+        // for a frame, which reads as a flicker every time the picker opens.
+        let _ = SendMessageW(manage.category, WM_SETREDRAW, 0, 0);
         let _ = SendMessageW(manage.category, CB_RESETCONTENT, 0, 0);
-    }
-    let uncategorized = platform::wide("未分类");
-    unsafe {
-        let _ = SendMessageW(
-            manage.category,
-            CB_ADDSTRING,
-            0,
-            uncategorized.as_ptr() as isize,
-        );
-    }
-    for (_, name) in &categories {
-        let wide = platform::wide(name);
-        unsafe {
+        for item in &items {
+            let wide = platform::wide(item);
             let _ = SendMessageW(manage.category, CB_ADDSTRING, 0, wide.as_ptr() as isize);
         }
+        let _ = SendMessageW(manage.category, CB_SETCURSEL, wanted, 0);
+        let _ = SendMessageW(manage.category, WM_SETREDRAW, 1, 0);
+        let _ = InvalidateRect(Some(manage.category), None, true);
     }
     if index.is_none() && draft.is_some() {
         manage.draft_category = None;
-    }
-    unsafe {
-        let _ = SendMessageW(manage.category, CB_SETCURSEL, index.unwrap_or(0), 0);
     }
 }
 
@@ -526,22 +554,43 @@ fn reload_tag_filter(manage: &mut Manage) {
     }) else {
         return;
     };
-    manage.loading = true;
-    unsafe {
-        let _ = SendMessageW(manage.tag_filter, CB_RESETCONTENT, 0, 0);
-        let all = platform::wide("全部标签");
-        let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, all.as_ptr() as isize);
-        for tag in &options {
-            let wide = platform::wide(tag);
-            let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, wide.as_ptr() as isize);
+    let mut items: Vec<String> = Vec::with_capacity(options.len() + 1);
+    items.push("全部标签".to_string());
+    items.extend(options.iter().cloned());
+    let current = unsafe { SendMessageW(manage.tag_filter, CB_GETCURSEL, 0, 0) }.0;
+    if combo_items_match(manage.tag_filter, &items) {
+        if current != index as isize {
+            unsafe {
+                let _ = SendMessageW(manage.tag_filter, CB_SETCURSEL, index, 0);
+            }
         }
-        let _ = SendMessageW(manage.tag_filter, CB_SETCURSEL, index, 0);
         manage.tag_filter_value = if index == 0 {
             None
         } else {
             options.get(index - 1).cloned()
         };
+        manage.tag_options = options;
+        return;
     }
+    manage.loading = true;
+    unsafe {
+        // Rebuilding the list is rare (a tag appeared or disappeared); keep it
+        // invisible so opening the picker never blanks the combo first.
+        let _ = SendMessageW(manage.tag_filter, WM_SETREDRAW, 0, 0);
+        let _ = SendMessageW(manage.tag_filter, CB_RESETCONTENT, 0, 0);
+        for item in &items {
+            let wide = platform::wide(item);
+            let _ = SendMessageW(manage.tag_filter, CB_ADDSTRING, 0, wide.as_ptr() as isize);
+        }
+        let _ = SendMessageW(manage.tag_filter, CB_SETCURSEL, index, 0);
+        let _ = SendMessageW(manage.tag_filter, WM_SETREDRAW, 1, 0);
+        let _ = InvalidateRect(Some(manage.tag_filter), None, true);
+    }
+    manage.tag_filter_value = if index == 0 {
+        None
+    } else {
+        items.get(index).cloned()
+    };
     manage.tag_options = options;
     manage.loading = false;
 }
