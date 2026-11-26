@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, SetBkColor, SetBkMode,
-    SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, InvalidateRect, RedrawWindow, SetBkColor,
+    SetBkMode, SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, OPAQUE, PAINTSTRUCT, RDW_ALLCHILDREN,
+    RDW_INVALIDATE,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
@@ -2004,7 +2005,9 @@ fn apply_live_theme(ui: &mut SettingsUi, pref: &str) {
         ui::apply_window_style_for(ui.hwnd, palette, true);
     }
     unsafe {
-        let _ = InvalidateRect(Some(ui.hwnd), None, false);
+        // Invalidate the owner-draw children too: repainting only the top
+        // window left the buttons on the previous palette until a hover.
+        let _ = RedrawWindow(Some(ui.hwnd), None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
     }
 }
 
