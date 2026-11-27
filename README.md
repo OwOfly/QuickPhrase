@@ -73,7 +73,7 @@
 
 ## 快速开始
 
-1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.4-win-x64.zip`，或直接下载单文件 `QuickPhrase-0.1.4-win-x64.exe`。
+1. 到 [Releases](https://github.com/OwOfly/QuickPhrase/releases/latest) 下载 `QuickPhrase-0.1.5-win-x64.zip`，或直接下载单文件 `QuickPhrase-0.1.5-win-x64.exe`。
 2. 解压到任意目录（单文件版可跳过），双击 `QuickPhrase.exe`。无需管理员权限。
 3. 托盘出现图标后，按 `Ctrl+Alt+Q` 呼出面板。
 4. 首次启动会写入几条示例短语，直接在管理窗口里改成自己的内容即可。
@@ -142,7 +142,7 @@ scripts\inject-smoke.ps1 -IsolatedDesktop   # Unicode、粘贴和同窗口焦点
 
 冒烟脚本若发现 QuickPhrase 正在运行会拒绝执行。每次运行使用独立的便携目录并保留日志，只清理本次启动的进程。输入类脚本可能更改剪贴板，请只在隔离的交互式测试桌面使用 `-IsolatedDesktop`。
 
-0.1.4 构建记录：`cargo test` 197/197，fmt / clippy 通过；面板、标签批量、退出门禁、跨进程注入、专属快捷键在发布前需在隔离交互桌面复跑。详细记录在 [`docs/reviews/`](docs/reviews/) 与 `docs/_ref/optimization-plan-20261124.md`。
+0.1.5 构建记录：`cargo test` 197/197，fmt / clippy 通过；本版只含两处界面重绘修复，冒烟脚本复跑结果见发布说明。详细记录在 [`docs/reviews/`](docs/reviews/) 与 `docs/_ref/optimization-plan-20261124.md`。
 
 </details>
 
@@ -201,6 +201,6 @@ scripts/        冒烟、打包、截图脚本
 
 [MIT](LICENSE) © 2026 OwOfly
 
-发布说明与 SHA256：[RELEASE_NOTES-v0.1.4.md](RELEASE_NOTES-v0.1.4.md)
+发布说明与 SHA256：[RELEASE_NOTES-v0.1.5.md](RELEASE_NOTES-v0.1.5.md)
 
 <p align="center"><sub>如果这个工具帮到你，欢迎点个 ⭐</sub></p>
