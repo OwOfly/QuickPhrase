@@ -358,6 +358,8 @@ pub fn run(selftest: bool, bench: bool, started: Instant) -> i32 {
     if STATE.with(|state| state.borrow().hotkey_ok) {
         hotkey::unregister(hwnd);
     }
+    storage::flush_usage();
+    storage::flush_disk();
     logging::info("message loop ended");
 
     if (selftest || bench) && !hotkey_registered {
@@ -491,6 +493,7 @@ unsafe extern "system" fn window_proc(
                 state.hotkey_ok = false;
             });
             storage::flush_usage();
+            storage::flush_disk();
             PostQuitMessage(0);
             LRESULT(0)
         }
@@ -538,6 +541,7 @@ unsafe extern "system" fn window_proc(
         WM_ENDSESSION => {
             if wparam.0 != 0 {
                 storage::flush_usage();
+                storage::flush_disk();
             } else {
                 // Another app cancelled the session end; resume normal use.
                 clear_exit_gate(ExitGate::SessionEnding);

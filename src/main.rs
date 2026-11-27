@@ -127,6 +127,7 @@ fn main() {
             }
         }
         settings_ui::shutdown();
+        storage::flush_disk();
         logging::info("settings-test done");
         return;
     }
@@ -159,6 +160,7 @@ fn main() {
             }
         }
         manage::shutdown();
+        storage::flush_disk();
         logging::info("manage-test done");
         return;
     }
@@ -217,6 +219,7 @@ fn main() {
         }
         panel::shutdown();
         storage::flush_usage();
+        storage::flush_disk();
         logging::info("panel-test done");
         return;
     }

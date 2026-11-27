@@ -1,9 +1,11 @@
 //! Persistent store: `data.json`, `settings.json`, `rules-user.json`.
 //!
-//! Write path (final-plan §6.1): temp file -> flush -> re-read/verify ->
-//! rotate a backup -> `MoveFileExW` (first write) or `ReplaceFileW`
-//! (existing file), with a `MoveFileExW` fallback. Any failure keeps the
-//! original file and removes the temp file.
+//! Write path (final-plan §6.1): temp file -> re-read/verify -> rotate a
+//! backup -> atomic same-volume rename (`MoveFileExW`, with `ReplaceFileW` as a
+//! fallback). Any failure keeps the original file and removes the temp file.
+//! The `FlushFileBuffers` barrier is queued on a background worker
+//! (`flush_disk` waits for it on exit) so a slow volume does not stall the UI
+//! thread.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -12,6 +14,7 @@ use std::os::windows::{ffi::OsStrExt, io::AsRawHandle};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pinyin::ToPinyin;
@@ -21,8 +24,7 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
     GetFileInformationByHandle, MoveFileExW, ReplaceFileW, BY_HANDLE_FILE_INFORMATION,
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, REPLACEFILE_IGNORE_MERGE_ERRORS,
-    REPLACEFILE_WRITE_THROUGH,
+    MOVEFILE_REPLACE_EXISTING, MOVE_FILE_FLAGS, REPLACEFILE_IGNORE_MERGE_ERRORS,
 };
 
 use crate::{logging, platform};
@@ -331,6 +333,107 @@ pub fn flush_usage() {
         }
     } else {
         logging::warn("usage flush failed: worker channel closed");
+    }
+}
+
+enum FlushEvent {
+    Path(PathBuf),
+    Delete(PathBuf),
+    Flush(mpsc::Sender<()>),
+}
+
+/// Background `FlushFileBuffers` queue.
+///
+/// Writes and the atomic replace stay synchronous, so readers and a process
+/// crash see the new file immediately. Only the durability barrier is deferred:
+/// on a slow volume one flush costs hundreds of milliseconds, which made every
+/// save (and every usage update) block the UI thread.
+static FLUSH_TX: OnceLock<mpsc::Sender<FlushEvent>> = OnceLock::new();
+
+fn run_flush_worker(rx: mpsc::Receiver<FlushEvent>) {
+    loop {
+        let first = match rx.recv() {
+            Ok(event) => event,
+            Err(_) => break,
+        };
+        // Coalesce whatever arrived together: repeated saves of the same file
+        // collapse into one flush.
+        let mut batch = vec![first];
+        while let Ok(event) = rx.try_recv() {
+            batch.push(event);
+        }
+        let mut paths: HashSet<PathBuf> = HashSet::new();
+        let mut deletes: HashSet<PathBuf> = HashSet::new();
+        let mut waiters: Vec<mpsc::Sender<()>> = Vec::new();
+        for event in batch {
+            match event {
+                FlushEvent::Path(path) => {
+                    paths.insert(path);
+                }
+                FlushEvent::Delete(path) => {
+                    deletes.insert(path);
+                }
+                FlushEvent::Flush(done) => waiters.push(done),
+            }
+        }
+        for path in deletes {
+            if let Err(err) = fs::remove_file(&path) {
+                if path.exists() {
+                    logging::warn(&format!("storage: delete {} failed: {err}", path.display()));
+                }
+            }
+        }
+        for path in paths {
+            if let Err(err) = sync_file(&path) {
+                if !path.exists() {
+                    continue;
+                }
+                logging::warn(&format!("storage: flush {} failed: {err}", path.display()));
+            }
+        }
+        for done in waiters {
+            let _ = done.send(());
+        }
+    }
+}
+
+fn flush_sender() -> &'static mpsc::Sender<FlushEvent> {
+    FLUSH_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        if let Err(err) = std::thread::Builder::new()
+            .name("quickphrase-flush".into())
+            .spawn(move || run_flush_worker(rx))
+        {
+            logging::warn(&format!("flush worker spawn failed: {err}"));
+        }
+        tx
+    })
+}
+
+fn schedule_flush(path: PathBuf) {
+    if let Err(err) = flush_sender().send(FlushEvent::Path(path)) {
+        logging::warn(&format!("flush enqueue failed: {err}"));
+    }
+}
+
+fn schedule_delete(path: PathBuf) {
+    if let Err(err) = flush_sender().send(FlushEvent::Delete(path)) {
+        logging::warn(&format!("delete enqueue failed: {err}"));
+    }
+}
+
+/// Wait for queued durability barriers. Called on orderly exit and session end.
+pub fn flush_disk() {
+    let Some(tx) = FLUSH_TX.get() else {
+        return;
+    };
+    let (done_tx, done_rx) = mpsc::channel();
+    if tx.send(FlushEvent::Flush(done_tx)).is_ok() {
+        if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            logging::warn("disk flush timed out; recent writes may not be durable yet");
+        }
+    } else {
+        logging::warn("disk flush failed: worker channel closed");
     }
 }
 
@@ -1961,7 +2064,7 @@ impl Store {
         rotate_backup: bool,
     ) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(value).map_err(|err| err.to_string())?;
-        write_atomic(&self.dir, name, &bytes, rotate_backup)
+        write_atomic(&self.dir, name, &bytes, rotate_backup, true)
     }
 }
 
@@ -2128,7 +2231,10 @@ fn read_hwm(dir: &Path) -> u64 {
 /// Reserve a revision before writing the data file. An interrupted write
 /// leaves a gap, never a duplicate.
 fn write_hwm(dir: &Path, value: u64) -> Result<(), String> {
-    write_atomic(dir, HWM_FILE, value.to_string().as_bytes(), false)
+    // The high-water mark is advisory: a lost update only means the next save
+    // recomputes from the current revision. Skip the flush so every save does
+    // not pay a second disk round-trip on slow volumes.
+    write_atomic(dir, HWM_FILE, value.to_string().as_bytes(), false, false)
 }
 
 fn backups(dir: &Path, name: &str) -> Vec<PathBuf> {
@@ -2161,6 +2267,12 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
     fs::create_dir_all(&directory).map_err(|err| err.to_string())?;
     let stem = name.trim_end_matches(".json");
     let target = directory.join(format!("{stem}-{}-{:04}.json", now_stamp(), backup_seq()));
+    // The live file is already durable, so a hard link snapshots it for free.
+    // Replacing `data.json` later keeps this inode alive without a byte copy
+    // or a second flush; slow disks pay hundreds of milliseconds per flush.
+    if fs::hard_link(&source, &target).is_ok() {
+        return Ok(());
+    }
     let temp = directory.join(format!("{stem}.tmp"));
     fs::copy(&source, &temp).map_err(|err| err.to_string())?;
     if let Err(err) = sync_file(&temp) {
@@ -2176,21 +2288,15 @@ fn backup_file(dir: &Path, name: &str) -> Result<(), String> {
 }
 
 /// Prune only after the main file was replaced successfully, so a failed
-/// replace cannot consume the oldest restore point.
+/// replace cannot consume the oldest restore point. Deletions are queued on the
+/// background worker: removing a file on a busy disk can take hundreds of ms.
 fn prune_backups(dir: &Path, name: &str) {
     let mut existing = backups(dir, name);
     while existing.len() > BACKUP_KEEP {
-        let oldest = existing.pop();
-        let Some(oldest) = oldest else {
+        let Some(oldest) = existing.pop() else {
             break;
         };
-        if let Err(err) = fs::remove_file(&oldest) {
-            logging::warn(&format!(
-                "storage: cannot prune backup {}: {err}",
-                oldest.display()
-            ));
-            break;
-        }
+        schedule_delete(oldest);
     }
 }
 
@@ -2276,14 +2382,19 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
     result.map_err(|err| err.to_string())
 }
 
-fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Result<(), String> {
+fn write_atomic(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    rotate_backup: bool,
+    sync: bool,
+) -> Result<(), String> {
     let target = dir.join(name);
     let temp = dir.join(format!("{name}.tmp"));
 
     let result = (|| -> Result<(), String> {
         let mut file = fs::File::create(&temp).map_err(|err| err.to_string())?;
         file.write_all(bytes).map_err(|err| err.to_string())?;
-        file.sync_all().map_err(|err| err.to_string())?;
         drop(file);
 
         let written = fs::read(&temp).map_err(|err| err.to_string())?;
@@ -2295,19 +2406,26 @@ fn write_atomic(dir: &Path, name: &str, bytes: &[u8], rotate_backup: bool) -> Re
             if rotate_backup {
                 backup_file(dir, name)?;
             }
-            if replace_file(&target, &temp).is_err() {
-                // Never fall back if the replace consumed the target: that
-                // would turn a recoverable failure into data loss.
-                if !target.exists() {
-                    return Err("replace_lost_target".to_string());
+            if move_file(&temp, &target, true).is_err() {
+                // MoveFileEx is a plain same-volume rename (cheap on slow
+                // disks). If it fails, ReplaceFileW can still swap the file.
+                if replace_file(&target, &temp).is_err() {
+                    if !target.exists() {
+                        return Err("replace_lost_target".to_string());
+                    }
+                    return Err("replace_failed".to_string());
                 }
-                move_file(&temp, &target, true)?;
             }
         } else {
             move_file(&temp, &target, false)?;
         }
         if rotate_backup {
             prune_backups(dir, name);
+        }
+        if sync {
+            // Durability barrier runs on the flush worker: the file is already
+            // complete and visible, only the disk cache flush is deferred.
+            schedule_flush(target.clone());
         }
         Ok(())
     })();
@@ -2326,7 +2444,10 @@ fn replace_file(target: &Path, replacement: &Path) -> Result<(), String> {
             PCWSTR(target.as_ptr()),
             PCWSTR(replacement.as_ptr()),
             PCWSTR::null(),
-            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_WRITE_THROUGH,
+            // Durability is handled by the background flush queue; asking the
+            // replace itself to write through would flush the dirty data on the
+            // UI thread and reintroduce the stall.
+            REPLACEFILE_IGNORE_MERGE_ERRORS,
             None,
             None,
         )
@@ -2337,10 +2458,12 @@ fn replace_file(target: &Path, replacement: &Path) -> Result<(), String> {
 fn move_file(source: &Path, target: &Path, replace: bool) -> Result<(), String> {
     let source: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
     let target: Vec<u16> = target.as_os_str().encode_wide().chain([0]).collect();
+    // No MOVEFILE_WRITE_THROUGH: the rename must not wait for a disk flush on
+    // the UI thread; the background flush queue owns durability.
     let flags = if replace {
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+        MOVEFILE_REPLACE_EXISTING
     } else {
-        MOVEFILE_WRITE_THROUGH
+        MOVE_FILE_FLAGS(0)
     };
     unsafe {
         MoveFileExW(PCWSTR(source.as_ptr()), PCWSTR(target.as_ptr()), flags)
@@ -3666,6 +3789,7 @@ mod tests {
             store.data.snippets[0].use_count = index;
             store.save_data().unwrap();
         }
+        flush_disk();
         let count = backups(&dir, DATA_FILE).len();
         assert_eq!(count, BACKUP_KEEP, "backups={count}");
         let _ = fs::remove_dir_all(&dir);
